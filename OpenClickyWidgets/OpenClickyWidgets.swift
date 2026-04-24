@@ -117,9 +117,7 @@ private struct OpenClickyActiveAgentsWidgetView: View {
     let snapshot: OpenClickyWidgetSnapshot
 
     var body: some View {
-        if !snapshot.privacy.widgetsEnabled {
-            EmptyWidgetMessage(text: "Widgets are off")
-        } else if snapshot.activeAgents.isEmpty {
+        if snapshot.activeAgents.isEmpty {
             EmptyWidgetMessage(text: "No active agents")
         } else {
             VStack(alignment: .leading, spacing: 8) {

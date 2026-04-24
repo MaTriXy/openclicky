@@ -15,10 +15,11 @@ The app is configured for OTA-style updates:
 - Feed file in this repo: `appcast.xml`
 - Release asset host: GitHub Releases under `https://github.com/jasonkneen/openclicky/releases`
 - Public EdDSA key in `Info.plist`: `SUPublicEDKey`
+- Sparkle Keychain account: `openclicky`
 
 The checked-in `appcast.xml` is intentionally an empty OpenClicky feed until the first signed release artifact exists.
 
-Before the first real OpenClicky release, confirm that you still have the Sparkle private key matching `SUPublicEDKey`. If not, generate a new Sparkle EdDSA key pair, replace `SUPublicEDKey` in `Info.plist` with the new public key, and keep the private key outside the repository. Existing installed builds can only move to a new Sparkle key if they first receive a bridge update signed by the old key.
+Before the first real OpenClicky release, confirm that the Sparkle private key for account `openclicky` is present in your Keychain and matches `SUPublicEDKey`. Keep the private key outside the repository. Existing installed builds can only move to a new Sparkle key if they first receive a bridge update signed by the old key.
 
 ## Release Flow
 
@@ -61,7 +62,7 @@ xcrun notarytool submit OpenClicky-1.0.1.dmg --keychain-profile "openclicky-nota
 xcrun stapler staple OpenClicky-1.0.1.dmg
 
 # Generate Sparkle's EdDSA signature.
-sign_update OpenClicky-1.0.1.dmg
+sign_update --account openclicky OpenClicky-1.0.1.dmg
 
 # Get the byte length for the appcast enclosure.
 stat -f%z OpenClicky-1.0.1.dmg
@@ -76,3 +77,82 @@ stat -f%z OpenClicky-1.0.1.dmg
 - The appcast item URL exactly matches the uploaded GitHub Release asset.
 - `sparkle:edSignature` was generated from the final stapled DMG, not an earlier copy.
 - A clean installed build checks the feed and offers or stages the update without sending the user to GitHub manually.
+
+## Local OTA Test
+
+Use this to prove the update loop before publishing to GitHub Releases. Build the app in Xcode, not with terminal `xcodebuild`, so macOS permission state remains tied to the proper app identity.
+
+### 1. Build And Install The Baseline
+
+1. In Xcode, set `MARKETING_VERSION` to a lower test version, for example `1.0.0`.
+2. Set `CURRENT_PROJECT_VERSION` to a lower build number, for example `100`.
+3. Archive/export a Developer ID signed app or run a proper Release build from Xcode.
+4. Install that build into `/Applications/OpenClicky.app`.
+5. Quit OpenClicky.
+
+Point that installed build at a local appcast:
+
+```sh
+defaults write com.jkneen.openclicky OpenClickySparkleFeedURLOverride -string "http://127.0.0.1:8808/appcast.xml"
+```
+
+The override only accepts `https`, `file`, or local `http` feeds. Non-local `http` is ignored. When this override is present, OpenClicky triggers a Sparkle background check immediately on launch.
+
+### 2. Build The Update
+
+1. In Xcode, bump `MARKETING_VERSION`, for example to `1.0.1`.
+2. Bump `CURRENT_PROJECT_VERSION`, for example to `101`.
+3. Archive/export the updated app.
+4. Package it as `OpenClicky-1.0.1.dmg`.
+5. Sign the final DMG with Sparkle's `sign_update --account openclicky` and keep the signature output.
+
+### 3. Serve A Local Feed
+
+Create a temporary update folder and appcast:
+
+```sh
+scripts/create-local-appcast.sh /path/to/OpenClicky-1.0.1.dmg 1.0.1 101 "SIGNATURE_FROM_SPARKLE_SIGN_UPDATE"
+```
+
+That writes `/tmp/openclicky-ota/appcast.xml` with a higher `sparkle:version` than the installed app:
+
+```xml
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>OpenClicky Local Updates</title>
+        <item>
+            <title>OpenClicky 1.0.1</title>
+            <pubDate>Fri, 24 Apr 2026 16:10:08 +0000</pubDate>
+            <sparkle:version>101</sparkle:version>
+            <sparkle:shortVersionString>1.0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure
+                url="http://127.0.0.1:8808/OpenClicky-1.0.1.dmg"
+                length="DMG_BYTE_LENGTH"
+                type="application/octet-stream"
+                sparkle:edSignature="SIGNATURE_FROM_SPARKLE_SIGN_UPDATE"/>
+        </item>
+    </channel>
+</rss>
+```
+
+Serve the folder:
+
+```sh
+cd /tmp/openclicky-ota
+python3 -m http.server 8808 --bind 127.0.0.1
+```
+
+### 4. Trigger The Update
+
+1. Launch `/Applications/OpenClicky.app`.
+2. Sparkle will read the local feed override and see the higher build.
+3. Accept or wait for the update flow.
+4. After relaunch, confirm the app version/build changed.
+
+Clear the local feed override after testing:
+
+```sh
+defaults delete com.jkneen.openclicky OpenClickySparkleFeedURLOverride
+```

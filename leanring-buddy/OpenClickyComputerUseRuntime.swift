@@ -123,8 +123,48 @@ enum OpenClickyComputerUsePermissionProbe {
         OpenClickyComputerUsePermissionStatus(
             accessibilityGranted: AXIsProcessTrusted(),
             screenRecordingGranted: WindowPositionManager.shouldTreatScreenRecordingPermissionAsGrantedForSessionLaunch(),
-            skyLightKeyboardPathAvailable: OpenClickySkyLightEventPost.isAvailable
+            skyLightKeyboardPathAvailable: OpenClickySkyLightEventPost.isAvailable,
+            fullDiskAccessLikelyGranted: OpenClickyMacPrivacyPermissionProbe.hasLikelyFullDiskAccess()
         )
+    }
+}
+
+enum OpenClickyMacPrivacyPermissionProbe {
+    static let fullDiskAccessSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+    static let automationSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
+
+    static func hasLikelyFullDiskAccess(fileManager: FileManager = .default) -> Bool {
+        let home = fileManager.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent("Library/Messages/chat.db"),
+            home.appendingPathComponent("Library/Safari/History.db"),
+            home.appendingPathComponent("Library/Mail", isDirectory: true)
+        ]
+
+        for candidate in candidates where fileManager.fileExists(atPath: candidate.path) {
+            if canReadProtectedItem(candidate, fileManager: fileManager) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func canReadProtectedItem(_ url: URL, fileManager: FileManager) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return false
+        }
+
+        if isDirectory.boolValue {
+            return (try? fileManager.contentsOfDirectory(atPath: url.path)) != nil
+        }
+
+        guard let handle = FileHandle(forReadingAtPath: url.path) else {
+            return false
+        }
+        try? handle.close()
+        return true
     }
 }
 

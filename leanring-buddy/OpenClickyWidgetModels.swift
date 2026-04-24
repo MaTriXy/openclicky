@@ -92,7 +92,7 @@ struct OpenClickyWidgetPrivacySettings: Codable, Equatable {
     var includesFocusedAppContext: Bool
 
     init(
-        widgetsEnabled: Bool = false,
+        widgetsEnabled: Bool = true,
         includesAgentTaskNames: Bool = false,
         includesMemorySnippets: Bool = false,
         includesFocusedAppContext: Bool = false

@@ -18,8 +18,8 @@ OpenClicky owns the macOS companion UI, voice flow, screen context, cursor overl
 - Archive old versions before replacing or superseding OpenClicky memory, skills, prompts, runtime notes, config, or log-derived artifacts. Use the archives path in `OpenClickyRuntimeMap.md`. Do not delete backups unless the user explicitly asks for destructive deletion.
 - Update `memory.md` when you learn stable user preferences, useful project facts, task outcomes, or reusable workflow context.
 - Do not claim you cannot remember outside the current conversation. Use `memory.md`.
-- Check `OpenClickyLearnedSkills/` for matching user-created workflow skills before starting.
-- After completing a new repeatable workflow, create or update `OpenClickyLearnedSkills/<snake_case_workflow_name>/SKILL.md` so future runs get faster. Example: creating an Apple Note for the first time should produce `OpenClickyLearnedSkills/create_apple_note/SKILL.md`.
+- Use `OpenClickyLearnedSkills/` when a matching user-created workflow clearly helps.
+- Create or update learned skills only when the user asks for skill/log learning or when a repeated workflow would materially speed up future work. Do not mention skill checks or skill creation in progress or final answers unless asked.
 - Avoid focus-stealing browser or window actions unless the task requires them.
 - Ask for missing permissions, keys, or files only when they block the task.
 - Keep all user-facing copy focused on OpenClicky.

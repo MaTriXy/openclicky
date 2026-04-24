@@ -104,7 +104,8 @@ enum BuddyNavigationMode {
 struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
-    @ObservedObject var companionManager: CompanionManager
+    let companionManager: CompanionManager
+    @ObservedObject var cursorState: CursorOverlayState
 
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
@@ -113,6 +114,7 @@ struct BlueCursorView: View {
         self.screenFrame = screenFrame
         self.isFirstAppearance = isFirstAppearance
         self.companionManager = companionManager
+        self.cursorState = companionManager.cursorOverlayState
 
         // Seed the cursor position from the current mouse location so the
         // buddy doesn't flash at (0,0) before onAppear fires.
@@ -258,7 +260,7 @@ struct BlueCursorView: View {
                 .rotationEffect(.degrees(triangleRotationDegrees))
                 .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
                 .scaleEffect(buddyFlightScale)
-                .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
+                .opacity(buddyIsVisibleOnThisScreen && (cursorState.voiceState == .idle || cursorState.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(
                     buddyNavigationMode == .followingCursor
@@ -266,25 +268,25 @@ struct BlueCursorView: View {
                         : nil,
                     value: cursorPosition
                 )
-                .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.25), value: cursorState.voiceState)
                 .animation(
                     buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
                     value: triangleRotationDegrees
                 )
 
             // Blue waveform — replaces the triangle while listening
-            BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
+            BlueCursorWaveformView(audioPowerLevel: cursorState.currentAudioPowerLevel)
+                .opacity(buddyIsVisibleOnThisScreen && cursorState.voiceState == .listening ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
-                .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.15), value: cursorState.voiceState)
 
             // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
             BlueCursorSpinnerView()
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
+                .opacity(buddyIsVisibleOnThisScreen && cursorState.voiceState == .processing ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
-                .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.15), value: cursorState.voiceState)
 
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
@@ -309,7 +311,7 @@ struct BlueCursorView: View {
             navigationAnimationTimer?.invalidate()
             companionManager.tearDownOnboardingVideo()
         }
-        .onChange(of: companionManager.detectedElementScreenLocation) { _, newLocation in
+        .onChange(of: cursorState.detectedElementScreenLocation) { _, newLocation in
             // When a UI element location is detected, navigate the buddy to
             // that position so it points at the element.
             guard newLocation != nil else {
@@ -320,8 +322,8 @@ struct BlueCursorView: View {
     }
 
     private func startNavigatingToCurrentDetectedLocationIfNeeded() {
-        guard let screenLocation = companionManager.detectedElementScreenLocation,
-              let displayFrame = companionManager.detectedElementDisplayFrame else {
+        guard let screenLocation = cursorState.detectedElementScreenLocation,
+              let displayFrame = cursorState.detectedElementDisplayFrame else {
             return
         }
 
@@ -346,7 +348,7 @@ struct BlueCursorView: View {
         case .followingCursor:
             // If another screen's BlueCursorView is navigating to an element,
             // hide the cursor on this screen to prevent a duplicate buddy
-            if companionManager.detectedElementScreenLocation != nil {
+            if cursorState.detectedElementScreenLocation != nil {
                 return false
             }
             return isCursorOnThisScreen
@@ -358,11 +360,13 @@ struct BlueCursorView: View {
     // MARK: - Cursor Tracking
 
     private func startTrackingCursor() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { _ in
+        let trackingTimer = Timer(timeInterval: 0.016, repeats: true) { _ in
             Task { @MainActor in
                 updateCursorTracking()
             }
         }
+        timer = trackingTimer
+        RunLoop.main.add(trackingTimer, forMode: .common)
     }
 
     private func updateCursorTracking() {
@@ -538,7 +542,7 @@ struct BlueCursorView: View {
 
         // Use custom bubble text from the companion manager (e.g. onboarding demo)
         // if available, otherwise fall back to a random pointer phrase
-        let pointerPhrase = companionManager.detectedElementBubbleText
+        let pointerPhrase = cursorState.detectedElementBubbleText
             ?? navigationPointerPhrases.randomElement()
             ?? "right here!"
 

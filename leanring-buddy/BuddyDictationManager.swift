@@ -549,7 +549,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
-                    self?.latestRecognizedText = transcriptText
+                    guard let self else { return }
+                    self.latestRecognizedText = transcriptText
+                    self.draftCallbacks?.updateDraftText(
+                        self.composeDraftText(withTranscribedText: transcriptText)
+                    )
                 }
             },
             onFinalTranscriptReady: { [weak self] transcriptText in

@@ -420,6 +420,25 @@ struct OpenClickySettingsView: View {
                 }
             }
 
+            settingsGroup("Additional macOS access") {
+                permissionRow(
+                    title: "Full Disk Access",
+                    isGranted: companionManager.hasFullDiskAccessPermission,
+                    settingsURL: OpenClickyMacPrivacyPermissionProbe.fullDiskAccessSettingsURL
+                )
+                valueRow(
+                    title: "Automation",
+                    subtitle: "macOS grants Automation per target app. OpenClicky can trigger the prompt for an app the first time it sends an Apple Event.",
+                    systemImageName: "terminal"
+                )
+                actionRow(title: "Open Automation settings", systemImageName: "slider.horizontal.3") {
+                    companionManager.openAutomationSettings()
+                }
+                actionRow(title: "Prime Reminders automation prompt", systemImageName: "checklist") {
+                    companionManager.requestRemindersAutomationPermission()
+                }
+            }
+
             settingsGroup("Agent Mode behavior") {
                 valueRow(
                     title: "Screen context source",

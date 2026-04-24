@@ -5,6 +5,7 @@ final class OpenClickyMessageLogStore: @unchecked Sendable {
 
     private let fileManager: FileManager
     private let lock = NSLock()
+    private let writeQueue = DispatchQueue(label: "com.jkneen.openclicky.message-log-writes", qos: .utility)
 
     let logDirectory: URL
 
@@ -146,30 +147,34 @@ final class OpenClickyMessageLogStore: @unchecked Sendable {
     }
 
     func append(lane: String, direction: String, event: String, fields: [String: Any] = [:]) {
-        lock.lock()
-        defer { lock.unlock() }
+        let sanitizedFields = Self.sanitizedJSONObject(fields)
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
 
-        do {
-            try fileManager.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+            do {
+                try self.fileManager.createDirectory(at: self.logDirectory, withIntermediateDirectories: true)
 
-            let isoFormatter = ISO8601DateFormatter()
-            isoFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+                let isoFormatter = ISO8601DateFormatter()
+                isoFormatter.timeZone = TimeZone(secondsFromGMT: 0)
 
-            let entry: [String: Any] = [
-                "timestamp": isoFormatter.string(from: Date()),
-                "lane": lane,
-                "direction": direction,
-                "event": event,
-                "fields": Self.sanitizedJSONObject(fields)
-            ]
+                let entry: [String: Any] = [
+                    "timestamp": isoFormatter.string(from: Date()),
+                    "lane": lane,
+                    "direction": direction,
+                    "event": event,
+                    "fields": sanitizedFields
+                ]
 
-            guard JSONSerialization.isValidJSONObject(entry) else { return }
-            var data = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
-            data.append(0x0A)
+                guard JSONSerialization.isValidJSONObject(entry) else { return }
+                var data = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
+                data.append(0x0A)
 
-            try append(data, to: currentLogFile)
-        } catch {
-            print("OpenClicky message log write failed: \(error.localizedDescription)")
+                try self.append(data, to: self.currentLogFile)
+            } catch {
+                print("OpenClicky message log write failed: \(error.localizedDescription)")
+            }
         }
     }
 

@@ -56,6 +56,7 @@ class ClaudeAPI {
         request.timeoutInterval = 120
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
 
         return request
@@ -204,6 +205,22 @@ class ClaudeAPI {
                 userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"]
             )
         }
+        let connectedAt = Date()
+        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "unknown"
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "incoming",
+            event: "claude.streaming.connected",
+            fields: [
+                "model": model,
+                "statusCode": httpResponse.statusCode,
+                "contentType": contentType,
+                "payloadBytes": bodyData.count,
+                "connectionLatencyMs": Self.elapsedMilliseconds(from: startTime, to: connectedAt),
+                "transport": "sse",
+                "streamingMethod": "URLSession.bytes"
+            ]
+        )
 
         // If non-2xx status, read the full body as error text
         guard (200...299).contains(httpResponse.statusCode) else {
@@ -233,6 +250,8 @@ class ClaudeAPI {
 
         // Parse SSE stream — each event is "data: {json}\n\n"
         var accumulatedResponseText = ""
+        var textDeltaCount = 0
+        var firstTextDeltaAt: Date?
 
         for try await line in byteStream.lines {
             // SSE lines look like: "data: {...}"
@@ -254,6 +273,23 @@ class ClaudeAPI {
                let deltaType = delta["type"] as? String,
                deltaType == "text_delta",
                let textChunk = delta["text"] as? String {
+                textDeltaCount += 1
+                if firstTextDeltaAt == nil {
+                    firstTextDeltaAt = Date()
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "voice",
+                        direction: "incoming",
+                        event: "claude.streaming.first_text_delta",
+                        fields: [
+                            "model": model,
+                            "transport": "sse",
+                            "streamingMethod": "URLSession.bytes",
+                            "firstTokenLatencyMs": Self.elapsedMilliseconds(from: startTime, to: firstTextDeltaAt!),
+                            "connectionToFirstTokenMs": Self.elapsedMilliseconds(from: connectedAt, to: firstTextDeltaAt!),
+                            "chunkLength": textChunk.count
+                        ]
+                    )
+                }
                 accumulatedResponseText += textChunk
                 // Send the accumulated text so far to the UI for progressive rendering
                 let currentAccumulatedText = accumulatedResponseText
@@ -271,10 +307,19 @@ class ClaudeAPI {
             fields: [
                 "model": model,
                 "duration": duration,
+                "durationMs": Self.elapsedMilliseconds(from: startTime, to: Date()),
+                "textDeltaCount": textDeltaCount,
+                "firstTokenLatencyMs": firstTextDeltaAt.map { Self.elapsedMilliseconds(from: startTime, to: $0) } ?? -1,
+                "transport": "sse",
+                "streamingMethod": "URLSession.bytes",
                 "text": accumulatedResponseText
             ]
         )
         return (text: accumulatedResponseText, duration: duration)
+    }
+
+    private static func elapsedMilliseconds(from start: Date, to end: Date) -> Int {
+        max(0, Int((end.timeIntervalSince(start) * 1000).rounded()))
     }
 
     /// Non-streaming fallback for validation requests where we don't need progressive display.

@@ -442,7 +442,7 @@ final class CodexHomeManager {
 
         - Read `memory.md` before work and update it with stable user preferences, project facts, task outcomes, and useful workflow context.
         - Read `SOUL.md` before agent work. Treat it as OpenClicky's persona and operating identity.
-        - Check learned skills before repeat workflows, then create or update a learned skill after a workflow becomes repeatable.
+        - Use or update learned skills when explicitly useful, especially when the user asks to inspect, optimize, or learn from skills/logs. Do not surface learned-skill work in normal task progress unless asked.
         - When optimizing skills, prompts, memory files, logs-derived notes, or other OpenClicky artifacts, archive the previous version under \(archivesDirectory.path) before replacing it. Do not delete old versions.
         - When learning from logs, create the needed memory entries, review notes, or learned skills, then archive superseded notes or skills instead of deleting them.
         - Read log review comments when the user asks to review, tune, or fix behavior from logs.

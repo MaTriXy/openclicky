@@ -65,9 +65,22 @@
 		AA20FR060000000000000001 /* OpenClickyWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OpenClickyWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AA20EX010000000000000001 /* Exceptions for "leanring-buddy" folder in "leanring-buddy" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 28F22CBE2F56440300A0FC59 /* leanring-buddy */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		28F22CC12F56440300A0FC59 /* leanring-buddy */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AA20EX010000000000000001 /* Exceptions for "leanring-buddy" folder in "leanring-buddy" target */,
+			);
 			path = "leanring-buddy";
 			sourceTree = "<group>";
 		};
@@ -611,6 +624,7 @@
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				EXCLUDED_SOURCE_FILE_NAMES = Info.plist;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "leanring-buddy/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = OpenClicky;
@@ -650,6 +664,7 @@
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				EXCLUDED_SOURCE_FILE_NAMES = Info.plist;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "leanring-buddy/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = OpenClicky;

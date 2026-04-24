@@ -22,6 +22,15 @@ enum CompanionVoiceState {
     case responding
 }
 
+@MainActor
+final class CursorOverlayState: ObservableObject {
+    @Published var voiceState: CompanionVoiceState = .idle
+    @Published var currentAudioPowerLevel: CGFloat = 0
+    @Published var detectedElementScreenLocation: CGPoint?
+    @Published var detectedElementDisplayFrame: CGRect?
+    @Published var detectedElementBubbleText: String?
+}
+
 enum ClickyAgentDockStatus: Equatable {
     case starting
     case running
@@ -49,26 +58,125 @@ private struct OpenClickyNativeTypeRequest {
     let targetDescription: String
 }
 
+private struct OpenClickyNativeKeyPressRequest {
+    let key: String
+    let modifiers: [String]
+    let targetDescription: String
+}
+
+private struct OpenClickyFolderOpenRequest {
+    let url: URL
+    let displayName: String
+    let instruction: String
+}
+
+private struct OpenClickyReminderAddRequest {
+    let title: String
+    let instruction: String
+}
+
+private struct OpenClickyReminderCountRequest {
+    let instruction: String
+}
+
+private struct OpenClickyMessagesSearchRequest {
+    let personName: String
+    let instruction: String
+}
+
+nonisolated private struct OpenClickyLocalAutomationResult: Sendable {
+    let output: String
+    let errorOutput: String
+    let terminationStatus: Int32
+}
+
+private struct OpenClickyRequestTiming {
+    let requestID: String
+    let source: String
+    let text: String
+    let requestedAt: Date
+}
+
+nonisolated private enum OpenClickyLocalAutomationRunner {
+    static func runAppleScript(_ script: String) -> OpenClickyLocalAutomationResult {
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-ss", "-e", script]
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return OpenClickyLocalAutomationResult(
+                output: "",
+                errorOutput: error.localizedDescription,
+                terminationStatus: -1
+            )
+        }
+
+        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return OpenClickyLocalAutomationResult(
+            output: output.trimmingCharacters(in: .whitespacesAndNewlines),
+            errorOutput: errorOutput.trimmingCharacters(in: .whitespacesAndNewlines),
+            terminationStatus: process.terminationStatus
+        )
+    }
+
+    static func appleScriptStringLiteral(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
-    @Published private(set) var voiceState: CompanionVoiceState = .idle
+    let cursorOverlayState = CursorOverlayState()
+    @Published private(set) var voiceState: CompanionVoiceState = .idle {
+        didSet {
+            cursorOverlayState.voiceState = voiceState
+        }
+    }
     @Published private(set) var lastTranscript: String?
-    @Published private(set) var currentAudioPowerLevel: CGFloat = 0
+    @Published private(set) var currentAudioPowerLevel: CGFloat = 0 {
+        didSet {
+            cursorOverlayState.currentAudioPowerLevel = currentAudioPowerLevel
+        }
+    }
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
+    @Published private(set) var hasFullDiskAccessPermission = false
 
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from Claude's response;
     /// observed by BlueCursorView to trigger the flight animation.
-    @Published var detectedElementScreenLocation: CGPoint?
+    @Published var detectedElementScreenLocation: CGPoint? {
+        didSet {
+            cursorOverlayState.detectedElementScreenLocation = detectedElementScreenLocation
+        }
+    }
     /// The display frame (global AppKit coords) of the screen the detected
     /// element is on, so BlueCursorView knows which screen overlay should animate.
-    @Published var detectedElementDisplayFrame: CGRect?
+    @Published var detectedElementDisplayFrame: CGRect? {
+        didSet {
+            cursorOverlayState.detectedElementDisplayFrame = detectedElementDisplayFrame
+        }
+    }
     /// Custom speech bubble text for the pointing animation. When set,
     /// BlueCursorView uses this instead of a random pointer phrase.
-    @Published var detectedElementBubbleText: String?
+    @Published var detectedElementBubbleText: String? {
+        didSet {
+            cursorOverlayState.detectedElementBubbleText = detectedElementBubbleText
+        }
+    }
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -160,7 +268,14 @@ final class CompanionManager: ObservableObject {
     private var fallbackSpeechSynthesizer: AVSpeechSynthesizer?
     private var pendingAgentVoiceFollowUpSessionID: UUID?
     private var pendingAgentVoiceFollowUpCreatedAt: Date?
+    private var lastAgentContextSessionID: UUID?
     private var announcedAgentFileURLs: Set<String> = []
+    private var liveHandledComputerUseFingerprints: Set<String> = []
+    private var lastAgentProgressNarrationAt: Date?
+    private var currentFolderContextURL: URL?
+    private var activeRequestTiming: OpenClickyRequestTiming?
+    private var agentRequestTimingsBySessionID: [UUID: OpenClickyRequestTiming] = [:]
+    private var agentExecutionStartDatesBySessionID: [UUID: Date] = [:]
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var controlDoubleTapCancellable: AnyCancellable?
@@ -168,6 +283,7 @@ final class CompanionManager: ObservableObject {
     private var audioPowerCancellable: AnyCancellable?
     private var agentStatusCancellables: [UUID: AnyCancellable] = [:]
     private var agentActivityCancellables: [UUID: AnyCancellable] = [:]
+    private var pendingAgentActivityRefreshTasks: [UUID: Task<Void, Never>] = [:]
     private var tutorIdleCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
@@ -210,6 +326,15 @@ final class CompanionManager: ObservableObject {
         let initialAgentSession = CodexAgentSession(title: "Agent 1", accentTheme: .blue)
         codexAgentSessions = [initialAgentSession]
         activeCodexAgentSessionID = initialAgentSession.id
+        OpenClickyMessageLogStore.shared.append(
+            lane: "system",
+            direction: "outgoing",
+            event: "openclicky.runtime.started",
+            fields: [
+                "nativeCUARouterVersion": "direct-cua-explicit-agent-v4",
+                "agentAssignment": "explicit-only"
+            ]
+        )
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -255,6 +380,59 @@ final class CompanionManager: ObservableObject {
 
     func refreshNativeComputerUseFocusedTarget() {
         _ = nativeComputerUseController.refreshFocusedTarget()
+    }
+
+    func openFullDiskAccessSettings() {
+        NSWorkspace.shared.open(OpenClickyMacPrivacyPermissionProbe.fullDiskAccessSettingsURL)
+    }
+
+    func openAutomationSettings() {
+        NSWorkspace.shared.open(OpenClickyMacPrivacyPermissionProbe.automationSettingsURL)
+    }
+
+    func requestRemindersAutomationPermission() {
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "native_cua.automation_probe.started",
+            fields: [
+                "target": "Reminders"
+            ]
+        )
+
+        Task.detached(priority: .userInitiated) {
+            let result = OpenClickyLocalAutomationRunner.runAppleScript("""
+            tell application "Reminders"
+                count reminders
+            end tell
+            """)
+
+            await MainActor.run {
+                if result.terminationStatus == 0 {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "outgoing",
+                        event: "native_cua.automation_probe.ready",
+                        fields: [
+                            "target": "Reminders"
+                        ]
+                    )
+                    self.speakShortSystemResponse("Reminders automation is ready.")
+                } else {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "error",
+                        event: "native_cua.automation_probe.blocked",
+                        fields: [
+                            "target": "Reminders",
+                            "error": result.errorOutput.isEmpty ? result.output : result.errorOutput
+                        ]
+                    )
+                    self.openAutomationSettings()
+                    self.speakShortSystemResponse(Self.nativeAutomationErrorMessage(appName: "Reminders", result: result))
+                }
+            }
+        }
     }
 
     func showSettingsWindow() {
@@ -428,7 +606,7 @@ final class CompanionManager: ObservableObject {
             hasCompletedOnboarding = true
         }
         print("OpenClicky runtime identity - bundleID: \(Bundle.main.bundleIdentifier ?? "unknown"), appPath: \(Bundle.main.bundleURL.path)")
-        print("OpenClicky start - accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("OpenClicky start - accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), fullDiskAccess: \(hasFullDiskAccessPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -555,6 +733,8 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        pendingAgentActivityRefreshTasks.values.forEach { $0.cancel() }
+        pendingAgentActivityRefreshTasks.removeAll()
         shortcutTransitionCancellable?.cancel()
         stopTutorIdleObservation()
         voiceStateCancellable?.cancel()
@@ -567,6 +747,7 @@ final class CompanionManager: ObservableObject {
         let previouslyHadAccessibility = hasAccessibilityPermission
         let previouslyHadScreenRecording = hasScreenRecordingPermission
         let previouslyHadMicrophone = hasMicrophonePermission
+        let previouslyHadFullDiskAccess = hasFullDiskAccessPermission
         let previouslyHadAll = allPermissionsGranted
 
         let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
@@ -588,12 +769,14 @@ final class CompanionManager: ObservableObject {
         // permission is also present.
         let persistedScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
         hasScreenContentPermission = hasScreenRecordingPermission && persistedScreenContentPermission
+        hasFullDiskAccessPermission = OpenClickyMacPrivacyPermissionProbe.hasLikelyFullDiskAccess()
 
         // Debug: log permission state on changes
         if previouslyHadAccessibility != hasAccessibilityPermission
             || previouslyHadScreenRecording != hasScreenRecordingPermission
-            || previouslyHadMicrophone != hasMicrophonePermission {
-            print("Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission)")
+            || previouslyHadMicrophone != hasMicrophonePermission
+            || previouslyHadFullDiskAccess != hasFullDiskAccessPermission {
+            print("Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), fullDiskAccess: \(hasFullDiskAccessPermission)")
         }
 
         // Track individual permission grants as they happen
@@ -605,6 +788,9 @@ final class CompanionManager: ObservableObject {
         }
         if !previouslyHadMicrophone && hasMicrophonePermission {
             ClickyAnalytics.trackPermissionGranted(permission: "microphone")
+        }
+        if !previouslyHadFullDiskAccess && hasFullDiskAccessPermission {
+            ClickyAnalytics.trackPermissionGranted(permission: "full_disk_access")
         }
 
         if !previouslyHadAll && allPermissionsGranted {
@@ -777,15 +963,30 @@ final class CompanionManager: ObservableObject {
                 guard let self else { return }
                 self.updateAgentDockItem(for: sessionID, status: status)
                 self.scheduleWidgetSnapshotPublish()
+                self.updateAgentProgressNarration()
             }
 
         agentActivityCancellables[session.id] = session.$entries
             .receive(on: DispatchQueue.main)
-            .sink { [weak self, sessionID = session.id, weak session] _ in
-                guard let self, let session else { return }
+            .sink { [weak self, sessionID = session.id] _ in
+                self?.scheduleAgentActivityRefresh(for: sessionID)
+            }
+    }
+
+    private func scheduleAgentActivityRefresh(for sessionID: UUID) {
+        guard pendingAgentActivityRefreshTasks[sessionID] == nil else { return }
+
+        pendingAgentActivityRefreshTasks[sessionID] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            await MainActor.run {
+                guard let self else { return }
+                self.pendingAgentActivityRefreshTasks[sessionID] = nil
+                guard let session = self.codexAgentSessions.first(where: { $0.id == sessionID }) else { return }
                 self.updateAgentDockItem(for: sessionID, status: session.status)
                 self.scheduleWidgetSnapshotPublish()
+                self.updateAgentProgressNarration()
             }
+        }
     }
 
     @discardableResult
@@ -799,6 +1000,7 @@ final class CompanionManager: ObservableObject {
         codexAgentSessions.append(session)
         observeCodexAgentSession(session)
         activeCodexAgentSessionID = session.id
+        lastAgentContextSessionID = session.id
         scheduleWidgetSnapshotPublish()
         return session
     }
@@ -826,6 +1028,199 @@ final class CompanionManager: ObservableObject {
     func selectCodexAgentSession(_ sessionID: UUID) {
         guard codexAgentSessions.contains(where: { $0.id == sessionID }) else { return }
         activeCodexAgentSessionID = sessionID
+        lastAgentContextSessionID = sessionID
+    }
+
+    private func beginRequestTiming(source: String, text: String) -> OpenClickyRequestTiming {
+        let timing = OpenClickyRequestTiming(
+            requestID: UUID().uuidString,
+            source: source,
+            text: text,
+            requestedAt: Date()
+        )
+        OpenClickyMessageLogStore.shared.append(
+            lane: "request",
+            direction: "incoming",
+            event: "openclicky.request.received",
+            fields: requestTimingFields(
+                timing,
+                extra: [
+                    "textLength": text.count,
+                    "textPreview": Self.truncatedLogText(text, maxLength: 240)
+                ]
+            )
+        )
+        return timing
+    }
+
+    private func withActiveRequestTiming<T>(_ timing: OpenClickyRequestTiming, perform work: () -> T) -> T {
+        let previousTiming = activeRequestTiming
+        activeRequestTiming = timing
+        defer { activeRequestTiming = previousTiming }
+        return work()
+    }
+
+    private func markRequestExecutionStarted(
+        route: String,
+        timing: OpenClickyRequestTiming? = nil,
+        extra: [String: Any] = [:]
+    ) -> Date {
+        let startedAt = Date()
+        var fields = extra
+        fields["executionStartedAt"] = startedAt
+        OpenClickyMessageLogStore.shared.append(
+            lane: "request",
+            direction: "outgoing",
+            event: "openclicky.request.execution_started",
+            fields: requestTimingFields(
+                timing ?? activeRequestTiming,
+                route: route,
+                at: startedAt,
+                extra: fields
+            )
+        )
+        return startedAt
+    }
+
+    private func markRequestStageCompleted(
+        route: String,
+        stage: String,
+        stageStartedAt: Date,
+        timing: OpenClickyRequestTiming? = nil,
+        status: String = "success",
+        extra: [String: Any] = [:]
+    ) {
+        let completedAt = Date()
+        var fields = extra
+        fields["stage"] = stage
+        fields["status"] = status
+        fields["stageStartedAt"] = stageStartedAt
+        fields["stageCompletedAt"] = completedAt
+        fields["stageDurationMs"] = Self.elapsedMilliseconds(from: stageStartedAt, to: completedAt)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "request",
+            direction: "outgoing",
+            event: "openclicky.request.stage_completed",
+            fields: requestTimingFields(
+                timing ?? activeRequestTiming,
+                route: route,
+                status: status,
+                at: completedAt,
+                extra: fields
+            )
+        )
+    }
+
+    private func markRequestCompleted(
+        route: String,
+        executionStartedAt: Date? = nil,
+        timing: OpenClickyRequestTiming? = nil,
+        status: String = "success",
+        extra: [String: Any] = [:]
+    ) {
+        let completedAt = Date()
+        var fields = extra
+        fields["status"] = status
+        fields["completedAt"] = completedAt
+        if let executionStartedAt {
+            fields["executionStartedAt"] = executionStartedAt
+            fields["executionDurationMs"] = Self.elapsedMilliseconds(from: executionStartedAt, to: completedAt)
+        }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "request",
+            direction: status == "success" ? "outgoing" : "error",
+            event: "openclicky.request.completed",
+            fields: requestTimingFields(
+                timing ?? activeRequestTiming,
+                route: route,
+                status: status,
+                at: completedAt,
+                extra: fields
+            )
+        )
+    }
+
+    private func requestTimingFields(
+        _ timing: OpenClickyRequestTiming?,
+        route: String? = nil,
+        status: String? = nil,
+        at: Date = Date(),
+        extra: [String: Any] = [:]
+    ) -> [String: Any] {
+        var fields = extra
+        fields["timingEventAt"] = at
+        if let route {
+            fields["route"] = route
+        }
+        if let status {
+            fields["status"] = status
+        }
+        guard let timing else {
+            fields["requestID"] = "none"
+            return fields
+        }
+
+        fields["requestID"] = timing.requestID
+        fields["requestSource"] = timing.source
+        fields["requestReceivedAt"] = timing.requestedAt
+        fields["requestAgeMs"] = Self.elapsedMilliseconds(from: timing.requestedAt, to: at)
+        return fields
+    }
+
+    private static func elapsedMilliseconds(from start: Date, to end: Date) -> Int {
+        max(0, Int((end.timeIntervalSince(start) * 1000).rounded()))
+    }
+
+    private static func truncatedLogText(_ value: String, maxLength: Int) -> String {
+        let flattened = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard flattened.count > maxLength else { return flattened }
+        return String(flattened.prefix(maxLength))
+    }
+
+    private func voiceResponseExecutionFields() -> [String: Any] {
+        let selectedVoiceResponseModel = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel)
+        var fields: [String: Any] = [
+            "executor": "voice_response",
+            "model": selectedVoiceResponseModel.id,
+            "modelProvider": selectedVoiceResponseModel.provider.rawValue
+        ]
+
+        switch selectedVoiceResponseModel.provider {
+        case .anthropic:
+            if AppBundleConfiguration.anthropicAPIKey() != nil {
+                fields["executionMethod"] = "ClaudeAPI.analyzeImageStreaming"
+                fields["authMode"] = "anthropic_api_key"
+                fields["transport"] = "sse"
+                fields["streamingMethod"] = "URLSession.bytes"
+            } else {
+                fields["executionMethod"] = "ClaudeAgentSDKAPI.analyzeImageStreaming"
+                fields["authMode"] = "local_claude_agent_sdk"
+                fields["transport"] = "process_stream_json"
+                fields["streamingMethod"] = "claude_cli_stream_json_buffered"
+            }
+        case .openAI:
+            if AppBundleConfiguration.openAIAPIKey() != nil {
+                fields["executionMethod"] = "OpenAIAPI.analyzeImageStreaming"
+                fields["authMode"] = "openai_api_key"
+                fields["transport"] = "sse"
+                fields["streamingMethod"] = "URLSession.bytes"
+            } else {
+                fields["executionMethod"] = "CodexPointDetector.analyzeImageResponse"
+                fields["authMode"] = "local_codex"
+                fields["transport"] = "process"
+                fields["streamingMethod"] = "codex_exec_buffered"
+            }
+        case .codex:
+            fields["executionMethod"] = "CodexPointDetector.analyzeImageResponse"
+            fields["authMode"] = "local_codex"
+            fields["transport"] = "process"
+            fields["streamingMethod"] = "codex_exec_buffered"
+        }
+
+        return fields
     }
 
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
@@ -852,6 +1247,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             interruptCurrentVoiceResponse()
             clearDetectedElementLocation()
+            liveHandledComputerUseFingerprints.removeAll()
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -871,8 +1267,8 @@ final class CompanionManager: ObservableObject {
             pendingKeyboardShortcutStartTask = Task {
                 await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
                     currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
+                    updateDraftText: { [weak self] partialTranscript in
+                        self?.handleLiveComputerUseTranscript(partialTranscript)
                     },
                     submitDraftText: { [weak self] finalTranscript in
                         self?.handleFinalVoiceTranscript(finalTranscript)
@@ -895,23 +1291,36 @@ final class CompanionManager: ObservableObject {
 
     private func handleFinalVoiceTranscript(_ finalTranscript: String) {
         lastTranscript = finalTranscript
+        let requestTiming = beginRequestTiming(source: "voice_final_transcript", text: finalTranscript)
+        activeRequestTiming = requestTiming
+        defer { activeRequestTiming = nil }
         print("Companion received transcript: \(finalTranscript)")
         OpenClickyMessageLogStore.shared.append(
             lane: "voice",
             direction: "incoming",
             event: "voice.transcript",
             fields: [
-                "text": finalTranscript
+                "text": finalTranscript,
+                "requestID": requestTiming.requestID
             ]
         )
         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-        if submitPendingAgentVoiceFollowUp(finalTranscript) {
+        if handleAgentCancellationRequestIfNeeded(from: finalTranscript) {
             return
         }
         if handleAgentStatusQuestionIfNeeded(from: finalTranscript) {
             return
         }
-        if startAgentTaskIfRequested(from: finalTranscript) {
+        if startExplicitAgentTaskIfRequested(from: finalTranscript) {
+            return
+        }
+        if handleDirectComputerUseRequest(from: finalTranscript, source: "final_transcript") {
+            return
+        }
+        if submitPendingAgentVoiceFollowUp(finalTranscript) {
+            return
+        }
+        if submitContextualAgentFollowUp(finalTranscript, source: "voice") {
             return
         }
         sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
@@ -919,125 +1328,834 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Prompt
 
-    private func startAgentTaskIfRequested(from transcript: String) -> Bool {
-        if let taskCreationInstruction = Self.agentTaskCreationInstruction(from: transcript) {
-            guard !taskCreationInstruction.isEmpty else {
-                speakShortSystemResponse("what should the agent do?")
-                return true
-            }
+    private func handleLiveComputerUseTranscript(_ partialTranscript: String) {
+        let trimmedTranscript = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTranscript.count >= 8 else { return }
 
-            if let typeRequest = Self.nativeTypeRequest(from: taskCreationInstruction) {
-                typeTextUsingNativeComputerUse(typeRequest)
-                return true
+        let shouldTraceMiss = Self.isPotentialDirectComputerUseTranscript(trimmedTranscript)
+        if Self.shouldDeferLiveComputerUseForAgentRoute(trimmedTranscript) {
+            if shouldTraceMiss {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "incoming",
+                    event: "native_cua.live_partial.deferred_agent_route",
+                    fields: [
+                        "partialTranscript": trimmedTranscript
+                    ]
+                )
             }
-
-            print("OpenClicky agent task creation request detected: \(taskCreationInstruction)")
-            startVoiceAgentTask(instruction: taskCreationInstruction)
-            return true
+            return
         }
 
-        if Self.isIncompleteAgentTaskCreationRequest(from: transcript) {
-            speakShortSystemResponse("what should the agent do?")
-            return true
+        if let folderRequest = folderOpenRequest(from: trimmedTranscript) {
+            let fingerprint = Self.directComputerUseFingerprint(kind: "folder", value: folderRequest.url.path)
+            guard !liveHandledComputerUseFingerprints.contains(fingerprint) else { return }
+            liveHandledComputerUseFingerprints.insert(fingerprint)
+            let requestTiming = beginRequestTiming(source: "voice_live_partial", text: trimmedTranscript)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.live_partial.folder_detected",
+                fields: [
+                    "partialTranscript": trimmedTranscript,
+                    "executor": "native_cua",
+                    "route": "native_cua.open_folder",
+                    "executionMethod": "NSWorkspace.open",
+                    "path": folderRequest.url.path,
+                    "requestID": requestTiming.requestID
+                ]
+            )
+            withActiveRequestTiming(requestTiming) {
+                openRequestedFolder(folderRequest, shouldSpeak: false)
+            }
+            return
         }
 
-        let explicitInstruction = Self.clickyAgentInstruction(from: transcript)
-
-        if let explicitInstruction {
-            guard !explicitInstruction.isEmpty else {
-                print("OpenClicky agent trigger detected without an instruction.")
-                speakShortSystemResponse("say what you want the agent to do after the agent trigger.")
-                return true
+        if let appOpenRequest = Self.localAppOpenRequest(from: trimmedTranscript) {
+            let fingerprint = Self.directComputerUseFingerprint(kind: "app", value: appOpenRequest.appName)
+            guard !liveHandledComputerUseFingerprints.contains(fingerprint) else { return }
+            liveHandledComputerUseFingerprints.insert(fingerprint)
+            let requestTiming = beginRequestTiming(source: "voice_live_partial", text: trimmedTranscript)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.live_partial.app_detected",
+                fields: [
+                    "partialTranscript": trimmedTranscript,
+                    "executor": "native_cua",
+                    "route": "native_cua.open_app",
+                    "executionMethod": "launchApplication(named:)",
+                    "appName": appOpenRequest.appName,
+                    "requestID": requestTiming.requestID
+                ]
+            )
+            withActiveRequestTiming(requestTiming) {
+                _ = openRequestedApplication(appOpenRequest, shouldSpeak: false)
             }
+            return
+        }
 
-            let instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
-            if let typeRequest = Self.nativeTypeRequest(from: instruction) {
-                typeTextUsingNativeComputerUse(typeRequest)
-                return true
+        if let keyPressRequest = Self.nativeKeyPressRequest(from: trimmedTranscript) {
+            let fingerprint = Self.directComputerUseFingerprint(
+                kind: "key",
+                value: "\(keyPressRequest.modifiers.joined(separator: "+"))+\(keyPressRequest.key)"
+            )
+            guard !liveHandledComputerUseFingerprints.contains(fingerprint) else { return }
+            liveHandledComputerUseFingerprints.insert(fingerprint)
+            let requestTiming = beginRequestTiming(source: "voice_live_partial", text: trimmedTranscript)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.live_partial.key_detected",
+                fields: [
+                    "partialTranscript": trimmedTranscript,
+                    "executor": "native_cua",
+                    "route": "native_cua.press_key",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "key": keyPressRequest.key,
+                    "modifiers": keyPressRequest.modifiers.joined(separator: ","),
+                    "requestID": requestTiming.requestID
+                ]
+            )
+            withActiveRequestTiming(requestTiming) {
+                pressKeyUsingNativeComputerUse(keyPressRequest, shouldSpeak: false)
             }
+            return
+        }
 
-            if let appOpenRequest = Self.localAppOpenRequest(from: instruction) {
-                openRequestedApplication(appOpenRequest)
-                return true
-            }
-            if Self.isIncompleteLocalAppOpenRequest(from: instruction) {
-                speakShortSystemResponse("what app should I open?")
-                return true
-            }
+        if shouldTraceMiss {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.live_partial.no_direct_match",
+                fields: [
+                    "partialTranscript": trimmedTranscript
+                ]
+            )
+        }
+    }
 
-            print("OpenClicky agent task detected; starting agent task: \(instruction)")
-            startVoiceAgentTask(instruction: instruction)
+    private func handleDirectComputerUseRequest(from transcript: String, source: String) -> Bool {
+        if let folderRequest = folderOpenRequest(from: transcript) {
+            let fingerprint = Self.directComputerUseFingerprint(kind: "folder", value: folderRequest.url.path)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.folder_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.open_folder",
+                    "executionMethod": "NSWorkspace.open",
+                    "path": folderRequest.url.path,
+                    "alreadyHandledLive": liveHandledComputerUseFingerprints.contains(fingerprint),
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            if liveHandledComputerUseFingerprints.contains(fingerprint) {
+                let executionStartedAt = markRequestExecutionStarted(
+                    route: "native_cua.open_folder.already_handled_live",
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "path": folderRequest.url.path
+                    ]
+                )
+                speakShortSystemResponse("opening \(folderRequest.displayName).")
+                markRequestCompleted(
+                    route: "native_cua.open_folder.already_handled_live",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "path": folderRequest.url.path
+                    ]
+                )
+            } else {
+                openRequestedFolder(folderRequest)
+            }
             return true
         }
 
         if let appOpenRequest = Self.localAppOpenRequest(from: transcript) {
-            openRequestedApplication(appOpenRequest)
+            let fingerprint = Self.directComputerUseFingerprint(kind: "app", value: appOpenRequest.appName)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.app_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.open_app",
+                    "executionMethod": "launchApplication(named:)",
+                    "appName": appOpenRequest.appName,
+                    "alreadyHandledLive": liveHandledComputerUseFingerprints.contains(fingerprint),
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            if liveHandledComputerUseFingerprints.contains(fingerprint) {
+                let executionStartedAt = markRequestExecutionStarted(
+                    route: "native_cua.open_app.already_handled_live",
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "appName": appOpenRequest.appName
+                    ]
+                )
+                speakShortSystemResponse("opening \(appOpenRequest.appName).")
+                markRequestCompleted(
+                    route: "native_cua.open_app.already_handled_live",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "appName": appOpenRequest.appName
+                    ]
+                )
+            } else {
+                _ = openRequestedApplication(appOpenRequest)
+            }
             return true
         }
 
-        if Self.isIncompleteLocalAppOpenRequest(from: transcript) {
-            speakShortSystemResponse("what app should I open?")
+        if let reminderAddRequest = Self.reminderAddRequest(from: transcript) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.reminder_add_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.reminder_add",
+                    "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                    "title": reminderAddRequest.title,
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            addReminderUsingNativeAutomation(reminderAddRequest)
+            return true
+        }
+
+        if let reminderCountRequest = Self.reminderCountRequest(from: transcript) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.reminder_count_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.reminder_count",
+                    "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            countRemindersUsingNativeAutomation(reminderCountRequest)
+            return true
+        }
+
+        if let messagesSearchRequest = Self.messagesSearchRequest(from: transcript) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.messages_search_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.messages_search",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                    "personName": messagesSearchRequest.personName,
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            searchMessagesUsingNativeComputerUse(messagesSearchRequest)
             return true
         }
 
         if let typeRequest = Self.nativeTypeRequest(from: transcript) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.type_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.type_text",
+                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "textLength": typeRequest.text.count,
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
             typeTextUsingNativeComputerUse(typeRequest)
             return true
         }
 
-        if let filesystemInstruction = Self.implicitFilesystemTaskInstruction(from: transcript) {
-            print("OpenClicky filesystem request detected; starting agent task: \(filesystemInstruction)")
-            startVoiceAgentTask(
-                instruction: filesystemInstruction,
-                acknowledgement: Self.filesystemTaskAcknowledgement(from: transcript)
+        if let keyPressRequest = Self.nativeKeyPressRequest(from: transcript) {
+            let fingerprint = Self.directComputerUseFingerprint(
+                kind: "key",
+                value: "\(keyPressRequest.modifiers.joined(separator: "+"))+\(keyPressRequest.key)"
             )
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "incoming",
+                event: "native_cua.direct_request.key_detected",
+                fields: [
+                    "source": source,
+                    "transcript": transcript,
+                    "executor": "native_cua",
+                    "route": "native_cua.press_key",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "key": keyPressRequest.key,
+                    "modifiers": keyPressRequest.modifiers.joined(separator: ","),
+                    "alreadyHandledLive": liveHandledComputerUseFingerprints.contains(fingerprint),
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+            if liveHandledComputerUseFingerprints.contains(fingerprint) {
+                let modifierText = keyPressRequest.modifiers.isEmpty ? "" : keyPressRequest.modifiers.joined(separator: " ") + " "
+                let executionStartedAt = markRequestExecutionStarted(
+                    route: "native_cua.press_key.already_handled_live",
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "key": keyPressRequest.key,
+                        "modifiers": keyPressRequest.modifiers.joined(separator: ",")
+                    ]
+                )
+                speakShortSystemResponse("pressed \(modifierText)\(keyPressRequest.key).")
+                markRequestCompleted(
+                    route: "native_cua.press_key.already_handled_live",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "live_partial_preexecuted",
+                        "key": keyPressRequest.key,
+                        "modifiers": keyPressRequest.modifiers.joined(separator: ",")
+                    ]
+                )
+            } else {
+                pressKeyUsingNativeComputerUse(keyPressRequest)
+            }
             return true
         }
 
-        if let liveLookupInstruction = Self.implicitLiveLookupInstruction(from: transcript) {
-            print("OpenClicky live lookup request detected; starting agent task: \(liveLookupInstruction)")
-            startVoiceAgentTask(instruction: liveLookupInstruction)
-            return true
-        }
-
-        guard let instruction = Self.implicitComputerUseInstruction(from: transcript) else {
-            print("OpenClicky agent trigger not detected; routing transcript to voice companion.")
-            return false
-        }
-
-        guard !instruction.isEmpty else {
-            print("OpenClicky agent trigger detected without an instruction.")
-            speakShortSystemResponse("say what you want the agent to do after the agent trigger.")
-            return true
-        }
-
-        let normalizedInstruction = Self.normalizedAgentTaskInstruction(from: instruction)
-        if let appOpenRequest = Self.localAppOpenRequest(from: normalizedInstruction) {
-            openRequestedApplication(appOpenRequest)
-            return true
-        }
-        if Self.isIncompleteLocalAppOpenRequest(from: normalizedInstruction) {
-            speakShortSystemResponse("what app should I open?")
-            return true
-        }
-
-        print("OpenClicky agent task detected; starting agent task: \(normalizedInstruction)")
-        startVoiceAgentTask(instruction: normalizedInstruction)
-        return true
+        return false
     }
 
-    private func openRequestedApplication(_ request: OpenClickyAppOpenRequest) {
+    @discardableResult
+    private func openRequestedApplication(
+        _ request: OpenClickyAppOpenRequest,
+        shouldSpeak: Bool = true,
+        logTiming: Bool = true
+    ) -> Bool {
+        let executionStartedAt = logTiming
+            ? markRequestExecutionStarted(
+                route: "native_cua.open_app",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "launchApplication(named:)",
+                    "controller": "NSWorkspace.openApplication_or_open_a",
+                    "appName": request.appName,
+                    "shouldSpeak": shouldSpeak
+                ]
+            )
+            : Date()
         if launchApplication(named: request.appName) {
-            speakShortSystemResponse("opening \(request.appName).")
-            return
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "outgoing",
+                event: "native_cua.open_app",
+                fields: [
+                    "executor": "native_cua",
+                    "executionMethod": "launchApplication(named:)",
+                    "controller": "NSWorkspace.openApplication_or_open_a",
+                    "appName": request.appName,
+                    "instruction": request.instruction
+                ]
+            )
+            if shouldSpeak {
+                speakShortSystemResponse("opening \(request.appName).")
+            }
+            if logTiming {
+                markRequestCompleted(
+                    route: "native_cua.open_app",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "launchApplication(named:)",
+                        "controller": "NSWorkspace.openApplication_or_open_a",
+                        "appName": request.appName
+                    ]
+                )
+            }
+            return true
         }
 
-        print("OpenClicky app open fallback to Agent Mode: \(request.instruction)")
-        startVoiceAgentTask(instruction: request.instruction)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "native_cua.open_app.failed",
+            fields: [
+                "executor": "native_cua",
+                "executionMethod": "launchApplication(named:)",
+                "controller": "NSWorkspace.openApplication_or_open_a",
+                "appName": request.appName,
+                "instruction": request.instruction
+            ]
+        )
+
+        if shouldSpeak {
+            speakShortSystemResponse("i couldn't open \(request.appName) through native CUA.")
+        }
+        if logTiming {
+            markRequestCompleted(
+                route: "native_cua.open_app",
+                executionStartedAt: executionStartedAt,
+                status: "failed",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "launchApplication(named:)",
+                    "controller": "NSWorkspace.openApplication_or_open_a",
+                    "appName": request.appName
+                ]
+            )
+        }
+        return false
+    }
+
+    private func openRequestedFolder(_ request: OpenClickyFolderOpenRequest, shouldSpeak: Bool = true) {
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.open_folder",
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "NSWorkspace.open",
+                "controller": "NSWorkspace",
+                "path": request.url.path,
+                "shouldSpeak": shouldSpeak
+            ]
+        )
+        NSWorkspace.shared.open(request.url)
+        currentFolderContextURL = request.url.standardizedFileURL
+        OpenClickyDirectActionMemoryStore.shared.recordFolderShortcut(
+            instruction: request.instruction,
+            url: request.url,
+            displayName: request.displayName
+        )
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: "opening \(request.displayName).",
+            contextTitle: request.instruction
+        )
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "native_cua.open_folder",
+            fields: [
+                "executor": "native_cua",
+                "executionMethod": "NSWorkspace.open",
+                "controller": "NSWorkspace",
+                "path": request.url.path,
+                "instruction": request.instruction
+            ]
+        )
+        if shouldSpeak {
+            speakShortSystemResponse("opening \(request.displayName).")
+        }
+        markRequestCompleted(
+            route: "native_cua.open_folder",
+            executionStartedAt: executionStartedAt,
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "NSWorkspace.open",
+                "controller": "NSWorkspace",
+                "path": request.url.path
+            ]
+        )
+    }
+
+    private func folderOpenRequest(from transcript: String) -> OpenClickyFolderOpenRequest? {
+        if let request = Self.localFolderOpenRequest(from: transcript) {
+            return request
+        }
+
+        guard let currentFolderContextURL,
+              let relativeRequest = Self.relativeFolderOpenRequest(
+                from: transcript,
+                baseURL: currentFolderContextURL
+              ) else {
+            return nil
+        }
+
+        return relativeRequest
+    }
+
+    private func addReminderUsingNativeAutomation(_ request: OpenClickyReminderAddRequest) {
+        interruptCurrentVoiceResponse()
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.reminder_add",
+            timing: timing,
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                "controller": "/usr/bin/osascript",
+                "automationTarget": "Reminders",
+                "title": request.title
+            ]
+        )
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: "adding \(request.title) to Reminders.",
+            contextTitle: "Native CUA"
+        )
+
+        let title = request.title
+        let instruction = request.instruction
+        Task.detached(priority: .userInitiated) {
+            let titleLiteral = OpenClickyLocalAutomationRunner.appleScriptStringLiteral(title)
+            let script = """
+            tell application "Reminders"
+                set targetList to default list
+                make new reminder at end of reminders of targetList with properties {name:\(titleLiteral)}
+            end tell
+            """
+            let result = OpenClickyLocalAutomationRunner.runAppleScript(script)
+
+            await MainActor.run {
+                if result.terminationStatus == 0 {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "outgoing",
+                        event: "native_cua.reminder_added",
+                        fields: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "title": title,
+                            "instruction": instruction
+                        ]
+                    )
+                    self.speakShortSystemResponse("added \(title) to Reminders.")
+                    self.markRequestCompleted(
+                        route: "native_cua.reminder_add",
+                        executionStartedAt: executionStartedAt,
+                        timing: timing,
+                        extra: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "title": title
+                        ]
+                    )
+                } else {
+                    let message = Self.nativeAutomationErrorMessage(
+                        appName: "Reminders",
+                        result: result
+                    )
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "error",
+                        event: "native_cua.reminder_add_error",
+                        fields: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "title": title,
+                            "instruction": instruction,
+                            "error": result.errorOutput.isEmpty ? result.output : result.errorOutput
+                        ]
+                    )
+                    self.speakShortSystemResponse(message)
+                    self.markRequestCompleted(
+                        route: "native_cua.reminder_add",
+                        executionStartedAt: executionStartedAt,
+                        timing: timing,
+                        status: "failed",
+                        extra: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "title": title,
+                            "error": result.errorOutput.isEmpty ? result.output : result.errorOutput
+                        ]
+                    )
+                }
+            }
+        }
+    }
+
+    private func countRemindersUsingNativeAutomation(_ request: OpenClickyReminderCountRequest) {
+        interruptCurrentVoiceResponse()
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.reminder_count",
+            timing: timing,
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                "controller": "/usr/bin/osascript",
+                "automationTarget": "Reminders"
+            ]
+        )
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: "checking Reminders directly.",
+            contextTitle: "Native CUA"
+        )
+
+        let instruction = request.instruction
+        Task.detached(priority: .userInitiated) {
+            let script = """
+            tell application "Reminders"
+                set openReminderCount to count of (reminders whose completed is false)
+            end tell
+            return openReminderCount as text
+            """
+            let result = OpenClickyLocalAutomationRunner.runAppleScript(script)
+
+            await MainActor.run {
+                if result.terminationStatus == 0 {
+                    let rawCount = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let count = Int(rawCount) ?? 0
+                    let noun = count == 1 ? "open reminder" : "open reminders"
+                    let response = "you have \(count) \(noun)."
+                    self.latestVoiceResponseCard = ClickyResponseCard(
+                        source: .voice,
+                        rawText: response,
+                        contextTitle: "Reminders"
+                    )
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "outgoing",
+                        event: "native_cua.reminder_count",
+                        fields: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "count": count,
+                            "instruction": instruction
+                        ]
+                    )
+                    self.speakShortSystemResponse(response)
+                    self.markRequestCompleted(
+                        route: "native_cua.reminder_count",
+                        executionStartedAt: executionStartedAt,
+                        timing: timing,
+                        extra: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "count": count
+                        ]
+                    )
+                } else {
+                    let message = Self.nativeAutomationErrorMessage(
+                        appName: "Reminders",
+                        result: result
+                    )
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "error",
+                        event: "native_cua.reminder_count_error",
+                        fields: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "instruction": instruction,
+                            "error": result.errorOutput.isEmpty ? result.output : result.errorOutput
+                        ]
+                    )
+                    self.speakShortSystemResponse(message)
+                    self.markRequestCompleted(
+                        route: "native_cua.reminder_count",
+                        executionStartedAt: executionStartedAt,
+                        timing: timing,
+                        status: "failed",
+                        extra: [
+                            "executor": "native_cua",
+                            "executionMethod": "OpenClickyLocalAutomationRunner.runAppleScript",
+                            "controller": "/usr/bin/osascript",
+                            "automationTarget": "Reminders",
+                            "error": result.errorOutput.isEmpty ? result.output : result.errorOutput
+                        ]
+                    )
+                }
+            }
+        }
+    }
+
+    private func searchMessagesUsingNativeComputerUse(_ request: OpenClickyMessagesSearchRequest) {
+        interruptCurrentVoiceResponse()
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.messages_search",
+            timing: timing,
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                "controller": "OpenClickyNativeComputerUseController",
+                "appName": "Messages",
+                "personName": request.personName
+            ]
+        )
+        let appRequest = OpenClickyAppOpenRequest(appName: "Messages", instruction: "Open Messages.")
+        _ = openRequestedApplication(appRequest, shouldSpeak: false, logTiming: false)
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: "searching Messages for \(request.personName).",
+            contextTitle: "Native CUA"
+        )
+
+        let personName = request.personName
+        let instruction = request.instruction
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "native_cua.messages_search_started",
+            fields: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                "controller": "OpenClickyNativeComputerUseController",
+                "appName": "Messages",
+                "personName": personName,
+                "instruction": instruction
+            ]
+        )
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            Self.activateRunningApplication(named: "Messages")
+
+            if !nativeComputerUseController.isEnabled {
+                nativeComputerUseController.setEnabled(true)
+            }
+
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard let targetWindow = nativeComputerUseController.refreshFocusedTarget() else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "native_cua.messages_search_error",
+                    fields: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.refreshFocusedTarget",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "instruction": instruction,
+                        "error": "No focused Messages window"
+                    ]
+                )
+                speakShortSystemResponse("opened Messages, but I couldn't focus its search field.")
+                markRequestCompleted(
+                    route: "native_cua.messages_search",
+                    executionStartedAt: executionStartedAt,
+                    timing: timing,
+                    status: "failed",
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.refreshFocusedTarget",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "error": "No focused Messages window"
+                    ]
+                )
+                return
+            }
+
+            do {
+                try nativeComputerUseController.pressKey("f", modifiers: ["command"], toPid: targetWindow.pid)
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                try nativeComputerUseController.pressKey("a", modifiers: ["command"], toPid: targetWindow.pid)
+                try nativeComputerUseController.typeText(personName, delayMilliseconds: 8, toPid: targetWindow.pid)
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "outgoing",
+                    event: "native_cua.messages_search",
+                    fields: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "target": targetWindow.agentContextNote,
+                        "instruction": instruction
+                    ]
+                )
+                speakShortSystemResponse("searching Messages for \(personName).")
+                markRequestCompleted(
+                    route: "native_cua.messages_search",
+                    executionStartedAt: executionStartedAt,
+                    timing: timing,
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "target": targetWindow.agentContextNote
+                    ]
+                )
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "native_cua.messages_search_error",
+                    fields: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "target": targetWindow.agentContextNote,
+                        "instruction": instruction,
+                        "error": error.localizedDescription
+                    ]
+                )
+                speakShortSystemResponse("Messages search hit a native CUA blocker: \(error.localizedDescription)")
+                markRequestCompleted(
+                    route: "native_cua.messages_search",
+                    executionStartedAt: executionStartedAt,
+                    timing: timing,
+                    status: "failed",
+                    extra: [
+                        "executor": "native_cua",
+                        "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                        "controller": "OpenClickyNativeComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "target": targetWindow.agentContextNote,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
     }
 
     private func typeTextUsingNativeComputerUse(_ request: OpenClickyNativeTypeRequest) {
         interruptCurrentVoiceResponse()
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.type_text",
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                "controller": "OpenClickyNativeComputerUseController",
+                "textLength": request.text.count
+            ]
+        )
 
         if !nativeComputerUseController.isEnabled {
             nativeComputerUseController.setEnabled(true)
@@ -1045,6 +2163,17 @@ final class CompanionManager: ObservableObject {
 
         guard let targetWindow = nativeComputerUseController.refreshFocusedTarget() else {
             speakShortSystemResponse("i don't have a target window to type into.")
+            markRequestCompleted(
+                route: "native_cua.type_text",
+                executionStartedAt: executionStartedAt,
+                status: "failed",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.refreshFocusedTarget",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "error": "No focused target window"
+                ]
+            )
             return
         }
 
@@ -1062,45 +2191,211 @@ final class CompanionManager: ObservableObject {
                 direction: "outgoing",
                 event: "native_cua.type_text",
                 fields: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "controller": "OpenClickyNativeComputerUseController",
                     "target": targetWindow.agentContextNote,
                     "textLength": request.text.count
                 ]
             )
             speakShortSystemResponse(acknowledgement)
+            markRequestCompleted(
+                route: "native_cua.type_text",
+                executionStartedAt: executionStartedAt,
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "textLength": request.text.count
+                ]
+            )
         } catch {
             OpenClickyMessageLogStore.shared.append(
                 lane: "computer-use",
                 direction: "error",
                 event: "native_cua.type_text_error",
                 fields: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "controller": "OpenClickyNativeComputerUseController",
                     "target": targetWindow.agentContextNote,
                     "error": error.localizedDescription
                 ]
             )
             speakShortSystemResponse("native typing hit a blocker: \(error.localizedDescription)")
+            markRequestCompleted(
+                route: "native_cua.type_text",
+                executionStartedAt: executionStartedAt,
+                status: "failed",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "error": error.localizedDescription
+                ]
+            )
+        }
+    }
+
+    private func pressKeyUsingNativeComputerUse(_ request: OpenClickyNativeKeyPressRequest, shouldSpeak: Bool = true) {
+        if shouldSpeak {
+            interruptCurrentVoiceResponse()
+        }
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "native_cua.press_key",
+            extra: [
+                "executor": "native_cua",
+                "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                "controller": "OpenClickyNativeComputerUseController",
+                "key": request.key,
+                "modifiers": request.modifiers.joined(separator: ","),
+                "shouldSpeak": shouldSpeak
+            ]
+        )
+
+        if !nativeComputerUseController.isEnabled {
+            nativeComputerUseController.setEnabled(true)
+        }
+
+        guard let targetWindow = nativeComputerUseController.refreshFocusedTarget() else {
+            if shouldSpeak {
+                speakShortSystemResponse("i don't have a target window for that key press.")
+            }
+            markRequestCompleted(
+                route: "native_cua.press_key",
+                executionStartedAt: executionStartedAt,
+                status: "failed",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.refreshFocusedTarget",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "key": request.key,
+                    "error": "No focused target window"
+                ]
+            )
+            return
+        }
+
+        do {
+            try nativeComputerUseController.pressKey(request.key, modifiers: request.modifiers, toPid: targetWindow.pid)
+            let modifierText = request.modifiers.isEmpty ? "" : request.modifiers.joined(separator: " ") + " "
+            let target = targetWindow.owner.trimmingCharacters(in: .whitespacesAndNewlines)
+            let acknowledgement = target.isEmpty
+                ? "pressed \(modifierText)\(request.key) in the focused window."
+                : "pressed \(modifierText)\(request.key) in \(target)."
+            latestVoiceResponseCard = ClickyResponseCard(
+                source: .voice,
+                rawText: acknowledgement,
+                contextTitle: request.targetDescription
+            )
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "outgoing",
+                event: "native_cua.press_key",
+                fields: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "key": request.key,
+                    "modifiers": request.modifiers.joined(separator: ",")
+                ]
+            )
+            if shouldSpeak {
+                speakShortSystemResponse(acknowledgement)
+            }
+            markRequestCompleted(
+                route: "native_cua.press_key",
+                executionStartedAt: executionStartedAt,
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "key": request.key,
+                    "modifiers": request.modifiers.joined(separator: ",")
+                ]
+            )
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "error",
+                event: "native_cua.press_key_error",
+                fields: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "key": request.key,
+                    "error": error.localizedDescription
+                ]
+            )
+            if shouldSpeak {
+                speakShortSystemResponse("native key press hit a blocker: \(error.localizedDescription)")
+            }
+            markRequestCompleted(
+                route: "native_cua.press_key",
+                executionStartedAt: executionStartedAt,
+                status: "failed",
+                extra: [
+                    "executor": "native_cua",
+                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "controller": "OpenClickyNativeComputerUseController",
+                    "target": targetWindow.agentContextNote,
+                    "key": request.key,
+                    "error": error.localizedDescription
+                ]
+            )
         }
     }
 
     private func launchApplication(named appName: String) -> Bool {
-        if let bundleIdentifier = Self.applicationBundleIdentifier(for: appName),
-           let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
-            return NSWorkspace.shared.open(appURL)
+        for bundleIdentifier in Self.applicationBundleIdentifiers(for: appName) {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+                Self.openApplication(at: appURL, appName: appName)
+                return true
+            }
         }
 
         if let appURL = Self.standardApplicationURL(named: appName) {
-            return NSWorkspace.shared.open(appURL)
+            Self.openApplication(at: appURL, appName: appName)
+            return true
         }
 
+        return runOpenApplication(arguments: ["-a", appName])
+    }
+
+    private static func openApplication(at appURL: URL, appName: String) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, error in
+            if let error {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "native_cua.open_app.activation_failed",
+                    fields: [
+                        "appName": appName,
+                        "path": appURL.path,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+    }
+
+    private func runOpenApplication(arguments: [String]) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", appName]
+        process.arguments = arguments
 
         do {
             try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
+            return true
         } catch {
-            print("OpenClicky app open failed for \(appName): \(error)")
+            print("OpenClicky app open failed for arguments \(arguments): \(error)")
             return false
         }
     }
@@ -1128,16 +2423,31 @@ final class CompanionManager: ObservableObject {
         let trimmedText = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
 
+        let requestTiming = beginRequestTiming(source: "text_mode", text: trimmedText)
+        activeRequestTiming = requestTiming
+        defer { activeRequestTiming = nil }
         lastTranscript = trimmedText
         ClickyAnalytics.trackUserMessageSent(transcript: trimmedText)
         interruptCurrentVoiceResponse()
         clearDetectedElementLocation()
 
+        if handleAgentCancellationRequestIfNeeded(from: trimmedText) {
+            return
+        }
+
+        if handleDirectComputerUseRequest(from: trimmedText, source: "text_mode") {
+            return
+        }
+
         if handleAgentStatusQuestionIfNeeded(from: trimmedText) {
             return
         }
 
-        if startAgentTaskIfRequested(from: trimmedText) {
+        if startExplicitAgentTaskIfRequested(from: trimmedText) {
+            return
+        }
+
+        if submitContextualAgentFollowUp(trimmedText, source: "text") {
             return
         }
 
@@ -1148,28 +2458,516 @@ final class CompanionManager: ObservableObject {
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty else { return false }
         guard let sessionID = pendingAgentVoiceFollowUpSessionID else { return false }
-        if let createdAt = pendingAgentVoiceFollowUpCreatedAt,
-           Date().timeIntervalSince(createdAt) > 90 {
-            pendingAgentVoiceFollowUpSessionID = nil
-            pendingAgentVoiceFollowUpCreatedAt = nil
-            return false
-        }
         pendingAgentVoiceFollowUpSessionID = nil
         pendingAgentVoiceFollowUpCreatedAt = nil
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "pending_voice_followup",
+                "sessionID": sessionID.uuidString,
+                "instructionLength": trimmedTranscript.count
+            ]
+        )
 
         guard let session = codexAgentSessions.first(where: { $0.id == sessionID }) else {
             speakShortSystemResponse("i lost track of that agent. open the agent dock and try again.")
+            markRequestCompleted(
+                route: "agent.followup",
+                executionStartedAt: executionStartedAt,
+                timing: timing,
+                status: "failed",
+                extra: [
+                    "executor": "agent_mode",
+                    "executionMethod": "CodexAgentSession.lookup",
+                    "controller": "CompanionManager",
+                    "source": "pending_voice_followup",
+                    "sessionID": sessionID.uuidString,
+                    "error": "Missing agent session"
+                ]
+            )
             return true
         }
 
         selectCodexAgentSession(sessionID)
         submitAgentPrompt(trimmedTranscript, to: session)
+        lastAgentContextSessionID = sessionID
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "pending_voice_followup",
+                "sessionID": sessionID.uuidString,
+                "title": session.title,
+                "model": session.model
+            ]
+        )
         speakShortSystemResponse("sent that to \(session.title).")
         return true
     }
 
+    private func submitContextualAgentFollowUp(_ transcript: String, source: String) -> Bool {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty else { return false }
+        guard !Self.isExplicitNewTaskRequest(trimmedTranscript) else { return false }
+        guard let session = latestSteerableAgentSession() else { return false }
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": source,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "instructionLength": trimmedTranscript.count
+            ]
+        )
+
+        selectCodexAgentSession(session.id)
+        submitAgentPrompt(trimmedTranscript, to: session)
+        lastAgentContextSessionID = session.id
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_followup.steered",
+            fields: [
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "source": source,
+                "instruction": trimmedTranscript
+            ]
+        )
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": source,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "model": session.model
+            ]
+        )
+        speakShortSystemResponse("sent that to \(session.title).")
+        return true
+    }
+
+    private func latestSteerableAgentSession() -> CodexAgentSession? {
+        if let activeSession = codexAgentSessions.first(where: { $0.id == activeCodexAgentSessionID }),
+           Self.isSteerableAgentStatus(activeSession.status),
+           activeSession.hasVisibleActivity {
+            return activeSession
+        }
+
+        if let lastAgentContextSessionID,
+           let lastContextSession = codexAgentSessions.first(where: { $0.id == lastAgentContextSessionID }),
+           Self.isSteerableAgentStatus(lastContextSession.status),
+           lastContextSession.hasVisibleActivity {
+            return lastContextSession
+        }
+
+        for dockItem in agentDockItems.reversed() {
+            guard let sessionID = dockItem.sessionID,
+                  let session = codexAgentSessions.first(where: { $0.id == sessionID }),
+                  Self.isSteerableAgentStatus(session.status),
+                  session.hasVisibleActivity else {
+                continue
+            }
+            return session
+        }
+
+        return nil
+    }
+
+    private static func isSteerableAgentStatus(_ status: CodexAgentSessionStatus) -> Bool {
+        switch status {
+        case .stopped:
+            return false
+        case .starting, .ready, .running, .failed:
+            return true
+        }
+    }
+
+    private func handleAgentCancellationRequestIfNeeded(from transcript: String) -> Bool {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty else { return false }
+
+        if Self.isCancelAllAgentTasksRequest(trimmedTranscript) {
+            cancelAllAgentTasks()
+            return true
+        }
+
+        if Self.isCancelCurrentAgentTaskRequest(trimmedTranscript) {
+            cancelCurrentAgentTask()
+            return true
+        }
+
+        return false
+    }
+
+    private func cancelAllAgentTasks() {
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.cancel_all",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.stop",
+                "controller": "CodexAgentSession"
+            ]
+        )
+        let sessionIDsToCancel = Set(agentDockItems.compactMap(\.sessionID))
+        var cancelledCount = 0
+
+        for session in codexAgentSessions {
+            guard sessionIDsToCancel.contains(session.id) || Self.isSteerableAgentStatus(session.status) else {
+                continue
+            }
+            session.stop()
+            cancelledCount += 1
+        }
+
+        agentDockItems.removeAll()
+        agentDockWindowManager.hide()
+        pendingAgentVoiceFollowUpSessionID = nil
+        pendingAgentVoiceFollowUpCreatedAt = nil
+        lastAgentContextSessionID = nil
+        scheduleWidgetSnapshotPublish()
+
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_tasks.cancelled_all",
+            fields: [
+                "count": cancelledCount
+            ]
+        )
+        markRequestCompleted(
+            route: "agent.cancel_all",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.stop",
+                "controller": "CodexAgentSession",
+                "cancelledCount": cancelledCount
+            ]
+        )
+
+        let response: String
+        if cancelledCount == 0 {
+            response = "there aren't any active agent tasks to cancel."
+        } else if cancelledCount == 1 {
+            response = "cancelled the agent task."
+        } else {
+            response = "cancelled all agent tasks."
+        }
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: response,
+            contextTitle: "Agent tasks"
+        )
+        speakShortSystemResponse(response)
+    }
+
+    private func cancelCurrentAgentTask() {
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.cancel_current",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.stop",
+                "controller": "CodexAgentSession"
+            ]
+        )
+        guard let session = latestSteerableAgentSession() else {
+            speakShortSystemResponse("there isn't an active agent task to cancel.")
+            markRequestCompleted(
+                route: "agent.cancel_current",
+                executionStartedAt: executionStartedAt,
+                timing: timing,
+                status: "failed",
+                extra: [
+                    "executor": "agent_mode",
+                    "executionMethod": "latestSteerableAgentSession",
+                    "controller": "CompanionManager",
+                    "error": "No active agent task"
+                ]
+            )
+            return
+        }
+
+        cancelAgentTask(sessionID: session.id, removeDockItems: true)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_task.cancelled",
+            fields: [
+                "sessionID": session.id.uuidString,
+                "title": session.title
+            ]
+        )
+        markRequestCompleted(
+            route: "agent.cancel_current",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.stop",
+                "controller": "CodexAgentSession",
+                "sessionID": session.id.uuidString,
+                "title": session.title
+            ]
+        )
+        speakShortSystemResponse("cancelled \(session.title).")
+    }
+
+    private func cancelAgentTask(sessionID: UUID, removeDockItems: Bool) {
+        codexAgentSessions.first(where: { $0.id == sessionID })?.stop()
+        completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "cancelled")
+        if removeDockItems {
+            agentDockItems.removeAll { $0.sessionID == sessionID }
+        }
+        if pendingAgentVoiceFollowUpSessionID == sessionID {
+            pendingAgentVoiceFollowUpSessionID = nil
+            pendingAgentVoiceFollowUpCreatedAt = nil
+        }
+        if lastAgentContextSessionID == sessionID {
+            lastAgentContextSessionID = nil
+        }
+        if agentDockItems.isEmpty {
+            agentDockWindowManager.hide()
+        }
+        scheduleWidgetSnapshotPublish()
+    }
+
+    private func startExplicitAgentTaskIfRequested(from transcript: String) -> Bool {
+        if let newTaskInstruction = Self.explicitNewTaskInstruction(from: transcript) {
+            guard !newTaskInstruction.isEmpty else {
+                speakShortSystemResponse("what should the new task be?")
+                return true
+            }
+
+            startVoiceAgentTask(instruction: newTaskInstruction)
+            return true
+        }
+
+        if Self.isIncompleteExplicitNewTaskRequest(from: transcript) {
+            speakShortSystemResponse("what should the new task be?")
+            return true
+        }
+
+        if let taskCreationInstruction = Self.agentTaskCreationInstruction(from: transcript) {
+            guard !taskCreationInstruction.isEmpty else {
+                speakShortSystemResponse("what should the agent do?")
+                return true
+            }
+
+            if let typeRequest = Self.nativeTypeRequest(from: taskCreationInstruction) {
+                typeTextUsingNativeComputerUse(typeRequest)
+                return true
+            }
+
+            if let keyPressRequest = Self.nativeKeyPressRequest(from: taskCreationInstruction) {
+                pressKeyUsingNativeComputerUse(keyPressRequest)
+                return true
+            }
+
+            if let folderRequest = folderOpenRequest(from: taskCreationInstruction) {
+                openRequestedFolder(folderRequest)
+                return true
+            }
+
+            print("OpenClicky agent task creation request detected: \(taskCreationInstruction)")
+            startVoiceAgentTask(instruction: taskCreationInstruction)
+            return true
+        }
+
+        if Self.isIncompleteAgentTaskCreationRequest(from: transcript) {
+            speakShortSystemResponse("what should the agent do?")
+            return true
+        }
+
+        guard let explicitInstruction = Self.clickyAgentInstruction(from: transcript) else {
+            return false
+        }
+
+        guard !explicitInstruction.isEmpty else {
+            print("OpenClicky agent trigger detected without an instruction.")
+            speakShortSystemResponse("say what you want the agent to do after the agent trigger.")
+            return true
+        }
+
+        let instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
+        if let typeRequest = Self.nativeTypeRequest(from: instruction) {
+            typeTextUsingNativeComputerUse(typeRequest)
+            return true
+        }
+
+        if let keyPressRequest = Self.nativeKeyPressRequest(from: instruction) {
+            pressKeyUsingNativeComputerUse(keyPressRequest)
+            return true
+        }
+
+        if let folderRequest = folderOpenRequest(from: instruction) {
+            openRequestedFolder(folderRequest)
+            return true
+        }
+
+        if let appOpenRequest = Self.localAppOpenRequest(from: instruction) {
+            _ = openRequestedApplication(appOpenRequest)
+            return true
+        }
+        if Self.isIncompleteLocalAppOpenRequest(from: instruction) {
+            speakShortSystemResponse("what app should I open?")
+            return true
+        }
+
+        print("OpenClicky agent task detected; starting agent task: \(instruction)")
+        startVoiceAgentTask(instruction: instruction)
+        return true
+    }
+
+    private static func isCancelAllAgentTasksRequest(_ transcript: String) -> Bool {
+        let normalizedTranscript = normalizedSpokenCommandText(transcript)
+        let phrases = [
+            "cancel all tasks",
+            "cancel all task",
+            "cancel all agents",
+            "cancel all agent tasks",
+            "stop all tasks",
+            "stop all agents",
+            "stop all agent tasks",
+            "kill all tasks",
+            "kill all agents",
+            "dismiss all tasks",
+            "dismiss all agents",
+            "clear all tasks",
+            "clear all agents",
+            "cancel everything",
+            "stop everything",
+            "kill everything"
+        ]
+        return phrases.contains { normalizedTranscript.contains($0) }
+    }
+
+    private static func isCancelCurrentAgentTaskRequest(_ transcript: String) -> Bool {
+        let normalizedTranscript = normalizedSpokenCommandText(transcript)
+        let phrases = [
+            "cancel that",
+            "cancel this",
+            "cancel it",
+            "cancel task",
+            "cancel the task",
+            "cancel current task",
+            "cancel current agent",
+            "cancel the agent",
+            "cancel that agent",
+            "stop that",
+            "stop this",
+            "stop it",
+            "stop task",
+            "stop the task",
+            "stop current task",
+            "stop current agent",
+            "stop the agent",
+            "kill that",
+            "kill this",
+            "kill it",
+            "kill task",
+            "kill the task",
+            "done with that",
+            "done with this"
+        ]
+        return phrases.contains { normalizedTranscript == $0 || normalizedTranscript.contains($0) }
+    }
+
+    private static func explicitNewTaskInstruction(from transcript: String) -> String? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let patterns = [
+            #"(?i)^\s*(?:this\s+is\s+)?(?:a\s+)?(?:new|separate|different)\s+(?:agent\s+|codex\s+)?task\s*[:,-]?\s+(.+?)\s*$"#,
+            #"(?i)^\s*(?:start|create|kick\s+off|launch)\s+(?:a\s+)?(?:new|separate|different)\s+(?:agent|codex)\s+task\s*(?:to|for|that)?\s+(.+?)\s*$"#,
+            #"(?i)^\s*(?:new|separate|different)\s+(?:agent|codex)\s*(?:task|job|session)?\s*[:,-]?\s+(.+?)\s*$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let instructionRange = Range(match.range(at: 1), in: candidate) else {
+                continue
+            }
+            let instruction = cleanedAgentTaskInstruction(String(candidate[instructionRange]))
+            return isAgentTaskPlaceholderInstruction(instruction) ? nil : instruction
+        }
+
+        return nil
+    }
+
+    private static func isExplicitNewTaskRequest(_ transcript: String) -> Bool {
+        explicitNewTaskInstruction(from: transcript) != nil || isIncompleteExplicitNewTaskRequest(from: transcript)
+    }
+
+    private static func isIncompleteExplicitNewTaskRequest(from transcript: String) -> Bool {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return false }
+
+        let patterns = [
+            #"(?i)^\s*(?:this\s+is\s+)?(?:a\s+)?(?:new|separate|different)\s+(?:agent\s+|codex\s+)?task[\s\.\!\?]*$"#,
+            #"(?i)^\s*(?:start|create|kick\s+off|launch)\s+(?:a\s+)?(?:new|separate|different)\s+(?:agent|codex)\s+task[\s\.\!\?]*$"#,
+            #"(?i)^\s*(?:new|separate|different)\s+(?:agent|codex)\s*(?:task|job|session)?[\s\.\!\?]*$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            if regex.firstMatch(in: candidate, range: range) != nil {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func normalizedSpokenCommandText(_ transcript: String) -> String {
+        transcript
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s]+"#, with: " ", options: .regularExpression)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     private func handleAgentStatusQuestionIfNeeded(from transcript: String) -> Bool {
         guard Self.isAgentStatusQuestion(transcript) else { return false }
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.status",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "agentStatusSpokenSummary",
+                "controller": "CompanionManager"
+            ]
+        )
 
         let summary = agentStatusSpokenSummary()
         latestVoiceResponseCard = ClickyResponseCard(
@@ -1182,6 +2980,17 @@ final class CompanionManager: ObservableObject {
             showAgentDockWindowNearCurrentScreen()
         }
         speakShortSystemResponse(summary)
+        markRequestCompleted(
+            route: "agent.status",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "agentStatusSpokenSummary",
+                "controller": "CompanionManager",
+                "visibleAgentCount": codexAgentSessions.filter(\.hasVisibleActivity).count
+            ]
+        )
         return true
     }
 
@@ -1223,6 +3032,80 @@ final class CompanionManager: ObservableObject {
             .joined(separator: " ")
 
         return "you have \(Self.spokenCount(visibleSessions.count, singular: "agent", plural: "agents")): \(headline). \(details)"
+    }
+
+    private func updateAgentProgressNarration() {
+        let now = Date()
+        if let lastAgentProgressNarrationAt,
+           now.timeIntervalSince(lastAgentProgressNarrationAt) < 30 {
+            return
+        }
+
+        speakAgentProgressUpdateIfAppropriate(now: now)
+    }
+
+    private func speakAgentProgressUpdateIfAppropriate(now: Date = Date()) {
+        let runningSessions = codexAgentSessions.filter { session in
+            switch session.status {
+            case .starting, .running:
+                return true
+            case .stopped, .ready, .failed:
+                return false
+            }
+        }
+
+        guard !runningSessions.isEmpty else { return }
+        guard voiceState == .idle, !elevenLabsTTSClient.isPlaying else { return }
+
+        let updateText: String
+        if runningSessions.count == 1, let session = runningSessions.first {
+            updateText = "\(session.title): \(Self.agentProgressPhrase(for: session))."
+        } else {
+            let details = runningSessions
+                .prefix(3)
+                .map { "\($0.title): \(Self.agentProgressPhrase(for: $0))" }
+                .joined(separator: ". ")
+            let remainingCount = runningSessions.count - min(runningSessions.count, 3)
+            if remainingCount > 0 {
+                updateText = "\(details). \(remainingCount) more running."
+            } else {
+                updateText = details + "."
+            }
+        }
+
+        lastAgentProgressNarrationAt = now
+        speakShortSystemResponse(updateText)
+    }
+
+    private static func agentProgressPhrase(for session: CodexAgentSession) -> String {
+        if let activity = session.latestActivitySummary?.lowercased() {
+            if activity.contains("matching files") || activity.contains("looking for") {
+                return "we're checking the files"
+            }
+            if activity.contains("focusing") || activity.contains("showing") {
+                return "we're opening what we found"
+            }
+            if activity.contains("checking the work") {
+                return "we're checking the work"
+            }
+            if activity.contains("working") {
+                return "we're working through it"
+            }
+            return "we're \(activity)"
+        }
+
+        switch session.status {
+        case .starting:
+            return "we're starting"
+        case .running:
+            return "we're working"
+        case .ready:
+            return "we're done"
+        case .failed:
+            return "we need attention"
+        case .stopped:
+            return "we're stopped"
+        }
     }
 
     private static func isAgentStatusQuestion(_ transcript: String) -> Bool {
@@ -1392,22 +3275,10 @@ final class CompanionManager: ObservableObject {
         return ["agent", "task", "job", "session", "agent task", "agent job", "codex task"].contains(normalized)
     }
 
-    private static func agentTaskDirective(from responseText: String) -> String? {
-        let pattern = #"(?is)\[AGENT_TASK:\s*(.+?)\s*\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(responseText.startIndex..<responseText.endIndex, in: responseText)
-        guard let match = regex.firstMatch(in: responseText, range: range),
-              let instructionRange = Range(match.range(at: 1), in: responseText) else {
-            return nil
-        }
-
-        let instruction = cleanedAgentTaskInstruction(String(responseText[instructionRange]))
-        return instruction.isEmpty ? nil : instruction
-    }
-
     private static func localAppOpenRequest(from transcript: String) -> OpenClickyAppOpenRequest? {
         let trimmedTranscript = normalizedCommandCandidate(from: transcript)
         guard !trimmedTranscript.isEmpty else { return nil }
+        guard !isAgentRoutingCandidate(trimmedTranscript) else { return nil }
 
         let pattern = #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:(?:ask|tell)\s+(?:an?\s+|the\s+)?agent\s+to\s+)?(?:open|launch|start|switch\s+to)\s+(?:up\s+)?(.+?)(?:\s+for\s+me)?[\.\!\?]*\s*$"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
@@ -1421,12 +3292,428 @@ final class CompanionManager: ObservableObject {
 
         let rawTarget = String(trimmedTranscript[targetRange])
         let normalizedTarget = normalizedApplicationName(from: rawTarget)
-        guard !normalizedTarget.isEmpty else { return nil }
+        guard !normalizedTarget.isEmpty,
+              !isReservedAgentOpenTarget(rawTarget),
+              !isLocalAppOpenPlaceholder(normalizedTarget),
+              !isLikelyFileOrFolderOpenTarget(rawTarget) else {
+            return nil
+        }
 
         return OpenClickyAppOpenRequest(
             appName: normalizedTarget,
             instruction: "Open \(normalizedTarget)."
         )
+    }
+
+    private static func reminderAddRequest(from transcript: String) -> OpenClickyReminderAddRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let normalizedCandidate = normalizedSpokenCommandText(candidate)
+        let mentionsReminders = normalizedCandidate.contains("reminder")
+            || normalizedCandidate.contains("reminders")
+            || normalizedCandidate.contains("todo")
+            || normalizedCandidate.contains("to do")
+            || normalizedCandidate.contains("task")
+        guard mentionsReminders else { return nil }
+
+        let hasAddAction = normalizedCandidate.contains("add")
+            || normalizedCandidate.contains("create")
+            || normalizedCandidate.contains("make")
+            || normalizedCandidate.contains("set")
+            || normalizedCandidate.hasPrefix("remind me")
+        guard hasAddAction else { return nil }
+
+        let titlePatterns = [
+            #"(?i)\b(?:just\s+)?(?:call\s+it|called|named|saying|that\s+says|with\s+title)\s+(.+?)\s*$"#,
+            #"(?i)^\s*remind\s+me\s+to\s+(.+?)\s*$"#,
+            #"(?i)^\s*(?:add|create|make|set)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+|test\s+)?(?:reminder|task|todo|to-do)(?:\s+(?:in|to|on)\s+(?:my\s+)?(?:apple\s+)?reminders?(?:\s+app)?)?(?:\s+(?:to|for)\s+)?(.+?)\s*$"#,
+            #"(?i)^\s*(?:add|create|make)\s+(.+?)\s+(?:to|in|on)\s+(?:my\s+)?(?:apple\s+)?reminders?(?:\s+app)?\s*$"#
+        ]
+
+        for pattern in titlePatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let titleRange = Range(match.range(at: 1), in: candidate) else {
+                continue
+            }
+
+            let title = cleanedReminderTitle(String(candidate[titleRange]))
+            guard !title.isEmpty, !isReminderTitlePlaceholder(title) else { continue }
+            return OpenClickyReminderAddRequest(title: title, instruction: candidate)
+        }
+
+        return nil
+    }
+
+    private static func reminderCountRequest(from transcript: String) -> OpenClickyReminderCountRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let normalizedCandidate = normalizedSpokenCommandText(candidate)
+        guard normalizedCandidate.contains("reminder")
+            || normalizedCandidate.contains("reminders")
+            || normalizedCandidate.contains("todo")
+            || normalizedCandidate.contains("to do")
+            || normalizedCandidate.contains("tasks") else {
+            return nil
+        }
+
+        let countSignals = [
+            "how many",
+            "count",
+            "number of",
+            "what reminders",
+            "what tasks",
+            "what todos",
+            "do i have"
+        ]
+        guard countSignals.contains(where: { normalizedCandidate.contains($0) }) else { return nil }
+
+        return OpenClickyReminderCountRequest(instruction: candidate)
+    }
+
+    private static func messagesSearchRequest(from transcript: String) -> OpenClickyMessagesSearchRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let normalizedCandidate = normalizedSpokenCommandText(candidate)
+        guard normalizedCandidate.contains("message") || normalizedCandidate.contains("messages") else {
+            return nil
+        }
+        guard normalizedCandidate.contains("from") || normalizedCandidate.contains("with") else {
+            return nil
+        }
+
+        let patterns = [
+            #"(?i)\bmessages?\s+from\s+(.+?)(?:\s+(?:today|this\s+morning|this\s+afternoon|this\s+evening|tonight|yesterday))?[\.\!\?]*\s*$"#,
+            #"(?i)\bmessages?\s+with\s+(.+?)(?:\s+(?:today|this\s+morning|this\s+afternoon|this\s+evening|tonight|yesterday))?[\.\!\?]*\s*$"#,
+            #"(?i)\bfrom\s+(.+?)\s+(?:in|on)\s+messages?[\.\!\?]*\s*$"#,
+            #"(?i)\bfrom\s+(.+?)(?:\s+(?:today|this\s+morning|this\s+afternoon|this\s+evening|tonight|yesterday))[\.\!\?]*\s*$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let personRange = Range(match.range(at: 1), in: candidate) else {
+                continue
+            }
+
+            let personName = cleanedMessagesSearchName(String(candidate[personRange]))
+            guard !personName.isEmpty, !isMessagesSearchPlaceholder(personName) else { continue }
+            return OpenClickyMessagesSearchRequest(personName: personName, instruction: candidate)
+        }
+
+        return nil
+    }
+
+    private static func localFolderOpenRequest(from transcript: String) -> OpenClickyFolderOpenRequest? {
+        let trimmedTranscript = normalizedCommandCandidate(from: transcript)
+        guard !trimmedTranscript.isEmpty else { return nil }
+
+        let normalizedTranscript = trimmedTranscript
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s]+"#, with: " ", options: .regularExpression)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard Self.containsFolderOpenVerb(normalizedTranscript) else {
+            return nil
+        }
+
+        let sourceFolderTerms = [
+            "source code folder",
+            "source folder",
+            "code folder",
+            "project folder",
+            "openclicky folder",
+            "open clicky folder",
+            "clicky folder",
+            "repo folder",
+            "repository folder",
+            "openclicky source",
+            "open clicky source"
+        ]
+
+        if sourceFolderTerms.contains(where: { normalizedTranscript.contains($0) }),
+           let sourceURL = existingOpenClickySourceDirectoryURL() {
+            return OpenClickyFolderOpenRequest(
+                url: sourceURL,
+                displayName: "the source code folder",
+                instruction: trimmedTranscript
+            )
+        }
+
+        if let rememberedShortcut = OpenClickyDirectActionMemoryStore.shared.folderShortcut(matching: normalizedTranscript) {
+            return OpenClickyFolderOpenRequest(
+                url: rememberedShortcut.url,
+                displayName: rememberedShortcut.displayName,
+                instruction: trimmedTranscript
+            )
+        }
+
+        return nil
+    }
+
+    private static func containsFolderOpenVerb(_ normalizedTranscript: String) -> Bool {
+        let openSignals = [
+            "open",
+            "show",
+            "reveal",
+            "switch to",
+            "bring up",
+            "pull up",
+            "go into",
+            "go in",
+            "go to",
+            "navigate to",
+            "inside"
+        ]
+
+        return openSignals.contains { normalizedTranscript.contains($0) }
+    }
+
+    private static func relativeFolderOpenRequest(
+        from transcript: String,
+        baseURL: URL,
+        fileManager: FileManager = .default
+    ) -> OpenClickyFolderOpenRequest? {
+        let trimmedTranscript = normalizedCommandCandidate(from: transcript)
+        guard !trimmedTranscript.isEmpty else { return nil }
+
+        let normalizedTranscript = normalizedFolderCommandText(trimmedTranscript)
+        guard containsFolderOpenVerb(normalizedTranscript) else { return nil }
+
+        let targetName = relativeFolderTargetName(from: normalizedTranscript)
+        guard !targetName.isEmpty else { return nil }
+
+        let directCandidate = baseURL.appendingPathComponent(targetName, isDirectory: true)
+        if existingDirectoryURL(directCandidate, fileManager: fileManager) != nil {
+            return OpenClickyFolderOpenRequest(
+                url: directCandidate,
+                displayName: "\(targetName) folder",
+                instruction: trimmedTranscript
+            )
+        }
+
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: baseURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let normalizedTargetName = normalizedFolderName(targetName)
+        for child in children {
+            guard existingDirectoryURL(child, fileManager: fileManager) != nil else { continue }
+            let childName = child.lastPathComponent
+            if normalizedFolderName(childName) == normalizedTargetName {
+                return OpenClickyFolderOpenRequest(
+                    url: child,
+                    displayName: "\(childName) folder",
+                    instruction: trimmedTranscript
+                )
+            }
+        }
+
+        return nil
+    }
+
+    private static func relativeFolderTargetName(from normalizedTranscript: String) -> String {
+        if let namedFolder = namedFolderTarget(from: normalizedTranscript) {
+            return namedFolder
+        }
+
+        var target = normalizedTranscript
+        let prefixes = [
+            "can you",
+            "could you",
+            "would you",
+            "will you",
+            "please",
+            "now"
+        ]
+        for prefix in prefixes where target.hasPrefix(prefix + " ") {
+            target.removeFirst(prefix.count)
+            target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let commandPrefixes = [
+            "go into the",
+            "go into",
+            "go in the",
+            "go in",
+            "go to the",
+            "go to",
+            "navigate to the",
+            "navigate to",
+            "open the",
+            "open",
+            "show the",
+            "show",
+            "reveal the",
+            "reveal",
+            "inside the",
+            "inside"
+        ]
+
+        for prefix in commandPrefixes where target.hasPrefix(prefix + " ") {
+            target.removeFirst(prefix.count)
+            target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+            break
+        }
+
+        let suffixes = [
+            "folder",
+            "directory",
+            "in there",
+            "there",
+            "please"
+        ]
+        var didStripSuffix = true
+        while didStripSuffix {
+            didStripSuffix = false
+            for suffix in suffixes where target == suffix || target.hasSuffix(" " + suffix) {
+                target.removeLast(suffix.count)
+                target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+                didStripSuffix = true
+            }
+        }
+
+        return target
+    }
+
+    private static func namedFolderTarget(from normalizedTranscript: String) -> String? {
+        let patterns = [
+            #"(?i)(?:go into|go in|go to|navigate to|open|show|reveal)\s+(?:the\s+)?(.+?)\s+(?:folder|directory)(?:\s+(?:open|open up|please|there|in there))*$"#,
+            #"(?i)(?:in|inside)\s+(?:that|this|the)\s+folder\s+(?:there(?:'s| is)?\s+)?(?:a\s+|an\s+|the\s+)?(.+?)\s+(?:folder|directory)(?:\s+(?:open|open up|please|there|in there))*$"#,
+            #"(?i)(?:there(?:'s| is)?\s+)?(?:a\s+|an\s+|the\s+)?(.+?)\s+(?:folder|directory)\s+(?:open|open up)(?:\s+please)?$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(normalizedTranscript.startIndex..<normalizedTranscript.endIndex, in: normalizedTranscript)
+            guard let match = regex.firstMatch(in: normalizedTranscript, range: range),
+                  let targetRange = Range(match.range(at: 1), in: normalizedTranscript) else {
+                continue
+            }
+
+            let target = String(normalizedTranscript[targetRange])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !target.isEmpty {
+                return folderSpeechAlias(for: target)
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizedFolderCommandText(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s_-]+"#, with: " ", options: .regularExpression)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func normalizedFolderName(_ value: String) -> String {
+        folderSpeechAlias(for: normalizedFolderCommandText(value))
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func folderSpeechAlias(for value: String) -> String {
+        let normalized = normalizedFolderCommandText(value)
+        switch normalized {
+        case "script", "scripps":
+            return "scripts"
+        default:
+            return normalized
+        }
+    }
+
+    private static func existingDirectoryURL(_ url: URL, fileManager: FileManager) -> URL? {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return nil
+        }
+        return url
+    }
+
+    private static func existingOpenClickySourceDirectoryURL(fileManager: FileManager = .default) -> URL? {
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "/Users/jkneen/Documents/GitHub/openclicky",
+            "\(home)/Documents/GitHub/openclicky"
+        ]
+
+        for candidate in candidates {
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: candidate, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return URL(fileURLWithPath: candidate, isDirectory: true)
+            }
+        }
+
+        return nil
+    }
+
+    private static func directComputerUseFingerprint(kind: String, value: String) -> String {
+        let normalizedValue = value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(kind):\(normalizedValue)"
+    }
+
+    private static func shouldDeferLiveComputerUseForAgentRoute(_ transcript: String) -> Bool {
+        isAgentRoutingCandidate(transcript)
+    }
+
+    private static func isAgentRoutingCandidate(_ transcript: String) -> Bool {
+        explicitNewTaskInstruction(from: transcript) != nil
+            || isIncompleteExplicitNewTaskRequest(from: transcript)
+            || agentTaskCreationInstruction(from: transcript) != nil
+            || isIncompleteAgentTaskCreationRequest(from: transcript)
+            || clickyAgentInstruction(from: transcript) != nil
+    }
+
+    private static func isPotentialDirectComputerUseTranscript(_ transcript: String) -> Bool {
+        let normalizedTranscript = transcript
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+
+        let directSignals = [
+            "open",
+            "show",
+            "reveal",
+            "switch",
+            "press",
+            "hit",
+            "tap",
+            "type",
+            "write",
+            "enter",
+            "paste",
+            "folder",
+            "source",
+            "code",
+            "clicky",
+            "openclicky"
+        ]
+
+        return directSignals.contains { normalizedTranscript.contains($0) }
     }
 
     private static func isIncompleteLocalAppOpenRequest(from transcript: String) -> Bool {
@@ -1443,6 +3730,7 @@ final class CompanionManager: ObservableObject {
         let prefixPatterns = [
             #"(?i)^\s*(?:hey|ok|okay|right|so)[\s,]+"#,
             #"(?i)^\s*(?:clicky|openclicky)[\s,]+"#,
+            #"(?i)^\s*i\s+(?:said|asked|told)\s+(?:for\s+you\s+to|you\s+to|to)\s+"#,
             #"(?i)^\s*(?:let's|lets)\s+try\s+(?:that|this)\s+again[\s,]+"#
         ]
 
@@ -1466,6 +3754,12 @@ final class CompanionManager: ObservableObject {
     private static func normalizedApplicationName(from rawTarget: String) -> String {
         var target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         target = target.trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?- "))
+        target = target.replacingOccurrences(
+            of: #"(?i)^(?:my|the|a|an)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+        target = target.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let removableSuffixes = [" app", " application"]
         for suffix in removableSuffixes where target.localizedCaseInsensitiveContains(suffix) {
@@ -1495,6 +3789,8 @@ final class CompanionManager: ObservableObject {
             return "Messages"
         case "notes":
             return "Notes"
+        case "reminders":
+            return "Reminders"
         case "calendar":
             return "Calendar"
         case "slack":
@@ -1506,6 +3802,116 @@ final class CompanionManager: ObservableObject {
         default:
             return target
         }
+    }
+
+    private static func cleanedReminderTitle(_ rawTitle: String) -> String {
+        var title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        title = title.trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?- "))
+        title = stripMatchingQuotes(from: title)
+        title = title.replacingOccurrences(
+            of: #"(?i)^(?:a\s+|an\s+|the\s+)?(?:reminder|task|todo|to-do)\s+(?:to|for)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+        title = title.replacingOccurrences(
+            of: #"(?i)[,\s]+(?:please|thanks|thank\s+you)$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return title.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+    }
+
+    private static func isReminderTitlePlaceholder(_ value: String) -> Bool {
+        let normalized = normalizedSpokenCommandText(value)
+        return [
+            "",
+            "it",
+            "this",
+            "that",
+            "something",
+            "a reminder",
+            "a task",
+            "test"
+        ].contains(normalized)
+    }
+
+    private static func cleanedMessagesSearchName(_ rawName: String) -> String {
+        var name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        name = name.trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?- "))
+        name = stripMatchingQuotes(from: name)
+        name = name.replacingOccurrences(
+            of: #"(?i)[,\s]+(?:please|okay|ok|thanks|thank\s+you)$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return name.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+    }
+
+    private static func isMessagesSearchPlaceholder(_ value: String) -> Bool {
+        let normalized = normalizedSpokenCommandText(value)
+        return ["", "someone", "somebody", "anyone", "people", "them", "him", "her"].contains(normalized)
+    }
+
+    private static func nativeAutomationErrorMessage(
+        appName: String,
+        result: OpenClickyLocalAutomationResult
+    ) -> String {
+        let detail = result.errorOutput.isEmpty ? result.output : result.errorOutput
+        let normalizedDetail = detail
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        if normalizedDetail.contains("not authorized")
+            || normalizedDetail.contains("not permitted")
+            || normalizedDetail.contains("not allowed")
+            || normalizedDetail.contains("errAEEventNotPermitted".lowercased()) {
+            return "macOS blocked \(appName) automation. enable OpenClicky for \(appName) in System Settings."
+        }
+
+        let shortDetail = detail
+            .components(separatedBy: .newlines)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown error"
+        return "\(appName) automation hit a blocker: \(shortDetail)"
+    }
+
+    private static func isLocalAppOpenPlaceholder(_ value: String) -> Bool {
+        let normalized = value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ["", "my", "the", "a", "an", "it", "that", "this"].contains(normalized)
+    }
+
+    private static func isReservedAgentOpenTarget(_ value: String) -> Bool {
+        let normalized = normalizedSpokenCommandText(value)
+        let stripped = normalized.replacingOccurrences(
+            of: #"^(?:my|the|a|an)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        if ["", "agent", "agents", "agent task", "agent job", "agent session"].contains(stripped) {
+            return true
+        }
+        return stripped.hasPrefix("agent ")
+            || stripped.hasPrefix("agents ")
+            || stripped.hasPrefix("codex task ")
+            || stripped.hasPrefix("codex job ")
+            || stripped.hasPrefix("codex session ")
+    }
+
+    private static func isLikelyFileOrFolderOpenTarget(_ value: String) -> Bool {
+        let normalized = normalizedFolderCommandText(value)
+        if normalized.contains(" folder") || normalized.contains(" directory") {
+            return true
+        }
+        if normalized.contains(" file") || normalized.contains(" in ") || normalized.contains(" inside ") {
+            return true
+        }
+        if normalized.contains(".") {
+            return true
+        }
+        return false
     }
 
     private static func nativeTypeRequest(from transcript: String) -> OpenClickyNativeTypeRequest? {
@@ -1582,32 +3988,129 @@ final class CompanionManager: ObservableObject {
         ].contains(normalized)
     }
 
-    private static func applicationBundleIdentifier(for appName: String) -> String? {
+    private static func nativeKeyPressRequest(from transcript: String) -> OpenClickyNativeKeyPressRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let patterns = [
+            #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:press|hit|tap)\s+(.+?)(?:\s+(?:in|into)\s+(?:the\s+)?(?:focused\s+)?(?:window|app|field))?[\.\!\?]*\s*$"#,
+            #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:send)\s+(?:the\s+)?(.+?)\s+key(?:\s+(?:to|into|in)\s+(?:the\s+)?(?:focused\s+)?(?:window|app|field))?[\.\!\?]*\s*$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let keyRange = Range(match.range(at: 1), in: candidate) else { continue }
+
+            let rawKeySpec = String(candidate[keyRange])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?"))
+            guard let parsed = parsedNativeKeySpec(from: rawKeySpec) else { return nil }
+
+            return OpenClickyNativeKeyPressRequest(
+                key: parsed.key,
+                modifiers: parsed.modifiers,
+                targetDescription: candidate
+            )
+        }
+
+        return nil
+    }
+
+    private static func parsedNativeKeySpec(from rawKeySpec: String) -> (key: String, modifiers: [String])? {
+        let normalizedKeySpec = rawKeySpec
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: "+", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: " plus ", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+
+        guard !normalizedKeySpec.isEmpty else { return nil }
+
+        var modifiers: [String] = []
+        var keyTokens: [String] = []
+        for token in normalizedKeySpec {
+            switch token {
+            case "cmd", "command":
+                modifiers.append("command")
+            case "ctrl", "control":
+                modifiers.append("control")
+            case "option", "alt":
+                modifiers.append("option")
+            case "shift":
+                modifiers.append("shift")
+            case "the", "key":
+                break
+            default:
+                keyTokens.append(token)
+            }
+        }
+
+        let key = keyTokens.joined()
+        guard !key.isEmpty, !["key", "button"].contains(key) else { return nil }
+        return (key: normalizedNativeKeyName(key), modifiers: modifiers)
+    }
+
+    private static func normalizedNativeKeyName(_ key: String) -> String {
+        switch key {
+        case "return":
+            return "enter"
+        case "spacebar":
+            return "space"
+        case "backspace":
+            return "delete"
+        case "leftarrow":
+            return "left"
+        case "rightarrow":
+            return "right"
+        case "uparrow":
+            return "up"
+        case "downarrow":
+            return "down"
+        default:
+            return key
+        }
+    }
+
+    private static func applicationBundleIdentifiers(for appName: String) -> [String] {
         switch appName {
         case "Google Chrome":
-            return "com.google.Chrome"
+            return ["com.google.Chrome"]
         case "Safari":
-            return "com.apple.Safari"
+            return ["com.apple.Safari"]
         case "Xcode":
-            return "com.apple.dt.Xcode"
+            return ["com.apple.dt.Xcode"]
         case "Terminal":
-            return "com.apple.Terminal"
+            return ["com.apple.Terminal"]
         case "Finder":
-            return "com.apple.finder"
+            return ["com.apple.finder"]
         case "System Settings":
-            return "com.apple.systempreferences"
+            return ["com.apple.SystemSettings", "com.apple.systempreferences"]
         case "Mail":
-            return "com.apple.mail"
+            return ["com.apple.mail"]
         case "Messages":
-            return "com.apple.MobileSMS"
+            return ["com.apple.MobileSMS"]
         case "Notes":
-            return "com.apple.Notes"
+            return ["com.apple.Notes"]
+        case "Reminders":
+            return ["com.apple.reminders"]
         case "Calendar":
-            return "com.apple.iCal"
+            return ["com.apple.iCal"]
         case "Slack":
-            return "com.tinyspeck.slackmacgap"
+            return ["com.tinyspeck.slackmacgap"]
         default:
-            return nil
+            return []
+        }
+    }
+
+    private static func activateRunningApplication(named appName: String) {
+        for bundleIdentifier in applicationBundleIdentifiers(for: appName) {
+            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first {
+                app.activate(options: [.activateAllWindows])
+                return
+            }
         }
     }
 
@@ -1621,254 +4124,6 @@ final class CompanionManager: ObservableObject {
         return applicationDirectories
             .map { URL(fileURLWithPath: $0).appendingPathComponent("\(appName).app", isDirectory: true) }
             .first { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    private static func implicitComputerUseInstruction(from transcript: String) -> String? {
-        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTranscript.isEmpty else { return nil }
-
-        let foldedTranscript = trimmedTranscript.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-        let tokenMatches = foldedTranscript.matches(of: /[A-Za-z0-9]+/)
-        let tokens = tokenMatches.map { match in
-            String(foldedTranscript[match.range]).lowercased()
-        }
-        guard !tokens.isEmpty else { return nil }
-
-        if beginsWithInstructionQuestion(tokens) {
-            return nil
-        }
-
-        if hasPoliteComputerUseRequest(tokens) || startsWithComputerUseAction(tokens) {
-            return trimmedTranscript
-        }
-
-        return nil
-    }
-
-    private static func implicitLiveLookupInstruction(from transcript: String) -> String? {
-        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTranscript.isEmpty else { return nil }
-
-        let normalizedTranscript = trimmedTranscript
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        let liveLookupSignals = [
-            "weather",
-            "latest",
-            "current",
-            "right now",
-            "today",
-            "news",
-            "price",
-            "stock",
-            "score",
-            "fixture",
-            "schedule",
-            "exchange rate",
-            "what's happening",
-            "whats happening",
-            "look up",
-            "search for",
-            "find out"
-        ]
-
-        guard liveLookupSignals.contains(where: { normalizedTranscript.contains($0) }) else { return nil }
-        return "Research the current answer to this request and report back concisely: \(trimmedTranscript)"
-    }
-
-    static func implicitFilesystemTaskInstruction(from transcript: String) -> String? {
-        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTranscript.isEmpty else { return nil }
-
-        let normalizedTranscript = trimmedTranscript
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        let localLocationSignals = [
-            "desktop",
-            "downloads",
-            "documents",
-            "folder",
-            "folders",
-            "directory",
-            "directories",
-            "file",
-            "files",
-            "finder",
-            "home folder",
-            "home directory",
-            "local path",
-            "on my mac"
-        ]
-
-        guard localLocationSignals.contains(where: { normalizedTranscript.contains($0) }) else {
-            return nil
-        }
-
-        let filesystemActionSignals = [
-            "browse",
-            "check",
-            "find",
-            "inspect",
-            "list",
-            "look at",
-            "look in",
-            "open",
-            "read",
-            "review",
-            "search",
-            "show",
-            "summarize",
-            "view",
-            "what files",
-            "what's in",
-            "what's on",
-            "whats in",
-            "whats on",
-            "what is in",
-            "what is on",
-            "where is",
-            "which file",
-            "which files"
-        ]
-
-        guard filesystemActionSignals.contains(where: { normalizedTranscript.contains($0) }) else {
-            return nil
-        }
-
-        return "Inspect the relevant local files or folders and report back concisely: \(trimmedTranscript)"
-    }
-
-    static func filesystemTaskAcknowledgement(from transcript: String) -> String {
-        let normalizedTranscript = transcript
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        if normalizedTranscript.contains("desktop") {
-            return "i'm checking your desktop now."
-        }
-        if normalizedTranscript.contains("downloads") {
-            return "i'm checking your downloads now."
-        }
-        if normalizedTranscript.contains("documents") {
-            return "i'm checking your documents now."
-        }
-        return "i'm checking those files now."
-    }
-
-    private static func mentionsOpenClickyRuntimeStorage(_ transcript: String) -> Bool {
-        let normalizedTranscript = transcript
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        let mentionsOpenClicky = normalizedTranscript.contains("openclicky")
-            || normalizedTranscript.contains("clicky")
-            || normalizedTranscript.contains("agent")
-            || normalizedTranscript.contains("agents")
-
-        guard mentionsOpenClicky else { return false }
-
-        let storageTerms = [
-            "log",
-            "logs",
-            "memory",
-            "memories",
-            "skill",
-            "skills",
-            "widget",
-            "widgets",
-            "config",
-            "settings",
-            "session",
-            "sessions",
-            "soul",
-            "persona",
-            "identity",
-            "who you are",
-            "who are you",
-            "review comments",
-            "where",
-            "stored",
-            "storage"
-        ]
-
-        return storageTerms.contains { normalizedTranscript.contains($0) }
-    }
-
-    static func shouldEscalateVoiceResponseToAgent(responseText: String, transcript: String) -> Bool {
-        let normalizedResponse = responseText
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        let refusalSignals = [
-            "can't",
-            "cannot",
-            "not able",
-            "not wired",
-            "don't have access",
-            "do not have access",
-            "no access"
-        ]
-
-        guard refusalSignals.contains(where: { normalizedResponse.contains($0) }) else { return false }
-
-        return implicitComputerUseInstruction(from: transcript) != nil
-            || implicitLiveLookupInstruction(from: transcript) != nil
-            || implicitFilesystemTaskInstruction(from: transcript) != nil
-            || mentionsOpenClickyRuntimeStorage(transcript)
-    }
-
-    private static func beginsWithInstructionQuestion(_ tokens: [String]) -> Bool {
-        guard let firstToken = tokens.first else { return false }
-        switch firstToken {
-        case "how", "where", "what", "why", "when":
-            return true
-        default:
-            return false
-        }
-    }
-
-    private static func hasPoliteComputerUseRequest(_ tokens: [String]) -> Bool {
-        for index in tokens.indices {
-            let token = tokens[index]
-            let nextIndex = index + 1
-            let secondNextIndex = index + 2
-
-            if token == "please",
-               nextIndex < tokens.count,
-               isComputerUseActionVerb(tokens[nextIndex]) {
-                return true
-            }
-
-            if ["can", "could", "would", "will"].contains(token),
-               nextIndex < tokens.count,
-               tokens[nextIndex] == "you",
-               secondNextIndex < tokens.count,
-               isComputerUseActionVerb(tokens[secondNextIndex]) {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    private static func startsWithComputerUseAction(_ tokens: [String]) -> Bool {
-        var index = 0
-        while index < tokens.count, ["hey", "ok", "okay", "please"].contains(tokens[index]) {
-            index += 1
-        }
-        guard index < tokens.count else { return false }
-        return isComputerUseActionVerb(tokens[index])
-    }
-
-    private static func isComputerUseActionVerb(_ token: String) -> Bool {
-        switch token {
-        case "open", "launch", "start", "switch", "close", "quit", "click", "press", "type", "scroll", "drag", "move", "select", "choose", "use", "search", "browse", "research", "find", "look", "show", "view", "inspect", "read", "list", "create", "make", "do", "take", "add", "write", "draft", "edit", "update", "save", "fix", "build", "install", "configure", "set", "send", "download", "upload", "review", "check", "test", "run", "summarize", "clean", "remove", "delete":
-            return true
-        default:
-            return false
-        }
     }
 
     private static func legacyClickyAgentInstruction(from transcript: String) -> String? {
@@ -1887,6 +4142,29 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startVoiceAgentTask(instruction: String, acknowledgement: String? = nil) {
+        if handleDirectComputerUseRequest(from: instruction, source: "agent_task_boundary") {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "incoming",
+                event: "openclicky.agent_task.intercepted_native_cua",
+                fields: [
+                    "instruction": instruction
+                ]
+            )
+            return
+        }
+
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.start",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "instructionLength": instruction.count
+            ]
+        )
         interruptCurrentVoiceResponse()
         ensureCursorOverlayVisibleForAgentTask()
 
@@ -1897,6 +4175,10 @@ final class CompanionManager: ObservableObject {
             title: Self.shortAgentInstructionSummary(instruction),
             accentTheme: accentTheme
         )
+        if let timing {
+            agentRequestTimingsBySessionID[agentSession.id] = timing
+        }
+        agentExecutionStartDatesBySessionID[agentSession.id] = executionStartedAt
         let dockItem = ClickyAgentDockItem(
             id: dockItemID,
             sessionID: agentSession.id,
@@ -1917,9 +4199,28 @@ final class CompanionManager: ObservableObject {
             direction: "outgoing",
             event: "openclicky.agent_task.created",
             fields: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "model": agentSession.model,
                 "sessionID": agentSession.id.uuidString,
                 "title": agentSession.title,
-                "instruction": instruction
+                "instruction": instruction,
+                "requestID": timing?.requestID ?? "none"
+            ]
+        )
+        markRequestStageCompleted(
+            route: "agent.start",
+            stage: "agent_created",
+            stageStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "createAndSelectNewCodexAgentSession",
+                "controller": "CompanionManager",
+                "model": agentSession.model,
+                "sessionID": agentSession.id.uuidString,
+                "title": agentSession.title
             ]
         )
 
@@ -2005,13 +4306,45 @@ final class CompanionManager: ObservableObject {
                 agentDockItems[itemIndex].status = .done
                 agentDockItems[itemIndex].caption = activitySummary ?? "Done. Use voice or text to follow up."
             }
+            completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "success")
         case .failed:
             agentDockItems[itemIndex].status = .failed
             agentDockItems[itemIndex].caption = activitySummary ?? "Needs attention. Ask for agent status to hear the error."
+            completeAgentRequestTimingIfNeeded(
+                sessionID: sessionID,
+                status: "failed",
+                extra: [
+                    "activitySummary": activitySummary ?? ""
+                ]
+            )
         case .stopped:
+            completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "cancelled")
             break
         }
         scheduleWidgetSnapshotPublish()
+    }
+
+    private func completeAgentRequestTimingIfNeeded(
+        sessionID: UUID,
+        status: String,
+        extra: [String: Any] = [:]
+    ) {
+        let timing = agentRequestTimingsBySessionID.removeValue(forKey: sessionID)
+        let executionStartedAt = agentExecutionStartDatesBySessionID.removeValue(forKey: sessionID)
+        guard timing != nil || executionStartedAt != nil else { return }
+
+        var fields = extra
+        fields["sessionID"] = sessionID.uuidString
+        fields["executor"] = "agent_mode"
+        fields["executionMethod"] = "CodexAgentSession.status"
+        fields["controller"] = "CodexAgentSession"
+        markRequestCompleted(
+            route: "agent.start",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            status: status,
+            extra: fields
+        )
     }
 
     func openAgentDockItem(_ itemID: UUID) {
@@ -2026,10 +4359,16 @@ final class CompanionManager: ObservableObject {
     }
 
     func dismissAgentDockItem(_ itemID: UUID) {
+        let dismissedSessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID
+        if let dismissedSessionID {
+            cancelAgentTask(sessionID: dismissedSessionID, removeDockItems: false)
+        }
+
         agentDockItems.removeAll { $0.id == itemID }
         if agentDockItems.isEmpty {
             agentDockWindowManager.hide()
         }
+        scheduleWidgetSnapshotPublish()
     }
 
     func prepareVoiceFollowUpForAgentDockItem(_ itemID: UUID) {
@@ -2060,20 +4399,81 @@ final class CompanionManager: ObservableObject {
     private func submitTextFollowUpForActiveAgent(_ submittedText: String) {
         let trimmedText = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
+        let timing = beginRequestTiming(source: "agent_text_followup", text: trimmedText)
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_text_followup",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "instructionLength": trimmedText.count
+            ]
+        )
         submitAgentPrompt(trimmedText, to: codexAgentSession)
+        lastAgentContextSessionID = codexAgentSession.id
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_text_followup",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "model": codexAgentSession.model
+            ]
+        )
         if isAdvancedModeEnabled {
             showCodexHUD()
         }
     }
 
     func submitAgentPromptFromUI(_ prompt: String) {
-        submitAgentPrompt(prompt, to: codexAgentSession)
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else { return }
+        let timing = beginRequestTiming(source: "agent_hud_prompt", text: trimmedPrompt)
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_hud_prompt",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "instructionLength": trimmedPrompt.count
+            ]
+        )
+        submitAgentPrompt(trimmedPrompt, to: codexAgentSession)
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_hud_prompt",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "model": codexAgentSession.model
+            ]
+        )
     }
 
     private func submitAgentPrompt(_ prompt: String, to session: CodexAgentSession) {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { return }
 
+        lastAgentContextSessionID = session.id
+        activeCodexAgentSessionID = session.id
         Task {
             let screenContext = await prepareAgentScreenContextForNextTurn()
             session.submitPromptFromUI(trimmedPrompt, screenContext: screenContext)
@@ -2286,16 +4686,18 @@ final class CompanionManager: ObservableObject {
     - if the screenshot doesn't seem relevant to their question, just answer the question directly.
     - for audio, voice playback, or "why are you not speaking" questions, give a short diagnosis or next check. do not summarize the screen unless the visible screen directly explains the audio problem.
     - you can help with anything — coding, writing, general knowledge, brainstorming.
-    - OpenClicky can open apps and use the computer through Agent Mode. direct action requests like "open chrome", "click that", "type this", "scroll down", or "switch to safari" are normally routed to Agent Mode before you answer. if the user asks whether you can do those things, say yes: OpenClicky can do that through Agent Mode.
-    - OpenClicky can inspect local files through Agent Mode when the user asks to browse, list, find, read, or review files or folders. if such a request reaches this voice model, return exactly [AGENT_TASK: inspect the relevant local files or folders and report back concisely] and no other text.
+    - OpenClicky can open apps, type text, and press keys through its native CUA computer-use path. simple focused-window control should be instant and should not become an Agent Mode task.
+    - Agent Mode is explicit-only. Do not start, request, or imply a background agent unless the user explicitly asks for an agent, a new agent task, or an existing active agent follow-up.
+    - If a request needs files, code, research, durable memory, or broader tools and the user did not explicitly ask for an agent, say what native voice/CUA can do now and name the exact agent request phrase they can use.
+    - OpenClicky can inspect, create, edit, and organize local files through explicit Agent Mode. Agents run with full local read/write capability when explicitly started; do not claim filesystem access is unavailable.
     - OpenClicky has durable local storage for logs, memory, learned skills, widget state, sessions, and config. if the user asks where those live, answer from the runtime storage context included below.
-    - OpenClicky has a SOUL.md persona file. if the user asks who OpenClicky is, how it should behave, or to change its persona, use the soul path from runtime storage and route edits to Agent Mode.
-    - if the user asks to view, edit, review, tune, fix, or inspect OpenClicky's logs, memory, learned skills, widget state, sessions, config, or review comments, return exactly [AGENT_TASK: the task the agent should do] and no other text.
-    - if the user asks to optimize skills, audit skills, review logs for learnings, or see what OpenClicky can learn from logs, return exactly [AGENT_TASK: inspect the relevant OpenClicky files, archive old versions as backups, then create or update the memory, learned skills, or review notes needed] and no other text.
+    - OpenClicky has a SOUL.md persona file. if the user asks who OpenClicky is or how it should behave, answer from runtime storage. for edits, tell them the explicit agent phrase to use.
+    - if the user asks to view, edit, review, tune, fix, or inspect OpenClicky's logs, memory, learned skills, widget state, sessions, config, or review comments, do not auto-start an agent; tell them to say "start an agent to..." if they want background work.
+    - if the user asks to optimize skills, audit skills, review logs for learnings, or see what OpenClicky can learn from logs, do not auto-start an agent; tell them the explicit agent phrase to use.
     - old OpenClicky artifacts should be archived as backups before replacement. do not suggest deleting old logs, memory, skills, prompts, or notes unless the user explicitly asks for destructive deletion.
-    - if the user asks you to create, start, spawn, run, launch, or set up an agent task and that request reaches this voice model, do not say you will do it in normal prose. return exactly [AGENT_TASK: the task the agent should do] and no other text. OpenClicky will create the background agent from that directive.
-    - for current weather, live news, prices, schedules, or anything time-sensitive that is not visible on screen, return exactly [AGENT_TASK: research the current answer to the user's request and report back concisely] and no other text. do not say live lookup is not wired in and do not invent current information.
-    - if the right answer would be "i can't do that from voice", return an [AGENT_TASK: ...] directive instead, unless the missing thing is a real blocker like a permission, credential, or required file.
+    - never output hidden agent-start directives. The app handles explicit agent starts before this voice model sees the request.
+    - for current weather, live news, prices, schedules, or anything time-sensitive that is not visible on screen, do not invent current information and do not start Agent Mode automatically. tell the user the exact explicit agent request phrase if live lookup is needed.
+    - if the right answer would be "i can't do that from voice", explain the smallest explicit next step instead of starting an agent automatically.
     - never say "simply" or "just".
     - don't read out code verbatim. describe what the code does or what needs to change conversationally.
     - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
@@ -2349,6 +4751,7 @@ final class CompanionManager: ObservableObject {
     - proactively guide them one step at a time when they pause.
     - point at the button, menu, field, panel, or visible area they should use next.
     - know that OpenClicky can open apps and use the computer through Agent Mode when the user gives a direct action request.
+    - simple open, type, and key-press actions use OpenClicky's native CUA path instead of Agent Mode.
     - if they completed a step, acknowledge it briefly and give the next step.
     - if they appear off track, gently redirect.
     - teach concepts only when they are useful for the next action.
@@ -2356,7 +4759,7 @@ final class CompanionManager: ObservableObject {
 
     style:
     - short spoken response, lowercase, casual, no markdown, no emojis.
-    - do not claim you clicked or controlled anything in tutor observations. you can guide and point; direct action requests are handled by Agent Mode.
+    - do not claim you clicked or controlled anything in tutor observations. you can guide and point; simple direct action requests use native CUA, and broader tool work can use Agent Mode when explicitly routed there.
 
     element pointing:
     append exactly one [POINT:x,y:label] tag at the end when a visible target would help. use [POINT:none] only when pointing would not help.
@@ -2373,16 +4776,58 @@ final class CompanionManager: ObservableObject {
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         interruptCurrentVoiceResponse()
+        let timing = activeRequestTiming
+        var executionFields = voiceResponseExecutionFields()
+        executionFields["transcriptLength"] = transcript.count
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "voice.response",
+            timing: timing,
+            extra: executionFields
+        )
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             self.voiceState = .processing
+            var didCompleteRequest = false
+
+            func completeRequest(status: String = "success", extra: [String: Any] = [:]) async {
+                await MainActor.run {
+                    guard !didCompleteRequest else { return }
+                    didCompleteRequest = true
+                    var completionFields = self.voiceResponseExecutionFields()
+                    extra.forEach { completionFields[$0.key] = $0.value }
+                    self.markRequestCompleted(
+                        route: "voice.response",
+                        executionStartedAt: executionStartedAt,
+                        timing: timing,
+                        status: status,
+                        extra: completionFields
+                    )
+                }
+            }
 
             do {
                 // Capture all connected screens so the AI has full context.
+                let captureStartedAt = Date()
                 let screenCaptures = try await captureAllScreensForVoiceResponseIfAvailable()
+                self.markRequestStageCompleted(
+                    route: "voice.response",
+                    stage: "screen_capture",
+                    stageStartedAt: captureStartedAt,
+                    timing: timing,
+                    extra: [
+                        "executor": "screen_capture",
+                        "executionMethod": "captureAllScreensForVoiceResponseIfAvailable",
+                        "controller": "ScreenCaptureKit",
+                        "screenCount": screenCaptures.count,
+                        "imageBytes": screenCaptures.reduce(0) { $0 + $1.imageData.count }
+                    ]
+                )
 
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else {
+                    await completeRequest(status: "cancelled", extra: ["cancelledAt": "after_screen_capture"])
+                    return
+                }
 
                 // Build image labels with the actual screenshot pixel dimensions
                 // so Claude's coordinate space matches the image it sees. We
@@ -2415,25 +4860,39 @@ final class CompanionManager: ObservableObject {
                 \(memoryContext)
                 """
 
+                let modelStartedAt = Date()
+                var modelResponseFields = self.voiceResponseExecutionFields()
                 let fullResponseText = try await analyzeVoiceResponse(
                     images: labeledImages,
                     systemPrompt: voiceSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: userPromptForClaude,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { accumulatedText in
+                        let visibleText = Self.parsePointingCoordinates(from: accumulatedText)
+                            .spokenText
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !visibleText.isEmpty else { return }
+                        self.latestVoiceResponseCard = ClickyResponseCard(
+                            source: .voice,
+                            rawText: visibleText,
+                            contextTitle: transcript
+                        )
                     }
                 )
+                self.markRequestStageCompleted(
+                    route: "voice.response",
+                    stage: "model_response",
+                    stageStartedAt: modelStartedAt,
+                    timing: timing,
+                    extra: {
+                        modelResponseFields["responseLength"] = fullResponseText.count
+                        modelResponseFields["imageCount"] = labeledImages.count
+                        return modelResponseFields
+                    }()
+                )
 
-                guard !Task.isCancelled else { return }
-
-                if let agentInstruction = Self.agentTaskDirective(from: fullResponseText) {
-                    startVoiceAgentTask(instruction: agentInstruction)
-                    return
-                }
-
-                if Self.shouldEscalateVoiceResponseToAgent(responseText: fullResponseText, transcript: transcript) {
-                    startVoiceAgentTask(instruction: transcript)
+                guard !Task.isCancelled else {
+                    await completeRequest(status: "cancelled", extra: ["cancelledAt": "after_model_response"])
                     return
                 }
 
@@ -2535,21 +4994,56 @@ final class CompanionManager: ObservableObject {
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let ttsStartedAt = Date()
                     do {
                         try await elevenLabsTTSClient.speakText(spokenText) {
                             self.voiceState = .responding
                         }
+                        self.markRequestStageCompleted(
+                            route: "voice.response",
+                            stage: "tts",
+                            stageStartedAt: ttsStartedAt,
+                            timing: timing,
+                            extra: [
+                                "executor": "tts",
+                                "executionMethod": "ElevenLabsTTSClient.speakText",
+                                "controller": "ElevenLabsTTSClient",
+                                "spokenTextLength": spokenText.count
+                            ]
+                        )
                     } catch {
-                        guard !Self.isExpectedCancellation(error) else { return }
+                        guard !Self.isExpectedCancellation(error) else {
+                            await completeRequest(status: "cancelled", extra: ["cancelledAt": "tts"])
+                            return
+                        }
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ ElevenLabs TTS error: \(error)")
                         speakResponseFailureFallback(error)
+                        self.markRequestStageCompleted(
+                            route: "voice.response",
+                            stage: "tts",
+                            stageStartedAt: ttsStartedAt,
+                            timing: timing,
+                            status: "failed",
+                            extra: [
+                                "executor": "tts",
+                                "executionMethod": "ElevenLabsTTSClient.speakText",
+                                "controller": "ElevenLabsTTSClient",
+                                "error": error.localizedDescription
+                            ]
+                        )
                     }
                 }
+                var completionFields = self.voiceResponseExecutionFields()
+                completionFields["spokenTextLength"] = spokenText.count
+                completionFields["pointed"] = parseResult.coordinate != nil
+                await completeRequest(extra: completionFields)
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                await completeRequest(status: "cancelled", extra: ["cancelledAt": "task"])
             } catch where Self.isExpectedCancellation(error) {
                 // User spoke again — URLSession/AVFoundation surfaced cancellation as NSError.
+                await completeRequest(status: "cancelled", extra: ["cancelledAt": "task"])
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
@@ -2563,6 +5057,12 @@ final class CompanionManager: ObservableObject {
                     ]
                 )
                 speakResponseFailureFallback(error)
+                await completeRequest(
+                    status: "failed",
+                    extra: [
+                        "error": error.localizedDescription
+                    ]
+                )
             }
 
             if !Task.isCancelled {
@@ -2782,13 +5282,13 @@ final class CompanionManager: ObservableObject {
     ) async throws -> String {
         if AppBundleConfiguration.openAIAPIKey() != nil {
             openAIAPI.model = model
-            let (text, _) = try await openAIAPI.analyzeImage(
+            let (text, _) = try await openAIAPI.analyzeImageStreaming(
                 images: images,
                 systemPrompt: systemPrompt,
                 conversationHistory: conversationHistory,
-                userPrompt: userPrompt
+                userPrompt: userPrompt,
+                onTextChunk: onTextChunk
             )
-            onTextChunk(text)
             return text
         }
 
@@ -3308,7 +5808,9 @@ final class CompanionManager: ObservableObject {
 
     func dismissLatestResponseCard() {
         if codexAgentSession.latestResponseCard != nil {
+            let sessionID = codexAgentSession.id
             codexAgentSession.dismissLatestResponseCard()
+            cancelAgentTask(sessionID: sessionID, removeDockItems: true)
         } else {
             latestVoiceResponseCard = nil
         }
@@ -3317,7 +5819,35 @@ final class CompanionManager: ObservableObject {
     func runSuggestedNextAction(_ actionTitle: String) {
         let trimmedActionTitle = actionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedActionTitle.isEmpty else { return }
+        let timing = beginRequestTiming(source: "agent_suggested_action", text: trimmedActionTitle)
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_suggested_action",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "instructionLength": trimmedActionTitle.count
+            ]
+        )
         submitAgentPrompt(trimmedActionTitle, to: codexAgentSession)
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": "agent_suggested_action",
+                "sessionID": codexAgentSession.id.uuidString,
+                "title": codexAgentSession.title,
+                "model": codexAgentSession.model
+            ]
+        )
         if isAdvancedModeEnabled {
             showCodexHUD()
         }
@@ -3714,5 +6244,226 @@ private final class UserActivityIdleDetector: ObservableObject {
         if isNowIdle != isUserIdle {
             isUserIdle = isNowIdle
         }
+    }
+}
+
+nonisolated private struct OpenClickyDirectActionStoredMemory: Codable, Sendable {
+    var folderShortcuts: [OpenClickyDirectActionStoredFolderShortcut]
+}
+
+nonisolated private struct OpenClickyDirectActionStoredFolderShortcut: Codable, Sendable {
+    var aliases: [String]
+    var path: String
+    var displayName: String
+    var lastUsedAt: Date
+}
+
+private final class OpenClickyDirectActionMemoryStore: @unchecked Sendable {
+    static let shared = OpenClickyDirectActionMemoryStore()
+
+    struct FolderShortcut {
+        let url: URL
+        let displayName: String
+    }
+
+    private let fileManager: FileManager
+    private let memoryFile: URL
+    private let lock = NSLock()
+    private let writeQueue = DispatchQueue(label: "com.jkneen.openclicky.direct-action-memory-writes", qos: .utility)
+    private var cachedMemory: OpenClickyDirectActionStoredMemory?
+
+    init(fileManager: FileManager = .default, memoryFile: URL? = nil) {
+        self.fileManager = fileManager
+        self.memoryFile = memoryFile ?? Self.defaultMemoryFile(fileManager: fileManager)
+    }
+
+    func folderShortcut(matching normalizedTranscript: String) -> FolderShortcut? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let memory = loadMemoryLocked()
+        for shortcut in memory.folderShortcuts {
+            guard fileManager.fileExists(atPath: shortcut.path) else { continue }
+            guard shortcut.aliases.contains(where: { alias in
+                !alias.isEmpty && normalizedTranscript.contains(alias)
+            }) else { continue }
+
+            return FolderShortcut(
+                url: URL(fileURLWithPath: shortcut.path, isDirectory: true),
+                displayName: shortcut.displayName
+            )
+        }
+
+        return nil
+    }
+
+    func recordFolderShortcut(instruction: String, url: URL, displayName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let path = url.standardizedFileURL.path
+        var memory = loadMemoryLocked()
+        let aliases = Self.aliases(forInstruction: instruction, displayName: displayName, path: path)
+        guard !aliases.isEmpty else { return }
+
+        if let index = memory.folderShortcuts.firstIndex(where: { $0.path == path }) {
+            let mergedAliases = Array(Set(memory.folderShortcuts[index].aliases + aliases)).sorted()
+            memory.folderShortcuts[index].aliases = mergedAliases
+            memory.folderShortcuts[index].displayName = displayName
+            memory.folderShortcuts[index].lastUsedAt = Date()
+        } else {
+            memory.folderShortcuts.append(
+                OpenClickyDirectActionStoredFolderShortcut(
+                    aliases: aliases,
+                    path: path,
+                    displayName: displayName,
+                    lastUsedAt: Date()
+                )
+            )
+        }
+
+        cachedMemory = memory
+        saveMemoryLocked(memory)
+    }
+
+    private func loadMemoryLocked() -> OpenClickyDirectActionStoredMemory {
+        if let cachedMemory {
+            return cachedMemory
+        }
+
+        var memory: OpenClickyDirectActionStoredMemory
+        if let data = try? Data(contentsOf: memoryFile),
+           let decoded = try? JSONDecoder().decode(OpenClickyDirectActionStoredMemory.self, from: data) {
+            memory = decoded
+        } else {
+            memory = OpenClickyDirectActionStoredMemory(folderShortcuts: [])
+        }
+
+        if seedBuiltInShortcutsIfNeeded(&memory) {
+            cachedMemory = memory
+            saveMemoryLocked(memory)
+            return memory
+        }
+
+        cachedMemory = memory
+        return memory
+    }
+
+    private func saveMemoryLocked(_ memory: OpenClickyDirectActionStoredMemory) {
+        cachedMemory = memory
+        let fileManager = fileManager
+        let memoryFile = memoryFile
+        let data: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            data = try encoder.encode(memory)
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "computer-use",
+                direction: "error",
+                event: "native_cua.direct_action_memory.write_failed",
+                fields: [
+                    "path": memoryFile.path,
+                    "error": error.localizedDescription
+                ]
+            )
+            return
+        }
+
+        writeQueue.async {
+            do {
+                try fileManager.createDirectory(at: memoryFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: memoryFile, options: [.atomic])
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "native_cua.direct_action_memory.write_failed",
+                    fields: [
+                        "path": memoryFile.path,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    private func seedBuiltInShortcutsIfNeeded(_ memory: inout OpenClickyDirectActionStoredMemory) -> Bool {
+        let sourcePath = "/Users/jkneen/Documents/GitHub/openclicky"
+        guard fileManager.fileExists(atPath: sourcePath) else { return false }
+        guard !memory.folderShortcuts.contains(where: { $0.path == sourcePath }) else { return false }
+
+        memory.folderShortcuts.append(
+            OpenClickyDirectActionStoredFolderShortcut(
+                aliases: [
+                    "clicky folder",
+                    "code folder",
+                    "open clicky folder",
+                    "open clicky source",
+                    "openclicky folder",
+                    "openclicky source",
+                    "project folder",
+                    "repo folder",
+                    "repository folder",
+                    "source code folder",
+                    "source folder"
+                ],
+                path: sourcePath,
+                displayName: "the source code folder",
+                lastUsedAt: Date()
+            )
+        )
+        return true
+    }
+
+    private static func aliases(forInstruction instruction: String, displayName: String, path: String) -> [String] {
+        var aliases = Set<String>()
+
+        for candidate in [instruction, displayName] {
+            let normalized = normalize(candidate)
+            if normalized.count >= 4 {
+                aliases.insert(normalized)
+            }
+
+            let withoutOpenVerbs = normalized
+                .replacingOccurrences(of: "open ", with: "")
+                .replacingOccurrences(of: "show ", with: "")
+                .replacingOccurrences(of: "reveal ", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if withoutOpenVerbs.count >= 4 {
+                aliases.insert(withoutOpenVerbs)
+            }
+        }
+
+        let lastPathComponent = URL(fileURLWithPath: path).lastPathComponent
+        let normalizedName = normalize(lastPathComponent)
+        if normalizedName.count >= 4 {
+            aliases.insert(normalizedName)
+            aliases.insert("\(normalizedName) folder")
+            aliases.insert("\(normalizedName) source")
+        }
+
+        return Array(aliases).sorted()
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s]+"#, with: " ", options: .regularExpression)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func defaultMemoryFile(fileManager: FileManager) -> URL {
+        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent("OpenClicky", isDirectory: true)
+            .appendingPathComponent("direct-computer-use-shortcuts.json", isDirectory: false)
     }
 }

@@ -132,7 +132,7 @@ private struct CodexHUDView: View {
                 ClickyResponseCardCompactView(
                     card: card,
                     actionHandlers: ClickyResponseCardActionHandlers(
-                        dismiss: { session.dismissLatestResponseCard() },
+                        dismiss: { companionManager.dismissLatestResponseCard() },
                         runSuggestedNextAction: { actionTitle in
                             session.dismissLatestResponseCard()
                             companionManager.submitAgentPromptFromUI(actionTitle)

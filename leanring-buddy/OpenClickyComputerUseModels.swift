@@ -107,11 +107,18 @@ struct OpenClickyComputerUsePermissionStatus: Sendable, Codable, Hashable {
     let accessibilityGranted: Bool
     let screenRecordingGranted: Bool
     let skyLightKeyboardPathAvailable: Bool
+    let fullDiskAccessLikelyGranted: Bool
 
-    init(accessibilityGranted: Bool, screenRecordingGranted: Bool, skyLightKeyboardPathAvailable: Bool) {
+    init(
+        accessibilityGranted: Bool,
+        screenRecordingGranted: Bool,
+        skyLightKeyboardPathAvailable: Bool,
+        fullDiskAccessLikelyGranted: Bool = false
+    ) {
         self.accessibilityGranted = accessibilityGranted
         self.screenRecordingGranted = screenRecordingGranted
         self.skyLightKeyboardPathAvailable = skyLightKeyboardPathAvailable
+        self.fullDiskAccessLikelyGranted = fullDiskAccessLikelyGranted
     }
 
     var accessibilitySummary: String {
@@ -124,6 +131,10 @@ struct OpenClickyComputerUsePermissionStatus: Sendable, Codable, Hashable {
 
     var keyboardSummary: String {
         skyLightKeyboardPathAvailable ? "SkyLight keyboard ready" : "public keyboard fallback"
+    }
+
+    var fullDiskAccessSummary: String {
+        fullDiskAccessLikelyGranted ? "Full Disk Access likely ready" : "Full Disk Access not detected"
     }
 }
 
@@ -162,7 +173,8 @@ struct OpenClickyComputerUseStatus: Sendable, Codable, Hashable {
             "Enabled",
             permissions.accessibilitySummary,
             permissions.screenRecordingSummary,
-            permissions.keyboardSummary
+            permissions.keyboardSummary,
+            permissions.fullDiskAccessSummary
         ]
 
         if let focusedWindow {

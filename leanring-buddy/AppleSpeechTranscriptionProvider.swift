@@ -142,6 +142,6 @@ private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTra
     }
 
     deinit {
-        cancel()
+        recognitionTask?.cancel()
     }
 }

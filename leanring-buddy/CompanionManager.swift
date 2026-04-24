@@ -92,6 +92,7 @@ final class CompanionManager: ObservableObject {
     let overlayWindowManager = OverlayWindowManager()
     let textModeWindowManager = ClickyTextModeWindowManager()
     let agentDockWindowManager = ClickyAgentDockWindowManager()
+    let settingsWindowManager = OpenClickySettingsWindowManager()
     let codexHomeManager = CodexHomeManager()
     @Published private(set) var codexAgentSessions: [CodexAgentSession]
     @Published private(set) var activeCodexAgentSessionID: UUID
@@ -234,6 +235,10 @@ final class CompanionManager: ObservableObject {
         let resolvedModel = OpenClickyModelCatalog.computerUseModel(withID: model).id
         selectedComputerUseModel = resolvedModel
         UserDefaults.standard.set(resolvedModel, forKey: "selectedComputerUseModel")
+    }
+
+    func showSettingsWindow() {
+        settingsWindowManager.show(companionManager: self)
     }
 
     func setTutorModeEnabled(_ enabled: Bool) {

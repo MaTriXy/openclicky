@@ -14,7 +14,6 @@ struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
     @State private var isPanelPinned: Bool
-    @State private var isShowingSettings = false
     #if DEBUG
     @State private var showDevTools = false
     #endif
@@ -39,28 +38,16 @@ struct CompanionPanelView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            if isShowingSettings {
-                settingsSubscreen
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-            } else {
-                mainPanelContent
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-            }
-        }
+        mainPanelContent
         .frame(
             minWidth: 356,
             maxWidth: .infinity,
             alignment: .topLeading
         )
         .background(panelBackground)
-        .onChange(of: isShowingSettings) { _, isShowingSettings in
-            schedulePanelContentSizeRefresh(isShowingSettings: isShowingSettings)
-        }
         .onChange(of: companionManager.isAdvancedModeEnabled) {
-            schedulePanelContentSizeRefresh(isShowingSettings: isShowingSettings)
+            schedulePanelContentSizeRefresh()
         }
-        .animation(.easeOut(duration: 0.16), value: isShowingSettings)
         .animation(.none, value: selectedAccentThemeID)
     }
 
@@ -825,70 +812,21 @@ struct CompanionPanelView: View {
         companionManager.pointAtPermissionDragAssistant()
     }
 
-    private var settingsSubscreen: some View {
-        CodexAgentModeSettingsSheet(
-            session: companionManager.codexAgentSession,
-            knowledgeIndex: companionManager.bundledKnowledgeIndex,
-            responseCard: companionManager.latestResponseCard,
-            transcriptionProviderDisplayName: companionManager.buddyDictationManager.transcriptionProviderDisplayName,
-            transcriptionProviderID: companionManager.buddyDictationManager.transcriptionProviderID,
-            setVoiceTranscriptionProvider: { companionManager.setVoiceTranscriptionProvider($0) },
-            isClickyCursorEnabled: companionManager.isClickyCursorEnabled,
-            setClickyCursorEnabled: { companionManager.setClickyCursorEnabled($0) },
-            isTutorModeEnabled: companionManager.isTutorModeEnabled,
-            setTutorModeEnabled: { companionManager.setTutorModeEnabled($0) },
-            isAdvancedModeEnabled: companionManager.isAdvancedModeEnabled,
-            setAdvancedModeEnabled: { companionManager.setAdvancedModeEnabled($0) },
-            selectedCompanionModelID: companionManager.selectedModel,
-            setSelectedCompanionModel: { companionManager.setSelectedModel($0) },
-            selectedComputerUseModelID: companionManager.selectedComputerUseModel,
-            setSelectedComputerUseModel: { companionManager.setSelectedComputerUseModel($0) },
-            setAnthropicAPIKey: { companionManager.setAnthropicAPIKey($0) },
-            setElevenLabsAPIKey: { companionManager.setElevenLabsAPIKey($0) },
-            setElevenLabsVoiceID: { companionManager.setElevenLabsVoiceID($0) },
-            setAssemblyAIAPIKey: { companionManager.setAssemblyAIAPIKey($0) },
-            setDeepgramAPIKey: { companionManager.setDeepgramAPIKey($0) },
-            setCodexAgentAPIKey: { companionManager.setCodexAgentAPIKey($0) },
-            replayOnboarding: {},
-            quitClicky: { NSApp.terminate(nil) },
-            openHUD: { companionManager.showCodexHUD() },
-            openMemory: { companionManager.showMemoryWindow() },
-            dismissResponseCard: { companionManager.dismissLatestResponseCard() },
-            runSuggestedNextAction: { companionManager.runSuggestedNextAction($0) },
-            prepareVoiceFollowUp: { companionManager.prepareForVoiceFollowUp() },
-            openFeedback: openFeedbackInbox,
-            closeSettings: hideSettingsPanel
-        )
-    }
-
     private func showSettingsPanel() {
-        withAnimation(.easeOut(duration: 0.16)) {
-            isShowingSettings = true
-        }
-        schedulePanelContentSizeRefresh(isShowingSettings: true)
+        companionManager.showSettingsWindow()
     }
 
-    private func hideSettingsPanel() {
-        withAnimation(.easeOut(duration: 0.16)) {
-            isShowingSettings = false
-        }
-        schedulePanelContentSizeRefresh(isShowingSettings: false)
-    }
-
-    private func schedulePanelContentSizeRefresh(isShowingSettings: Bool) {
-        let userInfo = ["isShowingSettings": isShowingSettings]
+    private func schedulePanelContentSizeRefresh() {
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: .clickyPanelContentSizeDidChange,
-                object: nil,
-                userInfo: userInfo
+                object: nil
             )
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
             NotificationCenter.default.post(
                 name: .clickyPanelContentSizeDidChange,
-                object: nil,
-                userInfo: userInfo
+                object: nil
             )
         }
     }
@@ -1120,7 +1058,7 @@ struct CompanionPanelView: View {
         withAnimation(.easeOut(duration: 0.16)) {
             showDevTools.toggle()
         }
-        schedulePanelContentSizeRefresh(isShowingSettings: isShowingSettings)
+        schedulePanelContentSizeRefresh()
     }
 
     private var devToolsSection: some View {
@@ -1260,7 +1198,7 @@ struct CompanionPanelView: View {
     }
 
     private func openFeedbackInbox() {
-        guard let url = URL(string: "https://github.com/jkneen/openclicky/issues") else {
+        guard let url = URL(string: "https://github.com/jasonkneen/openclicky/issues") else {
             return
         }
         NSWorkspace.shared.open(url)

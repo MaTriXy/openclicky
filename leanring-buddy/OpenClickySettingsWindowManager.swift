@@ -424,12 +424,14 @@ struct OpenClickySettingsView: View {
                 )
             }
 
-            settingsGroup("Agent tools") {
-                actionRow(title: "Open Agent dashboard", systemImageName: "rectangle.grid.2x2") {
-                    companionManager.showCodexHUD()
-                }
-                actionRow(title: "Warm up Agent Mode", systemImageName: "bolt") {
-                    companionManager.warmUpCodexAgentMode()
+            if companionManager.isAdvancedModeEnabled {
+                settingsGroup("Agent tools") {
+                    actionRow(title: "Open Agent dashboard", systemImageName: "rectangle.grid.2x2") {
+                        companionManager.showCodexHUD()
+                    }
+                    actionRow(title: "Warm up Agent Mode", systemImageName: "bolt") {
+                        companionManager.warmUpCodexAgentMode()
+                    }
                 }
             }
         }

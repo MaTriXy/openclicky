@@ -136,6 +136,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     private var currentAssistantEntryID: String?
     private var hasInitializedProcess = false
     private var lastSubmittedPrompt: String?
+    private static let codexRuntimeCompatibilityFallbackModel = "gpt-5.4-mini"
 
     init(
         id: UUID = UUID(),
@@ -212,7 +213,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         status = .stopped
     }
 
-    private func runPrompt(_ prompt: String) async {
+    private func runPrompt(_ prompt: String, didRetryCompatibilityFallback: Bool = false) async {
         do {
             try await ensureThread()
             guard let activeThreadID else {
@@ -237,9 +238,23 @@ final class CodexAgentSession: ObservableObject, Identifiable {
                 "effort": homeManager.reasoningEffort
             ])
         } catch {
-            lastErrorMessage = error.localizedDescription
-            status = .failed(error.localizedDescription)
-            entries.append(CodexTranscriptEntry(role: .system, text: error.localizedDescription))
+            let text = Self.userFacingErrorMessage(from: error.localizedDescription)
+            if !didRetryCompatibilityFallback,
+               Self.shouldRetryWithCompatibilityFallback(text),
+               model != Self.codexRuntimeCompatibilityFallbackModel {
+                let requestedModel = model
+                entries.append(CodexTranscriptEntry(
+                    role: .system,
+                    text: "Codex rejected \(requestedModel) with this runtime, so OpenClicky is retrying with \(Self.codexRuntimeCompatibilityFallbackModel)."
+                ))
+                setModel(Self.codexRuntimeCompatibilityFallbackModel)
+                await runPrompt(prompt, didRetryCompatibilityFallback: true)
+                return
+            }
+
+            lastErrorMessage = text
+            status = .failed(text)
+            entries.append(CodexTranscriptEntry(role: .system, text: text))
         }
     }
 
@@ -335,20 +350,37 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         If a task requires destructive filesystem, git, credentials, or system permission changes, explain the action before doing it.
         """
 
-        let threadStart = try await processManager.sendRequest(method: "thread/start", params: [
-            "model": model,
-            "modelProvider": homeManager.modelProviderID,
-            "cwd": workingDirectoryPath,
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
-            "config": [:],
-            "serviceName": "OpenClicky",
-            "baseInstructions": baseInstructions,
-            "developerInstructions": developerInstructions,
-            "personality": "friendly",
-            "ephemeral": false,
-            "sessionStartSource": "startup"
-        ])
+        let threadStart: [String: Any]
+        do {
+            threadStart = try await processManager.sendRequest(method: "thread/start", params: [
+                "model": model,
+                "modelProvider": homeManager.modelProviderID,
+                "cwd": workingDirectoryPath,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "config": [:],
+                "serviceName": "OpenClicky",
+                "baseInstructions": baseInstructions,
+                "developerInstructions": developerInstructions,
+                "personality": "friendly",
+                "ephemeral": false,
+                "sessionStartSource": "startup"
+            ])
+        } catch {
+            let text = Self.userFacingErrorMessage(from: error.localizedDescription)
+            if Self.shouldRetryWithCompatibilityFallback(text),
+               model != Self.codexRuntimeCompatibilityFallbackModel {
+                let requestedModel = model
+                entries.append(CodexTranscriptEntry(
+                    role: .system,
+                    text: "Codex rejected \(requestedModel) during startup with this runtime, so OpenClicky is retrying with \(Self.codexRuntimeCompatibilityFallbackModel)."
+                ))
+                setModel(Self.codexRuntimeCompatibilityFallbackModel)
+                try await ensureThread()
+                return
+            }
+            throw error
+        }
 
         if let thread = CodexJSON.dictionary(threadStart["thread"]),
            let threadID = CodexJSON.string(thread["id"]) {
@@ -415,7 +447,9 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             status = .ready
             playAgentDoneSoundIfAvailable()
         case "error":
-            let text = Self.notificationErrorMessage(from: params) ?? "Codex app-server emitted an error."
+            let text = Self.userFacingErrorMessage(
+                from: Self.notificationErrorMessage(from: params) ?? "Codex app-server emitted an error."
+            )
             lastErrorMessage = text
             status = .failed(text)
             entries.append(CodexTranscriptEntry(role: .system, text: text))
@@ -433,19 +467,33 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     }
 
     private static func notificationErrorMessage(from params: [String: Any]) -> String? {
-        if let text = CodexJSON.string(params["message"]), !text.isEmpty {
+        if let text = CodexRPCErrorMessage.readableMessage(from: params["message"]), !text.isEmpty {
             return text
         }
 
         guard let error = CodexJSON.dictionary(params["error"]) else { return nil }
 
-        let message = CodexJSON.string(error["message"]) ?? "Codex app-server emitted an error."
-        let details = CodexJSON.string(error["additionalDetails"])
+        let message = CodexRPCErrorMessage.readableMessage(from: error["message"])
+            ?? CodexRPCErrorMessage.readableMessage(from: error)
+            ?? "Codex app-server emitted an error."
+        let details = CodexRPCErrorMessage.readableMessage(from: error["additionalDetails"])
         if let details, !details.isEmpty, details != message {
             return "\(message)\n\(details)"
         }
 
         return message
+    }
+
+    nonisolated static func userFacingErrorMessage(from rawMessage: String) -> String {
+        CodexRPCErrorMessage.readableMessage(from: rawMessage) ?? rawMessage
+    }
+
+    nonisolated static func shouldRetryWithCompatibilityFallback(_ message: String) -> Bool {
+        let foldedMessage = message
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        return foldedMessage.contains("requires a newer version of codex")
+            || foldedMessage.contains("please upgrade to the latest app or cli")
     }
 
     private func handleCompletedItem(_ itemValue: Any?) {

@@ -226,8 +226,11 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
             if let id = CodexJSON.int(message["id"]) {
                 let continuation = pending.removeValue(forKey: id)
                 if let error = CodexJSON.dictionary(message["error"]) {
-                    var text = CodexJSON.string(error["message"]) ?? "Codex app-server returned an error."
-                    if let dataText = Self.readableErrorData(error["data"]), !dataText.isEmpty {
+                    var text = CodexRPCErrorMessage.readableMessage(from: error["message"])
+                        ?? "Codex app-server returned an error."
+                    if let dataText = Self.readableErrorData(error["data"]),
+                       !dataText.isEmpty,
+                       dataText != text {
                         text += "\n\(dataText)"
                     }
                     continuation?.resume(throwing: CodexRPCError(message: text))
@@ -250,8 +253,8 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
     private static func readableErrorData(_ value: Any?) -> String? {
         guard let value else { return nil }
 
-        if let text = value as? String {
-            return text
+        if let message = CodexRPCErrorMessage.readableMessage(from: value) {
+            return message
         }
 
         guard JSONSerialization.isValidJSONObject(value),

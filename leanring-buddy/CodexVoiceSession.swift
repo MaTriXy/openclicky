@@ -542,13 +542,15 @@ final class CodexVoiceSession {
     }
 
     private static func notificationErrorMessage(from params: [String: Any]) -> String? {
-        if let text = CodexJSON.string(params["message"]), !text.isEmpty {
+        if let text = CodexRPCErrorMessage.readableMessage(from: params["message"]), !text.isEmpty {
             return text
         }
 
         guard let error = CodexJSON.dictionary(params["error"]) else { return nil }
-        let message = CodexJSON.string(error["message"]) ?? "Codex app-server emitted an error."
-        let details = CodexJSON.string(error["additionalDetails"])
+        let message = CodexRPCErrorMessage.readableMessage(from: error["message"])
+            ?? CodexRPCErrorMessage.readableMessage(from: error)
+            ?? "Codex app-server emitted an error."
+        let details = CodexRPCErrorMessage.readableMessage(from: error["additionalDetails"])
         if let details, !details.isEmpty, details != message {
             return "\(message)\n\(details)"
         }
@@ -557,8 +559,10 @@ final class CodexVoiceSession {
 
     private static func turnErrorMessage(from turn: [String: Any]) -> String? {
         guard let error = CodexJSON.dictionary(turn["error"]) else { return nil }
-        let message = CodexJSON.string(error["message"]) ?? "Codex voice turn failed."
-        let details = CodexJSON.string(error["additionalDetails"])
+        let message = CodexRPCErrorMessage.readableMessage(from: error["message"])
+            ?? CodexRPCErrorMessage.readableMessage(from: error)
+            ?? "Codex voice turn failed."
+        let details = CodexRPCErrorMessage.readableMessage(from: error["additionalDetails"])
         if let details, !details.isEmpty, details != message {
             return "\(message)\n\(details)"
         }

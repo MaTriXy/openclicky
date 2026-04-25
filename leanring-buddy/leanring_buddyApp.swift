@@ -29,7 +29,7 @@ struct leanring_buddyApp: App {
 /// Manages the companion lifecycle: creates the menu bar panel and starts
 /// the companion voice pipeline on launch.
 @MainActor
-final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, SPUStandardUserDriverDelegate {
     private static let sparkleFeedOverrideDefaultsKey = "OpenClickySparkleFeedURLOverride"
     private var menuBarPanelManager: MenuBarPanelManager?
     private let companionManager = CompanionManager()
@@ -88,7 +88,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDel
         let updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: self,
-            userDriverDelegate: nil
+            userDriverDelegate: self
         )
         self.sparkleUpdaterController = updaterController
 
@@ -103,6 +103,27 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDel
         guard let override = Self.sparkleFeedOverrideURLString() else { return nil }
         print("OpenClicky: Using Sparkle feed override: \(override)")
         return override
+    }
+
+    var supportsGentleScheduledUpdateReminders: Bool {
+        true
+    }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        true
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        guard handleShowingUpdate, !state.userInitiated else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        menuBarPanelManager?.showPanelOnLaunch()
     }
 
     private static func sparkleFeedOverrideURLString() -> String? {

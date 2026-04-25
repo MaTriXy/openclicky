@@ -210,6 +210,7 @@ final class CompanionManager: ObservableObject {
     let widgetStateStore = OpenClickyWidgetStateStore()
     let codexHomeManager = CodexHomeManager()
     let nativeComputerUseController = OpenClickyNativeComputerUseController()
+    let backgroundComputerUseController = OpenClickyBackgroundComputerUseController()
     @Published private(set) var codexAgentSessions: [CodexAgentSession]
     @Published private(set) var activeCodexAgentSessionID: UUID
     let codexHUDWindowManager = CodexHUDWindowManager()
@@ -336,7 +337,8 @@ final class CompanionManager: ObservableObject {
             event: "openclicky.runtime.started",
             fields: [
                 "nativeCUARouterVersion": "direct-cua-explicit-agent-v4",
-                "agentAssignment": "explicit-only"
+                "agentAssignment": "explicit-only",
+                "computerUseBackend": selectedComputerUseBackendID
             ]
         )
     }
@@ -354,6 +356,9 @@ final class CompanionManager: ObservableObject {
     @Published var selectedComputerUseModel: String = OpenClickyModelCatalog.computerUseModel(
         withID: UserDefaults.standard.string(forKey: "selectedComputerUseModel") ?? OpenClickyModelCatalog.defaultComputerUseModelID
     ).id
+    @Published var selectedComputerUseBackendID: String = OpenClickyComputerUseBackendID.resolving(
+        UserDefaults.standard.string(forKey: AppBundleConfiguration.userComputerUseBackendDefaultsKey)
+    ).rawValue
     @Published var isTutorModeEnabled: Bool = CompanionManager.initialTutorModeEnabled()
     @Published var isAdvancedModeEnabled: Bool = UserDefaults.standard.bool(forKey: AppBundleConfiguration.userAdvancedModeDefaultsKey)
     private let userActivityIdleDetector = UserActivityIdleDetector()
@@ -381,6 +386,28 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(resolvedModel, forKey: "selectedComputerUseModel")
     }
 
+    var selectedComputerUseBackend: OpenClickyComputerUseBackendID {
+        OpenClickyComputerUseBackendID.resolving(selectedComputerUseBackendID)
+    }
+
+    func setSelectedComputerUseBackend(_ backendID: String) {
+        let backend = OpenClickyComputerUseBackendID.resolving(backendID)
+        selectedComputerUseBackendID = backend.rawValue
+        UserDefaults.standard.set(backend.rawValue, forKey: AppBundleConfiguration.userComputerUseBackendDefaultsKey)
+        if backend == .backgroundComputerUse {
+            backgroundComputerUseController.refreshStatus()
+        }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "internal",
+            event: "computer_use.backend_selected",
+            fields: [
+                "backend": backend.rawValue,
+                "executor": backend.executorID
+            ]
+        )
+    }
+
     func setNativeComputerUseEnabled(_ enabled: Bool) {
         nativeComputerUseController.setEnabled(enabled)
     }
@@ -391,6 +418,32 @@ final class CompanionManager: ObservableObject {
 
     func refreshNativeComputerUseFocusedTarget() {
         _ = nativeComputerUseController.refreshFocusedTarget()
+    }
+
+    func refreshBackgroundComputerUseStatus() {
+        backgroundComputerUseController.refreshStatus()
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "internal",
+            event: "background_computer_use.status_refreshed",
+            fields: [
+                "status": backgroundComputerUseController.status.summary,
+                "manifestPath": backgroundComputerUseController.status.manifestPath
+            ]
+        )
+    }
+
+    func startBackgroundComputerUseRuntime() {
+        backgroundComputerUseController.startRuntime()
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "background_computer_use.start_requested",
+            fields: [
+                "sourceRoot": backgroundComputerUseController.status.sourceRootPath,
+                "manifestPath": backgroundComputerUseController.status.manifestPath
+            ]
+        )
     }
 
     func openFullDiskAccessSettings() {
@@ -1348,7 +1401,8 @@ final class CompanionManager: ObservableObject {
 
     private func handleLiveComputerUseTranscript(_ partialTranscript: String) {
         let trimmedTranscript = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmedTranscript.count >= 8 else { return }
+        let isShortKnownAppRequest = Self.bareLocalAppOpenRequest(from: trimmedTranscript) != nil
+        guard trimmedTranscript.count >= 8 || isShortKnownAppRequest else { return }
 
         let shouldTraceMiss = Self.isPotentialDirectComputerUseTranscript(trimmedTranscript)
         if Self.shouldDeferLiveComputerUseForAgentRoute(trimmedTranscript) {
@@ -1414,6 +1468,7 @@ final class CompanionManager: ObservableObject {
         }
 
         if let keyPressRequest = Self.nativeKeyPressRequest(from: trimmedTranscript) {
+            let backend = selectedComputerUseBackend
             let fingerprint = Self.directComputerUseFingerprint(
                 kind: "key",
                 value: "\(keyPressRequest.modifiers.joined(separator: "+"))+\(keyPressRequest.key)"
@@ -1424,19 +1479,21 @@ final class CompanionManager: ObservableObject {
             OpenClickyMessageLogStore.shared.append(
                 lane: "computer-use",
                 direction: "incoming",
-                event: "native_cua.live_partial.key_detected",
+                event: "\(backend.executorID).live_partial.key_detected",
                 fields: [
                     "partialTranscript": trimmedTranscript,
-                    "executor": "native_cua",
-                    "route": "native_cua.press_key",
-                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "executor": backend.executorID,
+                    "route": "\(backend.executorID).press_key",
+                    "executionMethod": backend == .backgroundComputerUse
+                        ? "BackgroundComputerUse /v1/press_key"
+                        : "OpenClickyNativeComputerUseController.pressKey",
                     "key": keyPressRequest.key,
                     "modifiers": keyPressRequest.modifiers.joined(separator: ","),
                     "requestID": requestTiming.requestID
                 ]
             )
             withActiveRequestTiming(requestTiming) {
-                pressKeyUsingNativeComputerUse(keyPressRequest, shouldSpeak: false)
+                pressKeyUsingSelectedComputerUse(keyPressRequest, shouldSpeak: false)
             }
             return
         }
@@ -1576,44 +1633,51 @@ final class CompanionManager: ObservableObject {
         }
 
         if let messagesSearchRequest = Self.messagesSearchRequest(from: transcript) {
+            let backend = selectedComputerUseBackend
             OpenClickyMessageLogStore.shared.append(
                 lane: "computer-use",
                 direction: "incoming",
-                event: "native_cua.direct_request.messages_search_detected",
+                event: "\(backend.executorID).direct_request.messages_search_detected",
                 fields: [
                     "source": source,
                     "transcript": transcript,
-                    "executor": "native_cua",
-                    "route": "native_cua.messages_search",
-                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey/typeText",
+                    "executor": backend.executorID,
+                    "route": "\(backend.executorID).messages_search",
+                    "executionMethod": backend == .backgroundComputerUse
+                        ? "BackgroundComputerUse /v1/press_key + /v1/type_text"
+                        : "OpenClickyNativeComputerUseController.pressKey/typeText",
                     "personName": messagesSearchRequest.personName,
                     "requestID": activeRequestTiming?.requestID ?? "none"
                 ]
             )
-            searchMessagesUsingNativeComputerUse(messagesSearchRequest)
+            searchMessagesUsingSelectedComputerUse(messagesSearchRequest)
             return true
         }
 
         if let typeRequest = Self.nativeTypeRequest(from: transcript) {
+            let backend = selectedComputerUseBackend
             OpenClickyMessageLogStore.shared.append(
                 lane: "computer-use",
                 direction: "incoming",
-                event: "native_cua.direct_request.type_detected",
+                event: "\(backend.executorID).direct_request.type_detected",
                 fields: [
                     "source": source,
                     "transcript": transcript,
-                    "executor": "native_cua",
-                    "route": "native_cua.type_text",
-                    "executionMethod": "OpenClickyNativeComputerUseController.typeText",
+                    "executor": backend.executorID,
+                    "route": "\(backend.executorID).type_text",
+                    "executionMethod": backend == .backgroundComputerUse
+                        ? "BackgroundComputerUse /v1/type_text"
+                        : "OpenClickyNativeComputerUseController.typeText",
                     "textLength": typeRequest.text.count,
                     "requestID": activeRequestTiming?.requestID ?? "none"
                 ]
             )
-            typeTextUsingNativeComputerUse(typeRequest)
+            typeTextUsingSelectedComputerUse(typeRequest)
             return true
         }
 
         if let keyPressRequest = Self.nativeKeyPressRequest(from: transcript) {
+            let backend = selectedComputerUseBackend
             let fingerprint = Self.directComputerUseFingerprint(
                 kind: "key",
                 value: "\(keyPressRequest.modifiers.joined(separator: "+"))+\(keyPressRequest.key)"
@@ -1621,13 +1685,15 @@ final class CompanionManager: ObservableObject {
             OpenClickyMessageLogStore.shared.append(
                 lane: "computer-use",
                 direction: "incoming",
-                event: "native_cua.direct_request.key_detected",
+                event: "\(backend.executorID).direct_request.key_detected",
                 fields: [
                     "source": source,
                     "transcript": transcript,
-                    "executor": "native_cua",
-                    "route": "native_cua.press_key",
-                    "executionMethod": "OpenClickyNativeComputerUseController.pressKey",
+                    "executor": backend.executorID,
+                    "route": "\(backend.executorID).press_key",
+                    "executionMethod": backend == .backgroundComputerUse
+                        ? "BackgroundComputerUse /v1/press_key"
+                        : "OpenClickyNativeComputerUseController.pressKey",
                     "key": keyPressRequest.key,
                     "modifiers": keyPressRequest.modifiers.joined(separator: ","),
                     "alreadyHandledLive": liveHandledComputerUseFingerprints.contains(fingerprint),
@@ -1637,9 +1703,9 @@ final class CompanionManager: ObservableObject {
             if liveHandledComputerUseFingerprints.contains(fingerprint) {
                 let modifierText = keyPressRequest.modifiers.isEmpty ? "" : keyPressRequest.modifiers.joined(separator: " ") + " "
                 let executionStartedAt = markRequestExecutionStarted(
-                    route: "native_cua.press_key.already_handled_live",
+                    route: "\(backend.executorID).press_key.already_handled_live",
                     extra: [
-                        "executor": "native_cua",
+                        "executor": backend.executorID,
                         "executionMethod": "live_partial_preexecuted",
                         "key": keyPressRequest.key,
                         "modifiers": keyPressRequest.modifiers.joined(separator: ",")
@@ -1647,17 +1713,17 @@ final class CompanionManager: ObservableObject {
                 )
                 speakShortSystemResponse("pressed \(modifierText)\(keyPressRequest.key).")
                 markRequestCompleted(
-                    route: "native_cua.press_key.already_handled_live",
+                    route: "\(backend.executorID).press_key.already_handled_live",
                     executionStartedAt: executionStartedAt,
                     extra: [
-                        "executor": "native_cua",
+                        "executor": backend.executorID,
                         "executionMethod": "live_partial_preexecuted",
                         "key": keyPressRequest.key,
                         "modifiers": keyPressRequest.modifiers.joined(separator: ",")
                     ]
                 )
             } else {
-                pressKeyUsingNativeComputerUse(keyPressRequest)
+                pressKeyUsingSelectedComputerUse(keyPressRequest)
             }
             return true
         }
@@ -2010,6 +2076,327 @@ final class CompanionManager: ObservableObject {
                         ]
                     )
                 }
+            }
+        }
+    }
+
+    private func searchMessagesUsingSelectedComputerUse(_ request: OpenClickyMessagesSearchRequest) {
+        switch selectedComputerUseBackend {
+        case .backgroundComputerUse:
+            searchMessagesUsingBackgroundComputerUse(request)
+        case .nativeSwift:
+            searchMessagesUsingNativeComputerUse(request)
+        }
+    }
+
+    private func typeTextUsingSelectedComputerUse(_ request: OpenClickyNativeTypeRequest) {
+        switch selectedComputerUseBackend {
+        case .backgroundComputerUse:
+            typeTextUsingBackgroundComputerUse(request)
+        case .nativeSwift:
+            typeTextUsingNativeComputerUse(request)
+        }
+    }
+
+    private func pressKeyUsingSelectedComputerUse(_ request: OpenClickyNativeKeyPressRequest, shouldSpeak: Bool = true) {
+        switch selectedComputerUseBackend {
+        case .backgroundComputerUse:
+            pressKeyUsingBackgroundComputerUse(request, shouldSpeak: shouldSpeak)
+        case .nativeSwift:
+            pressKeyUsingNativeComputerUse(request, shouldSpeak: shouldSpeak)
+        }
+    }
+
+    private func searchMessagesUsingBackgroundComputerUse(_ request: OpenClickyMessagesSearchRequest) {
+        interruptCurrentVoiceResponse()
+        let timing = activeRequestTiming
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "background_computer_use.messages_search",
+            timing: timing,
+            extra: [
+                "executor": "background_computer_use",
+                "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                "controller": "OpenClickyBackgroundComputerUseController",
+                "appName": "Messages",
+                "personName": request.personName,
+                "runtimeStatus": backgroundComputerUseController.status.summary
+            ]
+        )
+        let appRequest = OpenClickyAppOpenRequest(appName: "Messages", instruction: "Open Messages.")
+        _ = openRequestedApplication(appRequest, shouldSpeak: false, logTiming: false)
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: "searching Messages for \(request.personName).",
+            contextTitle: "Background Computer Use"
+        )
+
+        let personName = request.personName
+        let instruction = request.instruction
+        OpenClickyMessageLogStore.shared.append(
+            lane: "computer-use",
+            direction: "outgoing",
+            event: "background_computer_use.messages_search_started",
+            fields: [
+                "executor": "background_computer_use",
+                "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                "controller": "OpenClickyBackgroundComputerUseController",
+                "appName": "Messages",
+                "personName": personName,
+                "instruction": instruction,
+                "runtimeStatus": backgroundComputerUseController.status.summary
+            ]
+        )
+
+        Task { @MainActor in
+            do {
+                try? await Task.sleep(nanoseconds: 650_000_000)
+                Self.activateRunningApplication(named: "Messages")
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                let openSearch = try await backgroundComputerUseController.pressKey(
+                    "f",
+                    modifiers: ["command"],
+                    targetAppName: "Messages"
+                )
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                let selectAll = try await backgroundComputerUseController.pressKey(
+                    "a",
+                    modifiers: ["command"],
+                    targetAppName: "Messages"
+                )
+                let typed = try await backgroundComputerUseController.typeText(
+                    personName,
+                    targetAppName: "Messages"
+                )
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "outgoing",
+                    event: "background_computer_use.messages_search",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "instruction": instruction,
+                        "openSearch": openSearch.summary,
+                        "selectAll": selectAll.summary,
+                        "typed": typed.summary,
+                        "windowID": typed.windowID
+                    ]
+                )
+                speakShortSystemResponse("searching Messages for \(personName).")
+                markRequestCompleted(
+                    route: "background_computer_use.messages_search",
+                    executionStartedAt: executionStartedAt,
+                    timing: timing,
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "windowID": typed.windowID
+                    ]
+                )
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "background_computer_use.messages_search_error",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "instruction": instruction,
+                        "runtimeStatus": backgroundComputerUseController.status.summary,
+                        "error": error.localizedDescription
+                    ]
+                )
+                speakShortSystemResponse("Background Computer Use hit a blocker searching Messages: \(error.localizedDescription)")
+                markRequestCompleted(
+                    route: "background_computer_use.messages_search",
+                    executionStartedAt: executionStartedAt,
+                    timing: timing,
+                    status: "failed",
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key + /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "appName": "Messages",
+                        "personName": personName,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+    }
+
+    private func typeTextUsingBackgroundComputerUse(_ request: OpenClickyNativeTypeRequest) {
+        interruptCurrentVoiceResponse()
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "background_computer_use.type_text",
+            extra: [
+                "executor": "background_computer_use",
+                "executionMethod": "BackgroundComputerUse /v1/type_text",
+                "controller": "OpenClickyBackgroundComputerUseController",
+                "textLength": request.text.count,
+                "runtimeStatus": backgroundComputerUseController.status.summary
+            ]
+        )
+
+        Task { @MainActor in
+            do {
+                let result = try await backgroundComputerUseController.typeText(request.text)
+                let acknowledgement = "typed that with Background Computer Use."
+                latestVoiceResponseCard = ClickyResponseCard(
+                    source: .voice,
+                    rawText: acknowledgement,
+                    contextTitle: request.targetDescription
+                )
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "outgoing",
+                    event: "background_computer_use.type_text",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "windowID": result.windowID,
+                        "summary": result.summary,
+                        "textLength": request.text.count
+                    ]
+                )
+                speakShortSystemResponse(acknowledgement)
+                markRequestCompleted(
+                    route: "background_computer_use.type_text",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "windowID": result.windowID,
+                        "textLength": request.text.count
+                    ]
+                )
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "background_computer_use.type_text_error",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "runtimeStatus": backgroundComputerUseController.status.summary,
+                        "error": error.localizedDescription
+                    ]
+                )
+                speakShortSystemResponse("Background Computer Use typing hit a blocker: \(error.localizedDescription)")
+                markRequestCompleted(
+                    route: "background_computer_use.type_text",
+                    executionStartedAt: executionStartedAt,
+                    status: "failed",
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/type_text",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+    }
+
+    private func pressKeyUsingBackgroundComputerUse(_ request: OpenClickyNativeKeyPressRequest, shouldSpeak: Bool = true) {
+        if shouldSpeak {
+            interruptCurrentVoiceResponse()
+        }
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "background_computer_use.press_key",
+            extra: [
+                "executor": "background_computer_use",
+                "executionMethod": "BackgroundComputerUse /v1/press_key",
+                "controller": "OpenClickyBackgroundComputerUseController",
+                "key": request.key,
+                "modifiers": request.modifiers.joined(separator: ","),
+                "shouldSpeak": shouldSpeak,
+                "runtimeStatus": backgroundComputerUseController.status.summary
+            ]
+        )
+
+        Task { @MainActor in
+            do {
+                let result = try await backgroundComputerUseController.pressKey(
+                    request.key,
+                    modifiers: request.modifiers
+                )
+                let modifierText = request.modifiers.isEmpty ? "" : request.modifiers.joined(separator: " ") + " "
+                let acknowledgement = "pressed \(modifierText)\(request.key) with Background Computer Use."
+                latestVoiceResponseCard = ClickyResponseCard(
+                    source: .voice,
+                    rawText: acknowledgement,
+                    contextTitle: request.targetDescription
+                )
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "outgoing",
+                    event: "background_computer_use.press_key",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "windowID": result.windowID,
+                        "summary": result.summary,
+                        "key": request.key,
+                        "modifiers": request.modifiers.joined(separator: ",")
+                    ]
+                )
+                if shouldSpeak {
+                    speakShortSystemResponse(acknowledgement)
+                }
+                markRequestCompleted(
+                    route: "background_computer_use.press_key",
+                    executionStartedAt: executionStartedAt,
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "windowID": result.windowID,
+                        "key": request.key,
+                        "modifiers": request.modifiers.joined(separator: ",")
+                    ]
+                )
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "computer-use",
+                    direction: "error",
+                    event: "background_computer_use.press_key_error",
+                    fields: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "runtimeStatus": backgroundComputerUseController.status.summary,
+                        "key": request.key,
+                        "error": error.localizedDescription
+                    ]
+                )
+                if shouldSpeak {
+                    speakShortSystemResponse("Background Computer Use key press hit a blocker: \(error.localizedDescription)")
+                }
+                markRequestCompleted(
+                    route: "background_computer_use.press_key",
+                    executionStartedAt: executionStartedAt,
+                    status: "failed",
+                    extra: [
+                        "executor": "background_computer_use",
+                        "executionMethod": "BackgroundComputerUse /v1/press_key",
+                        "controller": "OpenClickyBackgroundComputerUseController",
+                        "key": request.key,
+                        "error": error.localizedDescription
+                    ]
+                )
             }
         }
     }
@@ -2797,12 +3184,12 @@ final class CompanionManager: ObservableObject {
             }
 
             if let typeRequest = Self.nativeTypeRequest(from: taskCreationInstruction) {
-                typeTextUsingNativeComputerUse(typeRequest)
+                typeTextUsingSelectedComputerUse(typeRequest)
                 return true
             }
 
             if let keyPressRequest = Self.nativeKeyPressRequest(from: taskCreationInstruction) {
-                pressKeyUsingNativeComputerUse(keyPressRequest)
+                pressKeyUsingSelectedComputerUse(keyPressRequest)
                 return true
             }
 
@@ -2833,12 +3220,12 @@ final class CompanionManager: ObservableObject {
 
         let instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
         if let typeRequest = Self.nativeTypeRequest(from: instruction) {
-            typeTextUsingNativeComputerUse(typeRequest)
+            typeTextUsingSelectedComputerUse(typeRequest)
             return true
         }
 
         if let keyPressRequest = Self.nativeKeyPressRequest(from: instruction) {
-            pressKeyUsingNativeComputerUse(keyPressRequest)
+            pressKeyUsingSelectedComputerUse(keyPressRequest)
             return true
         }
 
@@ -3301,21 +3688,47 @@ final class CompanionManager: ObservableObject {
         guard !isAgentRoutingCandidate(trimmedTranscript) else { return nil }
 
         let pattern = #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:(?:ask|tell)\s+(?:an?\s+|the\s+)?agent\s+to\s+)?(?:open|launch|start|switch\s+to)\s+(?:up\s+)?(.+?)(?:\s+for\s+me)?[\.\!\?]*\s*$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(
-                in: trimmedTranscript,
-                range: NSRange(trimmedTranscript.startIndex..<trimmedTranscript.endIndex, in: trimmedTranscript)
-              ),
-              let targetRange = Range(match.range(at: 1), in: trimmedTranscript) else {
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(
+            in: trimmedTranscript,
+            range: NSRange(trimmedTranscript.startIndex..<trimmedTranscript.endIndex, in: trimmedTranscript)
+           ),
+           let targetRange = Range(match.range(at: 1), in: trimmedTranscript) {
+            let rawTarget = String(trimmedTranscript[targetRange])
+            let normalizedTarget = normalizedApplicationName(from: rawTarget)
+            guard !normalizedTarget.isEmpty,
+                  !isReservedAgentOpenTarget(rawTarget),
+                  !isLocalAppOpenPlaceholder(normalizedTarget),
+                  !isLikelyFileOrFolderOpenTarget(rawTarget) else {
+                return nil
+            }
+
+            return OpenClickyAppOpenRequest(
+                appName: normalizedTarget,
+                instruction: "Open \(normalizedTarget)."
+            )
+        }
+
+        return bareLocalAppOpenRequest(fromNormalizedCandidate: trimmedTranscript)
+    }
+
+    private static func bareLocalAppOpenRequest(from transcript: String) -> OpenClickyAppOpenRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        return bareLocalAppOpenRequest(fromNormalizedCandidate: candidate)
+    }
+
+    private static func bareLocalAppOpenRequest(fromNormalizedCandidate candidate: String) -> OpenClickyAppOpenRequest? {
+        let rawTarget = candidate.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+        guard !rawTarget.isEmpty,
+              !isAgentRoutingCandidate(rawTarget),
+              !isReservedAgentOpenTarget(rawTarget),
+              !isLikelyFileOrFolderOpenTarget(rawTarget) else {
             return nil
         }
 
-        let rawTarget = String(trimmedTranscript[targetRange])
         let normalizedTarget = normalizedApplicationName(from: rawTarget)
-        guard !normalizedTarget.isEmpty,
-              !isReservedAgentOpenTarget(rawTarget),
-              !isLocalAppOpenPlaceholder(normalizedTarget),
-              !isLikelyFileOrFolderOpenTarget(rawTarget) else {
+        guard isKnownBareLocalApplicationName(normalizedTarget),
+              !isLocalAppOpenPlaceholder(normalizedTarget) else {
             return nil
         }
 
@@ -3323,6 +3736,28 @@ final class CompanionManager: ObservableObject {
             appName: normalizedTarget,
             instruction: "Open \(normalizedTarget)."
         )
+    }
+
+    private static func isKnownBareLocalApplicationName(_ appName: String) -> Bool {
+        switch appName {
+        case "Google Chrome",
+            "Safari",
+            "Xcode",
+            "Terminal",
+            "Finder",
+            "System Settings",
+            "Mail",
+            "Messages",
+            "Notes",
+            "Reminders",
+            "Calendar",
+            "Slack",
+            "Cursor",
+            "Codex":
+            return true
+        default:
+            return false
+        }
     }
 
     private static func reminderAddRequest(from transcript: String) -> OpenClickyReminderAddRequest? {
@@ -4460,6 +4895,22 @@ final class CompanionManager: ObservableObject {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { return }
         let timing = beginRequestTiming(source: "agent_hud_prompt", text: trimmedPrompt)
+        activeRequestTiming = timing
+        defer { activeRequestTiming = nil }
+        if handleDirectComputerUseRequest(from: trimmedPrompt, source: "agent_hud_prompt") {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "incoming",
+                event: "openclicky.agent_prompt.intercepted_native_cua",
+                fields: [
+                    "source": "agent_hud_prompt",
+                    "instruction": trimmedPrompt,
+                    "requestID": timing.requestID
+                ]
+            )
+            return
+        }
+
         let executionStartedAt = markRequestExecutionStarted(
             route: "agent.followup",
             timing: timing,
@@ -4526,7 +4977,24 @@ final class CompanionManager: ObservableObject {
         }
 
         do {
-            if nativeComputerUseController.isEnabled {
+            if selectedComputerUseBackend == .backgroundComputerUse {
+                do {
+                    let capture = try await backgroundComputerUseController.captureFrontmostWindowAsJPEG()
+                    return try writeBackgroundComputerUseScreenContext(capture)
+                } catch {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "computer-use",
+                        direction: "error",
+                        event: "background_computer_use.screen_context_error",
+                        fields: [
+                            "backend": selectedComputerUseBackend.rawValue,
+                            "error": error.localizedDescription,
+                            "status": backgroundComputerUseController.status.summary
+                        ]
+                    )
+                    print("OpenClicky Agent Mode: Background Computer Use context unavailable: \(error)")
+                }
+            } else if nativeComputerUseController.isEnabled {
                 do {
                     let capture = try await nativeComputerUseController.captureFocusedWindowAsJPEG()
                     return try writeNativeComputerUseScreenContext(capture)
@@ -4579,6 +5047,25 @@ final class CompanionManager: ObservableObject {
 
         return CodexAgentScreenContext(
             source: "native CUA Swift focused-window context",
+            capturedAt: Date(),
+            attachments: [
+                CodexAgentScreenContextAttachment(
+                    label: capture.label,
+                    fileURL: fileURL,
+                    note: capture.agentContextNote
+                )
+            ]
+        )
+    }
+
+    private func writeBackgroundComputerUseScreenContext(_ capture: OpenClickyBackgroundComputerUseWindowCapture) throws -> CodexAgentScreenContext {
+        let directory = try createAgentScreenContextDirectory()
+        let batchID = Self.agentContextBatchID()
+        let fileURL = directory.appendingPathComponent("\(batchID)-background-computer-use-window.jpg", isDirectory: false)
+        try capture.imageData.write(to: fileURL, options: .atomic)
+
+        return CodexAgentScreenContext(
+            source: "Background Computer Use focused-window context",
             capturedAt: Date(),
             attachments: [
                 CodexAgentScreenContextAttachment(

@@ -88,6 +88,7 @@ struct OpenClickySettingsView: View {
     @ObservedObject var companionManager: CompanionManager
     @ObservedObject private var session: CodexAgentSession
     @ObservedObject private var nativeComputerUseController: OpenClickyNativeComputerUseController
+    @ObservedObject private var backgroundComputerUseController: OpenClickyBackgroundComputerUseController
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
     @AppStorage(AppBundleConfiguration.userAnthropicAPIKeyDefaultsKey) private var userAnthropicAPIKey = ""
     @AppStorage(AppBundleConfiguration.userElevenLabsAPIKeyDefaultsKey) private var userElevenLabsAPIKey = ""
@@ -105,6 +106,7 @@ struct OpenClickySettingsView: View {
         self.companionManager = companionManager
         self.session = companionManager.codexAgentSession
         self.nativeComputerUseController = companionManager.nativeComputerUseController
+        self.backgroundComputerUseController = companionManager.backgroundComputerUseController
     }
 
     var body: some View {
@@ -186,7 +188,7 @@ struct OpenClickySettingsView: View {
         case .pointing:
             return "Screen capture permissions and the model used for cursor pointing."
         case .computerUse:
-            return "In-app CUA Swift control for focused-window context, app discovery, and targeted keyboard actions."
+            return "Choose the computer-use backend for focused-window context and targeted actions."
         case .agentMode:
             return "Background agents, Codex configuration, model, working directory, and dashboard access."
         case .memory:
@@ -382,6 +384,20 @@ struct OpenClickySettingsView: View {
 
     private var computerUsePanel: some View {
         VStack(alignment: .leading, spacing: 14) {
+            settingsGroup("Computer use backend") {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                    ForEach(OpenClickyComputerUseBackendID.allCases) { backend in
+                        optionButton(
+                            title: backend.label,
+                            subtitle: backend.subtitle,
+                            isSelected: companionManager.selectedComputerUseBackendID == backend.rawValue,
+                            action: { companionManager.setSelectedComputerUseBackend(backend.rawValue) }
+                        )
+                    }
+                }
+                .padding(14)
+            }
+
             settingsGroup("Native CUA Swift") {
                 toggleRow(
                     title: "Enable in-app computer use",
@@ -404,6 +420,25 @@ struct OpenClickySettingsView: View {
                     subtitle: nativeComputerUseController.status.focusedTargetSummary,
                     systemImageName: "scope"
                 )
+            }
+
+            settingsGroup("Background Computer Use") {
+                valueRow(
+                    title: "Runtime status",
+                    subtitle: backgroundComputerUseController.status.summary,
+                    systemImageName: backgroundComputerUseController.status.isRuntimeReady ? "checkmark.circle" : "exclamationmark.triangle"
+                )
+                valueRow(
+                    title: "Manifest",
+                    subtitle: backgroundComputerUseController.status.manifestPath,
+                    systemImageName: "doc.text.magnifyingglass"
+                )
+                actionRow(title: "Start Background Computer Use", systemImageName: "play.circle") {
+                    companionManager.startBackgroundComputerUseRuntime()
+                }
+                actionRow(title: "Refresh Background status", systemImageName: "arrow.clockwise") {
+                    companionManager.refreshBackgroundComputerUseStatus()
+                }
             }
 
             settingsGroup("Actions") {
@@ -443,10 +478,17 @@ struct OpenClickySettingsView: View {
             settingsGroup("Agent Mode behavior") {
                 valueRow(
                     title: "Screen context source",
-                    subtitle: nativeComputerUseController.isEnabled
-                        ? "Agent Mode first captures the focused target window through the native CUA Swift path, then falls back to all-screen capture if unavailable."
-                        : "Agent Mode uses the existing all-screen capture path until native computer use is enabled.",
+                    subtitle: companionManager.selectedComputerUseBackend == .backgroundComputerUse
+                        ? "Agent Mode first asks Background Computer Use for the focused window screenshot, then falls back if unavailable."
+                        : nativeComputerUseController.isEnabled
+                            ? "Agent Mode first captures the focused target window through the native CUA Swift path, then falls back if unavailable."
+                            : "Agent Mode uses the existing all-screen capture path until native computer use is enabled.",
                     systemImageName: "photo.on.rectangle"
+                )
+                valueRow(
+                    title: "Selected backend",
+                    subtitle: companionManager.selectedComputerUseBackend.label,
+                    systemImageName: "switch.2"
                 )
                 valueRow(
                     title: "Existing CUA Driver MCP",

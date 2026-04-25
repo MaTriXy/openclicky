@@ -1,5 +1,50 @@
 import Foundation
 
+nonisolated enum OpenClickyComputerUseBackendID: String, CaseIterable, Identifiable, Sendable {
+    case nativeSwift = "native_swift"
+    case backgroundComputerUse = "background_computer_use"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .nativeSwift:
+            return "Native CUA Swift"
+        case .backgroundComputerUse:
+            return "Background Computer Use"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .nativeSwift:
+            return "Embedded OpenClicky control"
+        case .backgroundComputerUse:
+            return "Loopback runtime from background-computer-use"
+        }
+    }
+
+    var executorID: String {
+        switch self {
+        case .nativeSwift:
+            return "native_cua"
+        case .backgroundComputerUse:
+            return "background_computer_use"
+        }
+    }
+
+    static let fallback: OpenClickyComputerUseBackendID = .nativeSwift
+
+    static func resolving(_ rawValue: String?) -> OpenClickyComputerUseBackendID {
+        guard let rawValue,
+              let backend = OpenClickyComputerUseBackendID(rawValue: rawValue) else {
+            return fallback
+        }
+
+        return backend
+    }
+}
+
 /// Native, in-app computer-use models inspired by trycua/cua-driver.
 ///
 /// CUA source reference: /Users/jkneen/Documents/GitHub/cua/libs/cua-driver
@@ -215,6 +260,102 @@ struct OpenClickyComputerUseWindowCapture: Sendable, Hashable {
 
     var agentContextNote: String {
         "\(window.agentContextNote) Image dimensions \(screenshotWidthInPixels)x\(screenshotHeightInPixels) pixels."
+    }
+}
+
+struct OpenClickyBackgroundComputerUseStatus: Sendable, Hashable {
+    let sourceRootPath: String
+    let sourceAvailable: Bool
+    let startScriptAvailable: Bool
+    let installedAppAvailable: Bool
+    let manifestPath: String
+    let manifestExists: Bool
+    let baseURL: String?
+    let startedAt: String?
+    let accessibilityGranted: Bool?
+    let screenRecordingGranted: Bool?
+    let instructionsReady: Bool?
+    let instructionsSummary: String?
+    let isStarting: Bool
+    let lastErrorMessage: String?
+
+    var isRuntimeReady: Bool {
+        manifestExists && baseURL != nil && instructionsReady != false && lastErrorMessage == nil
+    }
+
+    var summary: String {
+        if isStarting {
+            return "Starting runtime from \(sourceRootPath)"
+        }
+
+        guard sourceAvailable else {
+            return "Source folder missing at \(sourceRootPath)"
+        }
+
+        guard startScriptAvailable else {
+            return "Start script missing at \(sourceRootPath)/script/start.sh"
+        }
+
+        guard manifestExists else {
+            return installedAppAvailable
+                ? "Installed app found, but runtime manifest is not active"
+                : "Runtime not started yet"
+        }
+
+        if let lastErrorMessage, !lastErrorMessage.isEmpty {
+            return "Runtime manifest found, but last request failed: \(lastErrorMessage)"
+        }
+
+        let permissionSummary: String
+        switch (accessibilityGranted, screenRecordingGranted) {
+        case (.some(true), .some(true)):
+            permissionSummary = "permissions ready"
+        case (.some(false), .some(false)):
+            permissionSummary = "Accessibility and Screen Recording needed"
+        case (.some(false), _):
+            permissionSummary = "Accessibility needed"
+        case (_, .some(false)):
+            permissionSummary = "Screen Recording needed"
+        default:
+            permissionSummary = "permissions unknown"
+        }
+
+        if let baseURL, !baseURL.isEmpty {
+            return "Ready at \(baseURL) - \(permissionSummary)"
+        }
+
+        return "Manifest found - \(permissionSummary)"
+    }
+}
+
+struct OpenClickyBackgroundComputerUseWindowCapture: Sendable, Hashable {
+    let imageData: Data
+    let windowID: String
+    let title: String
+    let bundleID: String
+    let pid: Int32
+    let baseURL: String
+    let stateToken: String
+    let imagePath: String?
+    let screenshotWidthInPixels: Int
+    let screenshotHeightInPixels: Int
+
+    var displayTitle: String {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedTitle.isEmpty {
+            return bundleID
+        }
+
+        return "\(bundleID) - \(trimmedTitle)"
+    }
+
+    var label: String {
+        "Background Computer Use window (\(displayTitle))"
+    }
+
+    var agentContextNote: String {
+        let imagePathNote = imagePath.map { "Screenshot path \($0)." } ?? "Screenshot path unavailable."
+        return "BackgroundComputerUse target window \(windowID), pid \(pid), bundleID \(bundleID), title \(title), state token \(stateToken), runtime \(baseURL). Image dimensions \(screenshotWidthInPixels)x\(screenshotHeightInPixels) pixels. \(imagePathNote)"
     }
 }
 

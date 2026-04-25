@@ -37,6 +37,53 @@ nonisolated struct CodexRPCError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+nonisolated enum CodexRPCErrorMessage {
+    static func readableMessage(from value: Any?) -> String? {
+        guard let value else { return nil }
+
+        if let text = value as? String {
+            return readableMessage(fromText: text)
+        }
+
+        if let dictionary = value as? [String: Any] {
+            return readableMessage(fromDictionary: dictionary)
+        }
+
+        return nil
+    }
+
+    private static func readableMessage(fromText text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let data = trimmed.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) {
+            return readableMessage(from: json)
+        }
+
+        return trimmed
+    }
+
+    private static func readableMessage(fromDictionary dictionary: [String: Any]) -> String? {
+        if let message = CodexJSON.string(dictionary["message"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !message.isEmpty {
+            return readableMessage(fromText: message)
+        }
+
+        if let error = CodexJSON.dictionary(dictionary["error"]),
+           let message = readableMessage(fromDictionary: error) {
+            return message
+        }
+
+        if let details = CodexJSON.string(dictionary["additionalDetails"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !details.isEmpty {
+            return readableMessage(fromText: details)
+        }
+
+        return nil
+    }
+}
+
 nonisolated enum CodexJSON {
     static func string(_ value: Any?) -> String? {
         if let string = value as? String { return string }

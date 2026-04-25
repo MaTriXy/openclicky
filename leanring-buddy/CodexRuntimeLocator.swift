@@ -1,31 +1,60 @@
 import Foundation
 
 nonisolated enum CodexRuntimeLocator {
+    struct CodexRuntimeVersion: Comparable, Equatable {
+        let major: Int
+        let minor: Int
+        let patch: Int
+        let prerelease: String?
+
+        static func < (lhs: CodexRuntimeVersion, rhs: CodexRuntimeVersion) -> Bool {
+            if lhs.major != rhs.major { return lhs.major < rhs.major }
+            if lhs.minor != rhs.minor { return lhs.minor < rhs.minor }
+            if lhs.patch != rhs.patch { return lhs.patch < rhs.patch }
+
+            switch (lhs.prerelease, rhs.prerelease) {
+            case (nil, nil):
+                return false
+            case (nil, _?):
+                return false
+            case (_?, nil):
+                return true
+            case let (left?, right?):
+                return left.localizedStandardCompare(right) == .orderedAscending
+            }
+        }
+    }
+
     nonisolated enum LocatorError: LocalizedError {
         case codexExecutableNotFound
 
         var errorDescription: String? {
             switch self {
             case .codexExecutableNotFound:
-                return "OpenClicky could not find the bundled Codex 0.121.0 executable or a codex executable on PATH."
+                return "OpenClicky could not find a bundled, installed, or PATH Codex executable."
             }
         }
     }
 
     static func codexExecutableURL(bundle: Bundle = .main, fileManager: FileManager = .default) throws -> URL {
+        let candidates = codexExecutableCandidates(bundle: bundle, fileManager: fileManager)
+        guard !candidates.isEmpty else { throw LocatorError.codexExecutableNotFound }
+        return newestCodexExecutableURL(from: candidates) ?? candidates[0]
+    }
+
+    static func codexExecutableCandidates(bundle: Bundle = .main, fileManager: FileManager = .default) -> [URL] {
+        var candidates: [URL] = []
         if let bundled = bundledCodexExecutableURL(bundle: bundle, fileManager: fileManager) {
-            return bundled
+            candidates.append(bundled)
         }
-
         if let source = sourceCodexExecutableURL(fileManager: fileManager) {
-            return source
+            candidates.append(source)
         }
-
+        candidates.append(contentsOf: installedCodexAppExecutableURLs(fileManager: fileManager))
         if let pathCodex = pathCodexExecutableURL(fileManager: fileManager) {
-            return pathCodex
+            candidates.append(pathCodex)
         }
-
-        throw LocatorError.codexExecutableNotFound
+        return deduplicated(candidates)
     }
 
     static func bundledCodexExecutableURL(bundle: Bundle = .main, fileManager: FileManager = .default) -> URL? {
@@ -40,6 +69,15 @@ nonisolated enum CodexRuntimeLocator {
             .appendingPathComponent("CodexRuntime", isDirectory: true)
             .appendingPathComponent("bin/codex", isDirectory: false)
         return fileManager.isExecutableFile(atPath: executable.path) ? executable : nil
+    }
+
+    static func installedCodexAppExecutableURLs(fileManager: FileManager = .default) -> [URL] {
+        [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "\(NSHomeDirectory())/Applications/Codex.app/Contents/Resources/codex"
+        ]
+        .map { URL(fileURLWithPath: $0, isDirectory: false) }
+        .filter { fileManager.isExecutableFile(atPath: $0.path) }
     }
 
     static func sourceAppResourcesDirectory(fileManager: FileManager = .default) -> URL? {
@@ -76,6 +114,78 @@ nonisolated enum CodexRuntimeLocator {
             .path
         let basePath = existingPath ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         return "\(vendorPath):\(basePath)"
+    }
+
+    static func parsedVersion(from versionOutput: String) -> CodexRuntimeVersion? {
+        let pattern = #"(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.\-]+))?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                in: versionOutput,
+                range: NSRange(versionOutput.startIndex..<versionOutput.endIndex, in: versionOutput)
+              ),
+              let majorRange = Range(match.range(at: 1), in: versionOutput),
+              let minorRange = Range(match.range(at: 2), in: versionOutput),
+              let patchRange = Range(match.range(at: 3), in: versionOutput),
+              let major = Int(versionOutput[majorRange]),
+              let minor = Int(versionOutput[minorRange]),
+              let patch = Int(versionOutput[patchRange]) else {
+            return nil
+        }
+
+        let prerelease: String?
+        if match.range(at: 4).location != NSNotFound,
+           let prereleaseRange = Range(match.range(at: 4), in: versionOutput) {
+            prerelease = String(versionOutput[prereleaseRange])
+        } else {
+            prerelease = nil
+        }
+
+        return CodexRuntimeVersion(major: major, minor: minor, patch: patch, prerelease: prerelease)
+    }
+
+    private static func newestCodexExecutableURL(from candidates: [URL]) -> URL? {
+        candidates
+            .compactMap { candidate -> (url: URL, version: CodexRuntimeVersion)? in
+                guard let version = codexVersion(executableURL: candidate) else { return nil }
+                return (candidate, version)
+            }
+            .max { first, second in first.version < second.version }?
+            .url
+    }
+
+    private static func codexVersion(executableURL: URL) -> CodexRuntimeVersion? {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["--version"]
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData + errorData, encoding: .utf8) ?? ""
+        return parsedVersion(from: output)
+    }
+
+    private static func deduplicated(_ urls: [URL]) -> [URL] {
+        var seenPaths = Set<String>()
+        var uniqueURLs: [URL] = []
+        for url in urls {
+            let path = url.standardizedFileURL.path
+            guard seenPaths.insert(path).inserted else { continue }
+            uniqueURLs.append(url)
+        }
+        return uniqueURLs
     }
 
     private static func currentCodexVendorArchitecture() -> String {

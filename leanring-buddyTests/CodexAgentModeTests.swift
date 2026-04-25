@@ -97,6 +97,22 @@ struct CodexAgentModeTests {
         #expect(manager.codexHomeDirectory.lastPathComponent == "CodexHome")
     }
 
+    @Test func codexRuntimeVersionParsingComparesInstalledAlphaAboveOlderBundle() throws {
+        let bundled = try #require(CodexRuntimeLocator.parsedVersion(from: "codex-cli 0.121.0"))
+        let installed = try #require(CodexRuntimeLocator.parsedVersion(from: "codex-cli 0.125.0-alpha.3"))
+
+        #expect(installed > bundled)
+    }
+
+    @Test func codexRPCErrorMessageUnwrapsNestedJSONErrorPayload() throws {
+        let rawPayload = #"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}"#
+
+        let message = try #require(CodexRPCErrorMessage.readableMessage(from: rawPayload))
+
+        #expect(message == "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.")
+        #expect(CodexAgentSession.shouldRetryWithCompatibilityFallback(message))
+    }
+
     @Test func logReviewSetupCreatesMarkdownAndJSONLFiles() throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -118,6 +118,498 @@ final class OpenClickyNativeComputerUseController: ObservableObject {
 }
 
 @MainActor
+final class OpenClickyBackgroundComputerUseController: ObservableObject {
+    @Published private(set) var status: OpenClickyBackgroundComputerUseStatus
+
+    private let fileManager: FileManager
+    private let sourceRootURL: URL
+    private let installedAppURL: URL
+    private let manifestURL: URL
+
+    init(
+        sourceRootURL: URL = URL(fileURLWithPath: "/Users/jkneen/Documents/GitHub/background-computer-use", isDirectory: true),
+        fileManager: FileManager = .default
+    ) {
+        self.fileManager = fileManager
+        self.sourceRootURL = sourceRootURL
+        self.installedAppURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+            .appendingPathComponent("BackgroundComputerUse.app", isDirectory: true)
+        self.manifestURL = fileManager.temporaryDirectory
+            .appendingPathComponent("background-computer-use", isDirectory: true)
+            .appendingPathComponent("runtime-manifest.json", isDirectory: false)
+        self.status = Self.makeStatus(
+            sourceRootURL: sourceRootURL,
+            installedAppURL: installedAppURL,
+            manifestURL: manifestURL,
+            fileManager: fileManager,
+            isStarting: false,
+            lastErrorMessage: nil
+        )
+    }
+
+    func refreshStatus() {
+        status = Self.makeStatus(
+            sourceRootURL: sourceRootURL,
+            installedAppURL: installedAppURL,
+            manifestURL: manifestURL,
+            fileManager: fileManager,
+            isStarting: status.isStarting,
+            lastErrorMessage: nil
+        )
+    }
+
+    func startRuntime() {
+        guard status.isStarting == false else { return }
+
+        status = Self.makeStatus(
+            sourceRootURL: sourceRootURL,
+            installedAppURL: installedAppURL,
+            manifestURL: manifestURL,
+            fileManager: fileManager,
+            isStarting: true,
+            lastErrorMessage: nil
+        )
+
+        let sourceRootURL = sourceRootURL
+        let installedAppURL = installedAppURL
+        let manifestURL = manifestURL
+        let fileManager = fileManager
+
+        Task.detached(priority: .userInitiated) {
+            let startScriptURL = sourceRootURL
+                .appendingPathComponent("script", isDirectory: true)
+                .appendingPathComponent("start.sh", isDirectory: false)
+            let logDirectoryURL = fileManager.temporaryDirectory
+                .appendingPathComponent("background-computer-use", isDirectory: true)
+            let launchLogURL = logDirectoryURL
+                .appendingPathComponent("openclicky-launch.log", isDirectory: false)
+
+            do {
+                try fileManager.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+                fileManager.createFile(atPath: launchLogURL.path, contents: nil)
+                let logHandle = try FileHandle(forWritingTo: launchLogURL)
+                defer {
+                    try? logHandle.close()
+                }
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/bash")
+                process.arguments = [startScriptURL.path]
+                process.currentDirectoryURL = sourceRootURL
+                process.standardOutput = logHandle
+                process.standardError = logHandle
+                try process.run()
+                process.waitUntilExit()
+
+                let launchError = process.terminationStatus == 0
+                    ? nil
+                    : "start.sh exited with status \(process.terminationStatus). See \(launchLogURL.path)"
+                await MainActor.run {
+                    self.status = Self.makeStatus(
+                        sourceRootURL: sourceRootURL,
+                        installedAppURL: installedAppURL,
+                        manifestURL: manifestURL,
+                        fileManager: fileManager,
+                        isStarting: false,
+                        lastErrorMessage: launchError
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self.status = Self.makeStatus(
+                        sourceRootURL: sourceRootURL,
+                        installedAppURL: installedAppURL,
+                        manifestURL: manifestURL,
+                        fileManager: fileManager,
+                        isStarting: false,
+                        lastErrorMessage: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+
+    func captureFrontmostWindowAsJPEG() async throws -> OpenClickyBackgroundComputerUseWindowCapture {
+        let target = try await resolveTargetWindow(appName: nil)
+        let state = try await requestWindowState(windowID: target.windowID, imageMode: "path")
+
+        guard let image = state.screenshot.image else {
+            throw OpenClickyBackgroundComputerUseError.screenshotUnavailable(state.screenshot.captureError ?? "No screenshot image returned.")
+        }
+
+        let imageData: Data
+        if let imageBase64 = image.imageBase64,
+           let decoded = Data(base64Encoded: imageBase64) {
+            imageData = decoded
+        } else if let imagePath = image.imagePath {
+            imageData = try Data(contentsOf: URL(fileURLWithPath: imagePath))
+        } else {
+            throw OpenClickyBackgroundComputerUseError.screenshotUnavailable("No screenshot path or base64 image returned.")
+        }
+
+        return OpenClickyBackgroundComputerUseWindowCapture(
+            imageData: imageData,
+            windowID: state.window.windowID,
+            title: state.window.title,
+            bundleID: state.window.bundleID,
+            pid: state.window.pid,
+            baseURL: try runtimeBaseURL().absoluteString,
+            stateToken: state.stateToken,
+            imagePath: image.imagePath,
+            screenshotWidthInPixels: image.pixelWidth,
+            screenshotHeightInPixels: image.pixelHeight
+        )
+    }
+
+    func pressKey(_ key: String, modifiers: [String] = [], targetAppName: String? = nil) async throws -> OpenClickyBackgroundComputerUseActionResult {
+        let target = try await resolveTargetWindow(appName: targetAppName)
+        let chord = (modifiers + [key]).filter { !$0.isEmpty }.joined(separator: "+")
+        let request = OpenClickyBackgroundComputerUsePressKeyRequest(
+            window: target.windowID,
+            key: chord,
+            cursor: OpenClickyBackgroundComputerUseCursorRequest(
+                id: "openclicky-main",
+                name: "OpenClicky",
+                color: "#38BDF8"
+            ),
+            imageMode: "omit",
+            debug: true
+        )
+        let response: OpenClickyBackgroundComputerUseActionResponse = try await postJSON(
+            path: "/v1/press_key",
+            payload: request
+        )
+        try ensureActionSucceeded(response, route: "press_key")
+        return OpenClickyBackgroundComputerUseActionResult(
+            windowID: target.windowID,
+            summary: response.summary,
+            ok: response.ok
+        )
+    }
+
+    func typeText(_ text: String, targetAppName: String? = nil) async throws -> OpenClickyBackgroundComputerUseActionResult {
+        let target = try await resolveTargetWindow(appName: targetAppName)
+        let request = OpenClickyBackgroundComputerUseTypeTextRequest(
+            window: target.windowID,
+            text: text,
+            focusAssistMode: "focus_and_caret_end",
+            cursor: OpenClickyBackgroundComputerUseCursorRequest(
+                id: "openclicky-main",
+                name: "OpenClicky",
+                color: "#38BDF8"
+            ),
+            imageMode: "omit",
+            debug: true
+        )
+        let response: OpenClickyBackgroundComputerUseActionResponse = try await postJSON(
+            path: "/v1/type_text",
+            payload: request
+        )
+        try ensureActionSucceeded(response, route: "type_text")
+        return OpenClickyBackgroundComputerUseActionResult(
+            windowID: target.windowID,
+            summary: response.summary,
+            ok: response.ok
+        )
+    }
+
+    private func ensureActionSucceeded(_ response: OpenClickyBackgroundComputerUseActionResponse, route: String) throws {
+        guard response.ok else {
+            throw OpenClickyBackgroundComputerUseError.actionFailed(route: route, summary: response.summary)
+        }
+    }
+
+    private func resolveTargetWindow(appName: String?) async throws -> OpenClickyBackgroundComputerUseWindow {
+        let resolvedAppName: String
+        if let appName, !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedAppName = appName
+        } else if let nativeTarget = OpenClickyComputerUseWindowEnumerator.frontmostTargetWindow(),
+                  !nativeTarget.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedAppName = nativeTarget.owner
+        } else {
+            let response: OpenClickyBackgroundComputerUseListAppsResponse = try await postJSON(
+                path: "/v1/list_apps",
+                payload: OpenClickyBackgroundComputerUseEmptyRequest()
+            )
+            guard let frontmost = response.frontmostApp else {
+                throw OpenClickyBackgroundComputerUseError.noFrontmostApp
+            }
+            resolvedAppName = frontmost.name
+        }
+
+        let windowsResponse: OpenClickyBackgroundComputerUseListWindowsResponse = try await postJSON(
+            path: "/v1/list_windows",
+            payload: OpenClickyBackgroundComputerUseListWindowsRequest(app: resolvedAppName)
+        )
+        guard let window = windowsResponse.windows.first(where: { $0.isFocused && !$0.isMinimized && $0.isOnScreen })
+            ?? windowsResponse.windows.first(where: { $0.isMain && !$0.isMinimized && $0.isOnScreen })
+            ?? windowsResponse.windows.first(where: { !$0.isMinimized && $0.isOnScreen })
+            ?? windowsResponse.windows.first else {
+            throw OpenClickyBackgroundComputerUseError.noWindow(appName: resolvedAppName)
+        }
+
+        return window
+    }
+
+    private func requestWindowState(windowID: String, imageMode: String) async throws -> OpenClickyBackgroundComputerUseWindowStateResponse {
+        try await postJSON(
+            path: "/v1/get_window_state",
+            payload: OpenClickyBackgroundComputerUseWindowStateRequest(
+                window: windowID,
+                maxNodes: 6500,
+                imageMode: imageMode,
+                includeRawScreenshot: false,
+                debug: false
+            )
+        )
+    }
+
+    private func runtimeBaseURL() throws -> URL {
+        refreshStatus()
+        guard let baseURLString = status.baseURL,
+              let baseURL = URL(string: baseURLString) else {
+            throw OpenClickyBackgroundComputerUseError.runtimeUnavailable(status.summary)
+        }
+
+        return baseURL
+    }
+
+    private func postJSON<Request: Encodable, Response: Decodable>(
+        path: String,
+        payload: Request
+    ) async throws -> Response {
+        let baseURL = try runtimeBaseURL()
+        let relativePath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: relativePath, relativeTo: baseURL)?.absoluteURL else {
+            throw OpenClickyBackgroundComputerUseError.runtimeUnavailable("Invalid runtime path \(path)")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(payload)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200..<300).contains(httpResponse.statusCode) {
+                let message = String(data: data, encoding: .utf8) ?? "HTTP \(httpResponse.statusCode)"
+                throw OpenClickyBackgroundComputerUseError.httpError(statusCode: httpResponse.statusCode, message: message)
+            }
+            return try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            status = Self.makeStatus(
+                sourceRootURL: sourceRootURL,
+                installedAppURL: installedAppURL,
+                manifestURL: manifestURL,
+                fileManager: fileManager,
+                isStarting: false,
+                lastErrorMessage: error.localizedDescription
+            )
+            throw error
+        }
+    }
+
+    private static func makeStatus(
+        sourceRootURL: URL,
+        installedAppURL: URL,
+        manifestURL: URL,
+        fileManager: FileManager,
+        isStarting: Bool,
+        lastErrorMessage: String?
+    ) -> OpenClickyBackgroundComputerUseStatus {
+        let sourceAvailable = fileManager.fileExists(atPath: sourceRootURL.path)
+        let startScriptURL = sourceRootURL
+            .appendingPathComponent("script", isDirectory: true)
+            .appendingPathComponent("start.sh", isDirectory: false)
+        let startScriptAvailable = fileManager.fileExists(atPath: startScriptURL.path)
+        let installedAppAvailable = fileManager.fileExists(atPath: installedAppURL.path)
+        let manifestExists = fileManager.fileExists(atPath: manifestURL.path)
+        let manifest = manifestExists
+            ? try? JSONDecoder().decode(
+                OpenClickyBackgroundComputerUseRuntimeManifest.self,
+                from: Data(contentsOf: manifestURL)
+            )
+            : nil
+
+        return OpenClickyBackgroundComputerUseStatus(
+            sourceRootPath: sourceRootURL.path,
+            sourceAvailable: sourceAvailable,
+            startScriptAvailable: startScriptAvailable,
+            installedAppAvailable: installedAppAvailable,
+            manifestPath: manifestURL.path,
+            manifestExists: manifestExists,
+            baseURL: manifest?.baseURL,
+            startedAt: manifest?.startedAt,
+            accessibilityGranted: manifest?.permissions.accessibility.granted,
+            screenRecordingGranted: manifest?.permissions.screenRecording.granted,
+            instructionsReady: manifest?.instructions.ready,
+            instructionsSummary: manifest?.instructions.summary,
+            isStarting: isStarting,
+            lastErrorMessage: lastErrorMessage
+        )
+    }
+}
+
+nonisolated struct OpenClickyBackgroundComputerUseActionResult: Sendable, Hashable {
+    let windowID: String
+    let summary: String
+    let ok: Bool
+}
+
+nonisolated enum OpenClickyBackgroundComputerUseError: Error, LocalizedError, Equatable {
+    case runtimeUnavailable(String)
+    case noFrontmostApp
+    case noWindow(appName: String)
+    case screenshotUnavailable(String)
+    case actionFailed(route: String, summary: String)
+    case httpError(statusCode: Int, message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .runtimeUnavailable(let status):
+            return "Background Computer Use runtime is unavailable: \(status)"
+        case .noFrontmostApp:
+            return "Background Computer Use could not resolve the frontmost app."
+        case .noWindow(let appName):
+            return "Background Computer Use could not resolve a target window for \(appName)."
+        case .screenshotUnavailable(let reason):
+            return "Background Computer Use screenshot unavailable: \(reason)"
+        case .actionFailed(let route, let summary):
+            return "Background Computer Use \(route) failed: \(summary)"
+        case .httpError(let statusCode, let message):
+            return "Background Computer Use HTTP \(statusCode): \(message)"
+        }
+    }
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseRuntimeManifest: Decodable {
+    let baseURL: String
+    let startedAt: String?
+    let permissions: OpenClickyBackgroundComputerUseRuntimePermissions
+    let instructions: OpenClickyBackgroundComputerUseRuntimeInstructions
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseRuntimePermissions: Decodable {
+    let accessibility: OpenClickyBackgroundComputerUsePermission
+    let screenRecording: OpenClickyBackgroundComputerUsePermission
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUsePermission: Decodable {
+    let granted: Bool
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseRuntimeInstructions: Decodable {
+    let ready: Bool
+    let summary: String
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseEmptyRequest: Encodable {}
+
+private nonisolated struct OpenClickyBackgroundComputerUseListAppsResponse: Decodable {
+    let frontmostApp: OpenClickyBackgroundComputerUseRunningApp?
+    let runningApps: [OpenClickyBackgroundComputerUseRunningApp]
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseRunningApp: Decodable {
+    let name: String
+    let bundleID: String
+    let pid: Int32
+    let isFrontmost: Bool
+    let onscreenWindowCount: Int
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseListWindowsRequest: Encodable {
+    let app: String
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseListWindowsResponse: Decodable {
+    let windows: [OpenClickyBackgroundComputerUseWindow]
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseWindow: Decodable, Sendable, Hashable {
+    let windowID: String
+    let title: String
+    let bundleID: String
+    let pid: Int32
+    let isFocused: Bool
+    let isMain: Bool
+    let isMinimized: Bool
+    let isOnScreen: Bool
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseWindowStateRequest: Encodable {
+    let window: String
+    let maxNodes: Int
+    let imageMode: String
+    let includeRawScreenshot: Bool
+    let debug: Bool
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseWindowStateResponse: Decodable {
+    let stateToken: String
+    let window: OpenClickyBackgroundComputerUseResolvedWindow
+    let screenshot: OpenClickyBackgroundComputerUseScreenshot
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseResolvedWindow: Decodable, Sendable, Hashable {
+    let windowID: String
+    let title: String
+    let bundleID: String
+    let pid: Int32
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseScreenshot: Decodable {
+    let status: String
+    let image: OpenClickyBackgroundComputerUseScreenshotImage?
+    let captureError: String?
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseScreenshotImage: Decodable {
+    let imagePath: String?
+    let imageBase64: String?
+    let pixelWidth: Int
+    let pixelHeight: Int
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseCursorRequest: Encodable {
+    let id: String
+    let name: String
+    let color: String
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUsePressKeyRequest: Encodable {
+    let window: String
+    let key: String
+    let cursor: OpenClickyBackgroundComputerUseCursorRequest
+    let imageMode: String
+    let debug: Bool
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseTypeTextRequest: Encodable {
+    let window: String
+    let text: String
+    let focusAssistMode: String
+    let cursor: OpenClickyBackgroundComputerUseCursorRequest
+    let imageMode: String
+    let debug: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case window
+        case text
+        case focusAssistMode
+        case cursor
+        case imageMode
+        case debug
+    }
+}
+
+private nonisolated struct OpenClickyBackgroundComputerUseActionResponse: Decodable {
+    let ok: Bool
+    let summary: String
+}
+
+@MainActor
 enum OpenClickyComputerUsePermissionProbe {
     static func status() -> OpenClickyComputerUsePermissionStatus {
         OpenClickyComputerUsePermissionStatus(

@@ -16,6 +16,7 @@ nonisolated enum AppBundleConfiguration {
     static let userDeepgramAPIKeyDefaultsKey = "openClickyDeepgramAPIKey"
     static let userVoiceTranscriptionProviderDefaultsKey = "openClickyVoiceTranscriptionProvider"
     static let userAdvancedModeDefaultsKey = "openClickyAdvancedModeEnabled"
+    static let userComputerUseBackendDefaultsKey = "openClickyComputerUseBackend"
     static let userNativeComputerUseDefaultsKey = "openClickyNativeComputerUseEnabled"
     static let userWidgetsEnabledDefaultsKey = "openClickyWidgetsEnabled"
     static let userWidgetsIncludeAgentTaskNamesDefaultsKey = "openClickyWidgetsIncludeAgentTaskNames"

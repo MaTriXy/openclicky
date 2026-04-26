@@ -53,6 +53,12 @@ private struct OpenClickyAppOpenRequest {
     let instruction: String
 }
 
+private struct OpenClickyAgentSelectionRequest {
+    let agentName: String
+    let followUpText: String?
+    let instruction: String
+}
+
 private struct OpenClickyNativeTypeRequest {
     let text: String
     let targetDescription: String
@@ -1380,6 +1386,9 @@ final class CompanionManager: ObservableObject {
             return
         }
         if handleAgentStatusQuestionIfNeeded(from: finalTranscript) {
+            return
+        }
+        if handleAgentSelectionRequestIfNeeded(from: finalTranscript, source: "voice_final_transcript") {
             return
         }
         if startExplicitAgentTaskIfRequested(from: finalTranscript) {
@@ -2840,6 +2849,10 @@ final class CompanionManager: ObservableObject {
             return
         }
 
+        if handleAgentSelectionRequestIfNeeded(from: trimmedText, source: "text_mode") {
+            return
+        }
+
         if handleDirectComputerUseRequest(from: trimmedText, source: "text_mode") {
             return
         }
@@ -2969,6 +2982,115 @@ final class CompanionManager: ObservableObject {
         )
         speakShortSystemResponse("sent that to \(session.title).")
         return true
+    }
+
+    private func handleAgentSelectionRequestIfNeeded(from transcript: String, source: String) -> Bool {
+        guard let request = Self.agentSelectionRequest(from: transcript) else { return false }
+        let timing = activeRequestTiming
+        let route = request.followUpText == nil ? "agent.select" : "agent.select_and_followup"
+        let executionStartedAt = markRequestExecutionStarted(
+            route: route,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CompanionManager.selectCodexAgentSession",
+                "controller": "CompanionManager",
+                "source": source,
+                "agentName": request.agentName,
+                "hasFollowUpText": request.followUpText != nil
+            ]
+        )
+
+        guard let session = agentSession(matchingSpokenName: request.agentName) else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "error",
+                event: "openclicky.agent_select.not_found",
+                fields: [
+                    "source": source,
+                    "agentName": request.agentName,
+                    "instruction": request.instruction
+                ]
+            )
+            speakShortSystemResponse("i couldn't find an agent called \(request.agentName).")
+            markRequestCompleted(
+                route: route,
+                executionStartedAt: executionStartedAt,
+                timing: timing,
+                status: "failed",
+                extra: [
+                    "executor": "agent_mode",
+                    "executionMethod": "CompanionManager.agentSession",
+                    "controller": "CompanionManager",
+                    "source": source,
+                    "agentName": request.agentName,
+                    "error": "No matching agent session"
+                ]
+            )
+            return true
+        }
+
+        selectCodexAgentSession(session.id)
+        if isAdvancedModeEnabled {
+            showCodexHUD()
+        } else {
+            showAgentDockWindowNearCurrentScreen()
+        }
+
+        var extra: [String: String] = [
+            "source": source,
+            "agentName": request.agentName,
+            "sessionID": session.id.uuidString,
+            "title": session.title
+        ]
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_select.selected",
+            fields: extra.merging([
+                "instruction": request.instruction
+            ]) { current, _ in current }
+        )
+
+        if let followUpText = request.followUpText?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !followUpText.isEmpty {
+            submitAgentPrompt(followUpText, to: session)
+            extra["followUpTextLength"] = "\(followUpText.count)"
+            speakShortSystemResponse("sent that to \(session.title).")
+        } else {
+            speakShortSystemResponse("switched to \(session.title).")
+        }
+
+        markRequestCompleted(
+            route: route,
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: extra.merging([
+                "executor": "agent_mode",
+                "executionMethod": "CompanionManager.selectCodexAgentSession",
+                "controller": "CompanionManager"
+            ]) { current, _ in current }
+        )
+        return true
+    }
+
+    private func agentSession(matchingSpokenName name: String) -> CodexAgentSession? {
+        let needle = Self.normalizedAgentLookupText(name)
+        guard !needle.isEmpty else { return nil }
+
+        for dockItem in agentDockItems.reversed() {
+            let title = Self.normalizedAgentLookupText(dockItem.title)
+            guard title == needle || title.contains(needle) || needle.contains(title) else { continue }
+            if let sessionID = dockItem.sessionID,
+               let session = codexAgentSessions.first(where: { $0.id == sessionID }) {
+                return session
+            }
+        }
+
+        return codexAgentSessions.reversed().first { session in
+            let title = Self.normalizedAgentLookupText(session.title)
+            return title == needle || title.contains(needle) || needle.contains(title)
+        }
     }
 
     private func latestSteerableAgentSession() -> CodexAgentSession? {
@@ -3682,6 +3804,90 @@ final class CompanionManager: ObservableObject {
         return ["agent", "task", "job", "session", "agent task", "agent job", "codex task"].contains(normalized)
     }
 
+    private static func agentSelectionRequest(from transcript: String) -> OpenClickyAgentSelectionRequest? {
+        let candidate = normalizedCommandCandidate(from: transcript)
+        guard !candidate.isEmpty else { return nil }
+
+        let typedFollowUpPatterns = [
+            #"(?i)^\s*(?:open|show|select|switch\s+to|go\s+to|bring\s+up)\s+(?:the\s+)?(.+?)\s+agent\s+and\s+(?:type|write|enter)\s+(.+?)(?:\s+(?:in|into)\s+(?:the\s+)?(?:prompt|input)(?:\s+area|box|field)?)?[\.\!\?]*\s*$"#,
+            #"(?i)^\s*(?:open|show|select|switch\s+to|go\s+to|bring\s+up)\s+(?:agent\s+)?(.+?)\s+and\s+(?:type|write|enter)\s+(.+?)(?:\s+(?:in|into)\s+(?:the\s+)?(?:prompt|input)(?:\s+area|box|field)?)?[\.\!\?]*\s*$"#
+        ]
+
+        for pattern in typedFollowUpPatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let nameRange = Range(match.range(at: 1), in: candidate),
+                  let textRange = Range(match.range(at: 2), in: candidate) else {
+                continue
+            }
+
+            let agentName = cleanedAgentSelectionName(String(candidate[nameRange]))
+            let followUpText = cleanedAgentSelectionFollowUp(String(candidate[textRange]))
+            guard !agentName.isEmpty, !followUpText.isEmpty else { continue }
+            return OpenClickyAgentSelectionRequest(
+                agentName: agentName,
+                followUpText: followUpText,
+                instruction: candidate
+            )
+        }
+
+        let selectionPatterns = [
+            #"(?i)^\s*(?:open|show|select|switch\s+to|go\s+to|bring\s+up)\s+(?:the\s+)?(.+?)\s+agent[\.\!\?]*\s*$"#,
+            #"(?i)^\s*(?:open|show|select|switch\s+to|go\s+to|bring\s+up)\s+agent\s+(.+?)[\.\!\?]*\s*$"#
+        ]
+
+        for pattern in selectionPatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+            guard let match = regex.firstMatch(in: candidate, range: range),
+                  let nameRange = Range(match.range(at: 1), in: candidate) else {
+                continue
+            }
+
+            let agentName = cleanedAgentSelectionName(String(candidate[nameRange]))
+            guard !agentName.isEmpty else { continue }
+            return OpenClickyAgentSelectionRequest(
+                agentName: agentName,
+                followUpText: nil,
+                instruction: candidate
+            )
+        }
+
+        return nil
+    }
+
+    private static func cleanedAgentSelectionName(_ rawName: String) -> String {
+        var name = rawName.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+        name = stripMatchingQuotes(from: name)
+        name = name.replacingOccurrences(
+            of: #"(?i)^(?:the|a|an)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+        name = name.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+        return isAgentTaskPlaceholderInstruction(name) ? "" : name
+    }
+
+    private static func cleanedAgentSelectionFollowUp(_ rawText: String) -> String {
+        var text = rawText.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+        text = text.replacingOccurrences(
+            of: #"(?i)\s+(?:in|into)\s+(?:the\s+)?(?:prompt|input)(?:\s+area|box|field)?$"#,
+            with: "",
+            options: .regularExpression
+        )
+        text = stripMatchingQuotes(from: text)
+        return text.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
+    }
+
+    private static func normalizedAgentLookupText(_ value: String) -> String {
+        normalizedSpokenCommandText(value)
+            .replacingOccurrences(of: #"\b(?:agent|task|session)\b"#, with: " ", options: .regularExpression)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     private static func localAppOpenRequest(from transcript: String) -> OpenClickyAppOpenRequest? {
         let trimmedTranscript = normalizedCommandCandidate(from: transcript)
         guard !trimmedTranscript.isEmpty else { return nil }
@@ -4352,6 +4558,11 @@ final class CompanionManager: ObservableObject {
         }
         return stripped.hasPrefix("agent ")
             || stripped.hasPrefix("agents ")
+            || stripped.hasSuffix(" agent")
+            || stripped.hasSuffix(" agents")
+            || stripped.hasSuffix(" agent task")
+            || stripped.hasSuffix(" agent job")
+            || stripped.hasSuffix(" agent session")
             || stripped.hasPrefix("codex task ")
             || stripped.hasPrefix("codex job ")
             || stripped.hasPrefix("codex session ")
@@ -4897,6 +5108,10 @@ final class CompanionManager: ObservableObject {
         let timing = beginRequestTiming(source: "agent_hud_prompt", text: trimmedPrompt)
         activeRequestTiming = timing
         defer { activeRequestTiming = nil }
+        if handleAgentSelectionRequestIfNeeded(from: trimmedPrompt, source: "agent_hud_prompt") {
+            return
+        }
+
         if handleDirectComputerUseRequest(from: trimmedPrompt, source: "agent_hud_prompt") {
             OpenClickyMessageLogStore.shared.append(
                 lane: "agent",

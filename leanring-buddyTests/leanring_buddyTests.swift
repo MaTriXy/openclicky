@@ -86,4 +86,22 @@ struct leanring_buddyTests {
             ) == "empty"
         )
     }
+
+    @Test func voiceHealthChecksUseLocalFastPath() async throws {
+        #expect(
+            CompanionManager.quickLocalVoiceResponseText(
+                for: "Learning Buddy, can you hear me?"
+            ) == "yes, i can hear you."
+        )
+        #expect(
+            CompanionManager.quickLocalVoiceResponseText(
+                for: "Hey Clicky, are you there?"
+            ) == "i'm here."
+        )
+        #expect(
+            CompanionManager.quickLocalVoiceResponseText(
+                for: "Can you hear me out before you answer?"
+            ) == nil
+        )
+    }
 }

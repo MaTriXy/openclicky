@@ -710,6 +710,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func handleRecognitionError(_ error: Error) {
+        guard isDictationInProgress || activeTranscriptionSession != nil else {
+            return
+        }
+
         if hasFinishedCurrentDictationSession {
             return
         }

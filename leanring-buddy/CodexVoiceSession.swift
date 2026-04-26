@@ -78,6 +78,15 @@ final class CodexVoiceSession {
                     onTextChunk: { _ in }
                 )
                 self.didWarmUpCurrentThread = true
+            } catch where Self.isExpectedWarmUpCancellation(error) {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice",
+                    direction: "internal",
+                    event: "codex_voice.warmup.cancelled",
+                    fields: self.logFields(extra: [
+                        "reason": Self.expectedWarmUpCancellationReason(for: error)
+                    ])
+                )
             } catch {
                 OpenClickyMessageLogStore.shared.append(
                     lane: "voice",
@@ -503,6 +512,41 @@ final class CodexVoiceSession {
         ]
         extra.forEach { fields[$0.key] = $0.value }
         return fields
+    }
+
+    private static func isExpectedWarmUpCancellation(_ error: Error) -> Bool {
+        isExpectedCancellation(error) || isCodexAppServerStopped(error)
+    }
+
+    private static func expectedWarmUpCancellationReason(for error: Error) -> String {
+        if isCodexAppServerStopped(error) {
+            return "app_server_stopped"
+        }
+        return "expected_cancellation"
+    }
+
+    private static func isExpectedCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            return true
+        }
+
+        if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
+            return true
+        }
+
+        let description = String(describing: error).lowercased()
+        return description == "cancellationerror()" || description.contains("cancelled") || description.contains("canceled")
+    }
+
+    private static func isCodexAppServerStopped(_ error: Error) -> Bool {
+        let localized = (error as NSError).localizedDescription.lowercased()
+        let description = String(describing: error).lowercased()
+        return localized.contains("codex app-server stopped") || description.contains("codex app-server stopped")
     }
 
     private static func composePrompt(

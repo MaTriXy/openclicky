@@ -11,6 +11,9 @@ nonisolated enum AppBundleConfiguration {
     static let userAnthropicAPIKeyDefaultsKey = "openClickyAnthropicAPIKey"
     static let userElevenLabsAPIKeyDefaultsKey = "openClickyElevenLabsAPIKey"
     static let userElevenLabsVoiceIDDefaultsKey = "openClickyElevenLabsVoiceID"
+    static let userCartesiaAPIKeyDefaultsKey = "openClickyCartesiaAPIKey"
+    static let userCartesiaVoiceIDDefaultsKey = "openClickyCartesiaVoiceID"
+    static let userTTSProviderDefaultsKey = "openClickyTTSProvider"
     static let userCodexAgentAPIKeyDefaultsKey = "openClickyCodexAgentAPIKey"
     static let userAssemblyAIAPIKeyDefaultsKey = "openClickyAssemblyAIAPIKey"
     static let userDeepgramAPIKeyDefaultsKey = "openClickyDeepgramAPIKey"
@@ -76,6 +79,28 @@ nonisolated enum AppBundleConfiguration {
             environmentKeys: ["ELEVENLABS_VOICE_ID"]
         ) ?? localDevelopmentEnvironmentValue(forKey: "ELEVENLABS_VOICE_ID")
         ?? "kPzsL2i3teMYv0FxEYQ6"
+    }
+
+    static func cartesiaAPIKey() -> String? {
+        userDefaultsValue(forKey: userCartesiaAPIKeyDefaultsKey) ?? stringValue(
+            forKey: "CartesiaAPIKey",
+            environmentKeys: ["CARTESIA_API_KEY"]
+        ) ?? localDevelopmentEnvironmentValue(forKey: "CARTESIA_API_KEY")
+    }
+
+    /// Cartesia voice ID. Defaults to one of their public neutral voices.
+    /// Users override via Settings → Voice → Cartesia voice ID.
+    static func cartesiaVoiceID() -> String {
+        userDefaultsValue(forKey: userCartesiaVoiceIDDefaultsKey) ?? stringValue(
+            forKey: "CartesiaVoiceID",
+            environmentKeys: ["CARTESIA_VOICE_ID"]
+        ) ?? localDevelopmentEnvironmentValue(forKey: "CARTESIA_VOICE_ID")
+        ?? "a0e99841-438c-4a64-b679-ae501e7d6091"
+    }
+
+    /// Selected TTS provider — "elevenlabs" (default) or "cartesia".
+    static func ttsProviderRaw() -> String {
+        userDefaultsValue(forKey: userTTSProviderDefaultsKey) ?? "elevenlabs"
     }
 
     private static func userDefaultsValue(forKey key: String) -> String? {

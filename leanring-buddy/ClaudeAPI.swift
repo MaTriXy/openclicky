@@ -81,6 +81,10 @@ class ClaudeAPI {
         return "image/jpeg"
     }
 
+    private static func sanitizedAssistantContent(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Sends a no-op HEAD request to the API host to establish and cache a TLS session.
     /// Failures are silently ignored — this is purely an optimization.
     private func warmUpTLSConnectionIfNeeded() {
@@ -123,6 +127,7 @@ class ClaudeAPI {
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
         userPrompt: String,
+        assistantPrefill: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
@@ -134,7 +139,7 @@ class ClaudeAPI {
 
         for (userPlaceholder, assistantResponse) in conversationHistory {
             messages.append(["role": "user", "content": userPlaceholder])
-            messages.append(["role": "assistant", "content": assistantResponse])
+            messages.append(["role": "assistant", "content": Self.sanitizedAssistantContent(assistantResponse)])
         }
 
         // Build current message with all labeled images + prompt
@@ -158,6 +163,25 @@ class ClaudeAPI {
             "text": userPrompt
         ])
         messages.append(["role": "user", "content": contentBlocks])
+
+        // Anthropic assistant-prefill: when set, the assistant turn is
+        // partially prepopulated with the given text. The model
+        // continues generating from that exact byte. The streamed
+        // delta we get back is JUST the continuation; the prefill is
+        // NOT echoed in the response.
+        //
+        // IMPORTANT: Anthropic rejects the request if the final
+        // assistant content ends in whitespace
+        // (`final assistant content cannot end with trailing whitespace`).
+        // Strip trailing whitespace before sending. The model emits a
+        // leading space on its continuation tokens naturally, so the
+        // reassembled text still reads cleanly.
+        if let rawPrefill = assistantPrefill {
+            let trimmed = Self.sanitizedAssistantContent(rawPrefill)
+            if !trimmed.isEmpty {
+                messages.append(["role": "assistant", "content": trimmed])
+            }
+        }
 
         let body: [String: Any] = [
             "model": model,
@@ -339,7 +363,7 @@ class ClaudeAPI {
         var messages: [[String: Any]] = []
         for (userPlaceholder, assistantResponse) in conversationHistory {
             messages.append(["role": "user", "content": userPlaceholder])
-            messages.append(["role": "assistant", "content": assistantResponse])
+            messages.append(["role": "assistant", "content": Self.sanitizedAssistantContent(assistantResponse)])
         }
 
         // Build current message with all labeled images + prompt

@@ -24,11 +24,40 @@ struct CompanionScreenCapture {
 @MainActor
 enum CompanionScreenCaptureUtility {
 
+    /// Cached SCShareableContent. Fetching it cold takes 80–200ms because
+    /// ScreenCaptureKit enumerates every window on every display. Reusing
+    /// it for ~3 seconds lets push-to-talk → screenshot stay under the
+    /// audio-engine warmup budget. Refreshed on every miss.
+    private static var cachedShareableContent: SCShareableContent?
+    private static var cachedShareableContentExpiresAt: Date?
+    private static let shareableContentCacheLifetime: TimeInterval = 3.0
+
+    private static func currentShareableContent() async throws -> SCShareableContent {
+        if let cached = cachedShareableContent,
+           let expiresAt = cachedShareableContentExpiresAt,
+           expiresAt > Date() {
+            return cached
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        cachedShareableContent = content
+        cachedShareableContentExpiresAt = Date().addingTimeInterval(shareableContentCacheLifetime)
+        return content
+    }
+
+    /// Pre-fetches SCShareableContent so the first capture after key-down
+    /// skips the cold enumeration. Safe to call repeatedly — it just
+    /// refreshes the cache.
+    static func prewarmShareableContent() {
+        Task { @MainActor in
+            _ = try? await currentShareableContent()
+        }
+    }
+
     /// Captures all connected displays as JPEG data, labeling each with
     /// whether the user's cursor is on that screen. This gives the AI
     /// full context across multiple monitors.
     static func captureAllScreensAsJPEG() async throws -> [CompanionScreenCapture] {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content = try await currentShareableContent()
 
         guard !content.displays.isEmpty else {
             throw NSError(domain: "CompanionScreenCapture", code: -1,
@@ -135,7 +164,7 @@ enum CompanionScreenCaptureUtility {
     /// unrelated desktop clutter. Falls back to full-screen capture when no
     /// suitable focused window is available.
     static func captureFocusedWindowAsJPEG() async throws -> [CompanionScreenCapture] {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content = try await currentShareableContent()
 
         guard !content.displays.isEmpty else {
             throw NSError(domain: "CompanionScreenCapture", code: -1,

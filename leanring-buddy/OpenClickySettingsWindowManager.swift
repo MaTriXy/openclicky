@@ -93,6 +93,8 @@ struct OpenClickySettingsView: View {
     @AppStorage(AppBundleConfiguration.userAnthropicAPIKeyDefaultsKey) private var userAnthropicAPIKey = ""
     @AppStorage(AppBundleConfiguration.userElevenLabsAPIKeyDefaultsKey) private var userElevenLabsAPIKey = ""
     @AppStorage(AppBundleConfiguration.userElevenLabsVoiceIDDefaultsKey) private var userElevenLabsVoiceID = ""
+    @AppStorage(AppBundleConfiguration.userCartesiaAPIKeyDefaultsKey) private var userCartesiaAPIKey = ""
+    @AppStorage(AppBundleConfiguration.userCartesiaVoiceIDDefaultsKey) private var userCartesiaVoiceID = ""
     @AppStorage(AppBundleConfiguration.userCodexAgentAPIKeyDefaultsKey) private var userCodexAgentAPIKey = ""
     @AppStorage(AppBundleConfiguration.userAssemblyAIAPIKeyDefaultsKey) private var userAssemblyAIAPIKey = ""
     @AppStorage(AppBundleConfiguration.userDeepgramAPIKeyDefaultsKey) private var userDeepgramAPIKey = ""
@@ -322,27 +324,62 @@ struct OpenClickySettingsView: View {
             }
 
             settingsGroup("Playback") {
-                secureFieldRow(
-                    title: "ElevenLabs API key",
-                    subtitle: "Used for spoken OpenClicky replies.",
-                    systemImageName: "speaker.wave.2",
-                    placeholder: "ElevenLabs key",
-                    text: Binding(
-                        get: { userElevenLabsAPIKey },
-                        set: { userElevenLabsAPIKey = $0; companionManager.setElevenLabsAPIKey($0) }
-                    )
-                )
+                Picker("TTS provider", selection: Binding(
+                    get: { companionManager.selectedTTSProvider },
+                    set: { companionManager.setTTSProvider($0) }
+                )) {
+                    ForEach(OpenClickyTTSProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 4)
 
-                textFieldRow(
-                    title: "ElevenLabs voice ID",
-                    subtitle: "Optional custom voice override.",
-                    systemImageName: "person.wave.2",
-                    placeholder: "Voice ID",
-                    text: Binding(
-                        get: { userElevenLabsVoiceID },
-                        set: { userElevenLabsVoiceID = $0; companionManager.setElevenLabsVoiceID($0) }
+                if companionManager.selectedTTSProvider == .elevenLabs {
+                    secureFieldRow(
+                        title: "ElevenLabs API key",
+                        subtitle: "Used for spoken OpenClicky replies.",
+                        systemImageName: "speaker.wave.2",
+                        placeholder: "ElevenLabs key",
+                        text: Binding(
+                            get: { userElevenLabsAPIKey },
+                            set: { userElevenLabsAPIKey = $0; companionManager.setElevenLabsAPIKey($0) }
+                        )
                     )
-                )
+
+                    textFieldRow(
+                        title: "ElevenLabs voice ID",
+                        subtitle: "Optional custom voice override.",
+                        systemImageName: "person.wave.2",
+                        placeholder: "Voice ID",
+                        text: Binding(
+                            get: { userElevenLabsVoiceID },
+                            set: { userElevenLabsVoiceID = $0; companionManager.setElevenLabsVoiceID($0) }
+                        )
+                    )
+                } else {
+                    secureFieldRow(
+                        title: "Cartesia API key",
+                        subtitle: "Used for spoken OpenClicky replies.",
+                        systemImageName: "speaker.wave.2",
+                        placeholder: "Cartesia key",
+                        text: Binding(
+                            get: { userCartesiaAPIKey },
+                            set: { userCartesiaAPIKey = $0; companionManager.setCartesiaAPIKey($0) }
+                        )
+                    )
+
+                    textFieldRow(
+                        title: "Cartesia voice ID",
+                        subtitle: "Optional custom voice override.",
+                        systemImageName: "person.wave.2",
+                        placeholder: "Voice ID",
+                        text: Binding(
+                            get: { userCartesiaVoiceID },
+                            set: { userCartesiaVoiceID = $0; companionManager.setCartesiaVoiceID($0) }
+                        )
+                    )
+                }
             }
         }
     }
@@ -537,6 +574,17 @@ struct OpenClickySettingsView: View {
                         }
                     )
                 )
+            }
+
+            settingsGroup("Agent dock position") {
+                AgentParkingPositionPicker(
+                    selection: Binding(
+                        get: { companionManager.agentParkingPosition },
+                        set: { companionManager.setAgentParkingPosition($0) }
+                    )
+                )
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
             }
 
             settingsGroup("Agent authentication") {
@@ -955,5 +1003,96 @@ struct OpenClickySettingsView: View {
             event: "settings.open_logs_folder"
         )
         NSWorkspace.shared.open(OpenClickyMessageLogStore.shared.logDirectory)
+    }
+}
+
+// MARK: - AgentParkingPositionPicker
+
+/// A screen-shaped preview with eight tappable anchor points. Tapping
+/// any dot selects that parking position and updates the binding.
+struct AgentParkingPositionPicker: View {
+    @Binding var selection: AgentParkingPosition
+
+    private let aspectRatio: CGFloat = 16.0 / 10.0
+    private let dotSize: CGFloat = 18
+    private let outlineColor = Color.secondary.opacity(0.55)
+    private let selectedColor = Color.accentColor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Where agents park")
+                .font(.headline)
+
+            Text("Pick the corner of the screen where the agent dock should appear.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            GeometryReader { proxy in
+                let frame = previewRect(in: proxy.size)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(outlineColor, lineWidth: 1.5)
+                        .frame(width: frame.width, height: frame.height)
+                        .position(x: frame.midX, y: frame.midY)
+
+                    Rectangle()
+                        .fill(outlineColor.opacity(0.25))
+                        .frame(width: frame.width, height: 6)
+                        .position(x: frame.midX, y: frame.minY + 3)
+
+                    ForEach(AgentParkingPosition.allCases) { position in
+                        let dotPosition = absolutePoint(for: position, in: frame)
+                        Button {
+                            selection = position
+                        } label: {
+                            Circle()
+                                .fill(position == selection ? selectedColor : Color.clear)
+                                .overlay(
+                                    Circle().stroke(
+                                        position == selection ? selectedColor : outlineColor,
+                                        lineWidth: position == selection ? 0 : 1.5
+                                    )
+                                )
+                                .frame(width: dotSize, height: dotSize)
+                        }
+                        .buttonStyle(.plain)
+                        .help(position.label)
+                        .position(x: dotPosition.x, y: dotPosition.y)
+                    }
+                }
+            }
+            .frame(height: 160)
+
+            Text(selection.label)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+        }
+    }
+
+    private func previewRect(in size: CGSize) -> CGRect {
+        let availableHeight = size.height
+        let availableWidth = size.width
+        let widthFromHeight = availableHeight * aspectRatio
+        let heightFromWidth = availableWidth / aspectRatio
+        let width: CGFloat
+        let height: CGFloat
+        if widthFromHeight <= availableWidth {
+            width = widthFromHeight
+            height = availableHeight
+        } else {
+            width = availableWidth
+            height = heightFromWidth
+        }
+        let originX = (availableWidth - width) / 2
+        let originY = (availableHeight - height) / 2
+        return CGRect(x: originX, y: originY, width: width, height: height)
+    }
+
+    private func absolutePoint(for position: AgentParkingPosition, in frame: CGRect) -> CGPoint {
+        let anchor = position.normalizedAnchor
+        return CGPoint(
+            x: frame.minX + anchor.x * frame.width,
+            y: frame.minY + anchor.y * frame.height
+        )
     }
 }

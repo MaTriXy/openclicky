@@ -10,6 +10,86 @@
 import AppKit
 import SwiftUI
 
+// MARK: - AgentParkingPosition
+
+/// Where the agent dock parks itself on the active screen. Eight anchor
+/// points: four corners, four mid-edges. Default is top-right because
+/// that's where most users put their menubar/notification stack — the
+/// dock blends with that visual line without competing for the bottom
+/// Dock area. `nonisolated` so the type can be referenced from any
+/// actor context (the dock manager calls `originForWindow` from
+/// `@MainActor`; CompanionManager bindings cross actors freely).
+nonisolated enum AgentParkingPosition: String, CaseIterable, Identifiable {
+    case topLeft = "topLeft"
+    case topCenter = "topCenter"
+    case topRight = "topRight"
+    case middleLeft = "middleLeft"
+    case middleRight = "middleRight"
+    case bottomLeft = "bottomLeft"
+    case bottomCenter = "bottomCenter"
+    case bottomRight = "bottomRight"
+
+    static let `default`: AgentParkingPosition = .topRight
+    static let userDefaultsKey = "openclicky.agentParkingPosition"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .topLeft: return "Top Left"
+        case .topCenter: return "Top"
+        case .topRight: return "Top Right"
+        case .middleLeft: return "Left"
+        case .middleRight: return "Right"
+        case .bottomLeft: return "Bottom Left"
+        case .bottomCenter: return "Bottom"
+        case .bottomRight: return "Bottom Right"
+        }
+    }
+
+    /// Computes the origin (bottom-left in AppKit coords) for a window
+    /// of `size` parked on `screen` at this anchor. Uses `visibleFrame`
+    /// so the dock respects the menu bar and system Dock.
+    func originForWindow(size: NSSize, on screen: NSScreen, edgeInset: CGFloat = 16) -> CGPoint {
+        let frame = screen.frame
+        let visible = screen.visibleFrame
+
+        let xLeft = visible.minX + edgeInset
+        let xRight = visible.maxX - size.width - edgeInset
+        let xCenter = visible.midX - size.width / 2
+
+        let yTop = visible.maxY - size.height - max(edgeInset, frame.maxY - visible.maxY + 8)
+        let yBottom = visible.minY + edgeInset
+        let yMiddle = visible.midY - size.height / 2
+
+        switch self {
+        case .topLeft:      return CGPoint(x: xLeft, y: yTop)
+        case .topCenter:    return CGPoint(x: xCenter, y: yTop)
+        case .topRight:     return CGPoint(x: xRight, y: yTop)
+        case .middleLeft:   return CGPoint(x: xLeft, y: yMiddle)
+        case .middleRight:  return CGPoint(x: xRight, y: yMiddle)
+        case .bottomLeft:   return CGPoint(x: xLeft, y: yBottom)
+        case .bottomCenter: return CGPoint(x: xCenter, y: yBottom)
+        case .bottomRight:  return CGPoint(x: xRight, y: yBottom)
+        }
+    }
+
+    /// Anchor in [0,1]x[0,1] for the preview picker. (0,0) = top-left
+    /// in SwiftUI's drawing coordinates.
+    var normalizedAnchor: CGPoint {
+        switch self {
+        case .topLeft:      return CGPoint(x: 0.05, y: 0.10)
+        case .topCenter:    return CGPoint(x: 0.50, y: 0.10)
+        case .topRight:     return CGPoint(x: 0.95, y: 0.10)
+        case .middleLeft:   return CGPoint(x: 0.05, y: 0.50)
+        case .middleRight:  return CGPoint(x: 0.95, y: 0.50)
+        case .bottomLeft:   return CGPoint(x: 0.05, y: 0.90)
+        case .bottomCenter: return CGPoint(x: 0.50, y: 0.90)
+        case .bottomRight:  return CGPoint(x: 0.95, y: 0.90)
+        }
+    }
+}
+
 class OverlayWindow: NSWindow {
     init(screen: NSScreen) {
         // Create window covering entire screen
@@ -125,6 +205,9 @@ struct BlueCursorView: View {
         _isCursorOnThisScreen = State(initialValue: screenFrame.contains(mouseLocation))
     }
     @State private var timer: Timer?
+    /// High-priority background timer that drives cursor tracking. Held
+    /// as a strong reference so the source isn't deallocated mid-tick.
+    @State private var cursorTrackingTimer: DispatchSourceTimer?
     @State private var welcomeText: String = ""
     @State private var showWelcome: Bool = true
     @State private var bubbleSize: CGSize = .zero
@@ -308,6 +391,8 @@ struct BlueCursorView: View {
         }
         .onDisappear {
             timer?.invalidate()
+            cursorTrackingTimer?.cancel()
+            cursorTrackingTimer = nil
             navigationAnimationTimer?.invalidate()
             companionManager.tearDownOnboardingVideo()
         }
@@ -360,13 +445,31 @@ struct BlueCursorView: View {
     // MARK: - Cursor Tracking
 
     private func startTrackingCursor() {
-        let trackingTimer = Timer(timeInterval: 0.016, repeats: true) { _ in
-            Task { @MainActor in
+        // Sample `NSEvent.mouseLocation` (thread-safe) on a high-priority
+        // background queue so cursor tracking is independent of main-
+        // actor pressure. The previous Foundation `Timer` lived on the
+        // main RunLoop and got starved when LLM streaming + audio
+        // scheduling saturated the actor — visible as the cursor
+        // freezing in place.
+        //
+        // We only hop to main when the cursor actually moved. If main
+        // is busy, multiple hops may queue up, but each one re-reads
+        // `NSEvent.mouseLocation` when it runs, so the buddy never
+        // lags behind reality — it just catches up in a burst.
+        let queue = DispatchQueue(label: "openclicky.cursor.tracker", qos: .userInteractive)
+        let dispatchTimer = DispatchSource.makeTimerSource(queue: queue)
+        dispatchTimer.schedule(deadline: .now(), repeating: .milliseconds(16), leeway: .milliseconds(2))
+        var lastSampledPoint: CGPoint = .zero
+        dispatchTimer.setEventHandler {
+            let mouseLocation = NSEvent.mouseLocation
+            if mouseLocation == lastSampledPoint { return }
+            lastSampledPoint = mouseLocation
+            DispatchQueue.main.async {
                 updateCursorTracking()
             }
         }
-        timer = trackingTimer
-        RunLoop.main.add(trackingTimer, forMode: .common)
+        dispatchTimer.resume()
+        cursorTrackingTimer = dispatchTimer
     }
 
     private func updateCursorTracking() {
@@ -1260,12 +1363,16 @@ final class ClickyAgentDockWindowManager {
     private let dockTrailingInset: CGFloat = 10
     private let dockItemSpacing: CGFloat = 10
 
-    func show(companionManager: CompanionManager, onScreen screen: NSScreen) {
+    func show(
+        companionManager: CompanionManager,
+        onScreen screen: NSScreen,
+        position: AgentParkingPosition
+    ) {
         if panel == nil {
             createPanel(companionManager: companionManager)
         }
 
-        positionPanel(onScreen: screen)
+        positionPanel(onScreen: screen, position: position)
         panel?.orderFrontRegardless()
     }
 
@@ -1308,14 +1415,20 @@ final class ClickyAgentDockWindowManager {
         panel = dockPanel
     }
 
-    private func positionPanel(onScreen screen: NSScreen) {
+    private func positionPanel(onScreen screen: NSScreen, position: AgentParkingPosition) {
         guard let panel else { return }
-        let frame = screen.frame
-        let visibleFrame = screen.visibleFrame
-        let x = visibleFrame.maxX - dockSize.width - 16
-        let topInset = max(56, frame.maxY - visibleFrame.maxY + 56)
-        let y = frame.maxY - dockSize.height - topInset
-        panel.setFrame(NSRect(x: x, y: y, width: dockSize.width, height: dockSize.height), display: true)
+        // Keep the previous extra top padding for top-anchored positions
+        // (notification banners + menu bar leave less usable area at the
+        // top), and use a smaller default elsewhere.
+        let edgeInset: CGFloat
+        switch position {
+        case .topLeft, .topCenter, .topRight:
+            edgeInset = max(56, screen.frame.maxY - screen.visibleFrame.maxY + 56)
+        default:
+            edgeInset = 16
+        }
+        let origin = position.originForWindow(size: dockSize, on: screen, edgeInset: edgeInset)
+        panel.setFrame(NSRect(origin: origin, size: dockSize), display: true)
     }
 }
 

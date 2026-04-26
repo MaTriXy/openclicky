@@ -27,14 +27,29 @@ nonisolated struct OpenClickyModelOption: Identifiable, Equatable {
 }
 
 nonisolated enum OpenClickyModelCatalog {
-    static let defaultVoiceResponseModelID = "claude-sonnet-4-6"
+    /// Fast conversational responder. Used for the always-on voice loop —
+    /// hears you, decides whether to delegate, narrates progress.
+    /// Haiku 4.5 has ~150-250ms TTFT vs ~400-600ms for Sonnet.
+    static let defaultVoiceResponseModelID = "claude-haiku-4-5"
+    /// Heavier model used when the voice responder delegates a coding/agent task.
+    /// Coding work goes here; the voice path stays on the fast model.
+    static let defaultDelegationModelID = "claude-sonnet-4-6"
     static let defaultComputerUseModelID = "claude-sonnet-4-6"
     static let defaultCodexActionsModelID = "gpt-5.4"
 
+    /// Resolves the delegation model — falls back to a sensible coder
+    /// when the user hasn't picked one explicitly.
+    static func delegationModel(withID modelID: String?) -> OpenClickyModelOption {
+        if let modelID, let match = voiceResponseModels.first(where: { $0.id == modelID }) {
+            return match
+        }
+        return voiceResponseModel(withID: defaultDelegationModelID)
+    }
+
     static let voiceResponseModels: [OpenClickyModelOption] = [
+        OpenClickyModelOption(id: "claude-haiku-4-5", label: "Claude Haiku", provider: .anthropic, maxOutputTokens: 64_000),
         OpenClickyModelOption(id: "claude-sonnet-4-6", label: "Claude Sonnet", provider: .anthropic, maxOutputTokens: 64_000),
         OpenClickyModelOption(id: "claude-opus-4-6", label: "Claude Opus", provider: .anthropic, maxOutputTokens: 128_000),
-        OpenClickyModelOption(id: "claude-haiku-4-5", label: "Claude Haiku", provider: .anthropic, maxOutputTokens: 64_000),
         OpenClickyModelOption(id: "gpt-5.5", label: "GPT-5.5", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4", label: "GPT-5.4", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4-mini", label: "GPT-5.4 Mini", provider: .openAI, maxOutputTokens: 128_000),

@@ -299,6 +299,7 @@ private final class DeepgramStreamingTranscriptionSession: BuddyStreamingTranscr
     }
 
     private func failSession(with error: Error) {
+        let reportedError = Self.reportedError(for: error)
         stateQueue.async {
             guard !self.isCancelled else { return }
 
@@ -306,13 +307,13 @@ private final class DeepgramStreamingTranscriptionSession: BuddyStreamingTranscr
             if self.isAwaitingExplicitFinalTranscript
                 && !self.hasDeliveredFinalTranscript
                 && !latestTranscriptText.isEmpty {
-                print("[Deepgram] WebSocket error during finalization, delivering partial transcript: \(error.localizedDescription)")
+                print("[Deepgram] WebSocket error during finalization, delivering partial transcript: \(reportedError.localizedDescription)")
                 self.deliverFinalTranscriptIfNeeded(latestTranscriptText)
                 return
             }
 
-            print("[Deepgram] Session failed with error: \(error.localizedDescription)")
-            self.onError(error)
+            print("[Deepgram] Session failed with error: \(reportedError.localizedDescription)")
+            self.onError(reportedError)
         }
     }
 
@@ -327,6 +328,18 @@ private final class DeepgramStreamingTranscriptionSession: BuddyStreamingTranscr
         }
 
         return transcriptSegments.joined(separator: " ")
+    }
+
+    private static func reportedError(for error: Error) -> Error {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain,
+              nsError.code == NSURLErrorBadServerResponse else {
+            return error
+        }
+
+        return DeepgramStreamingTranscriptionProviderError(
+            message: "Deepgram rejected the streaming connection. Check the Deepgram API key, account status, and transcription model."
+        )
     }
 
     private static func makeWebsocketURL(modelName: String, keyterms: [String]) throws -> URL {
@@ -344,11 +357,24 @@ private final class DeepgramStreamingTranscriptionSession: BuddyStreamingTranscr
             URLQueryItem(name: "endpointing", value: "300")
         ]
 
+        // Deepgram replaced the legacy `keywords=` parameter on nova-3
+        // (and the upcoming nova-4 lineage) with `keyterm=`. Mixing
+        // `keywords` with `model=nova-3` causes the WebSocket upgrade
+        // to fail with `_NSURLErrorWebSocketHandshakeFailureReasonKey=0`
+        // (HTTP 400 at the upgrade). Detect by model-name prefix:
+        // nova-3 / nova-4 / future major bumps → keyterm. nova-2 and
+        // earlier → keywords (legacy).
+        let lowerModelName = modelName.lowercased()
+        let usesKeyterm = lowerModelName.hasPrefix("nova-3")
+            || lowerModelName.hasPrefix("nova-4")
+            || lowerModelName.hasPrefix("nova-5")
+        let keytermParameterName = usesKeyterm ? "keyterm" : "keywords"
+
         for keyterm in keyterms
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .filter({ !$0.isEmpty })
             .prefix(25) {
-            queryItems.append(URLQueryItem(name: "keywords", value: keyterm))
+            queryItems.append(URLQueryItem(name: keytermParameterName, value: keyterm))
         }
 
         websocketURLComponents.queryItems = queryItems

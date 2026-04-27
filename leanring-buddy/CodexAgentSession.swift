@@ -93,6 +93,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     @Published private(set) var activeThreadID: String?
     @Published private(set) var lastErrorMessage: String?
     @Published private(set) var latestResponseCard: ClickyResponseCard?
+    @Published private(set) var stopReason: String?
     @Published private(set) var title: String
     @Published var model: String = OpenClickyModelCatalog.codexActionsModel(
         withID: UserDefaults.standard.string(forKey: "clickyCodexModel") ?? OpenClickyModelCatalog.defaultCodexActionsModelID
@@ -218,14 +219,15 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         UserDefaults.standard.set(resolvedModel, forKey: "clickyCodexModel")
 
         if processManager.isRunning {
-            stop()
+            stop(reason: "model_changed")
         }
     }
 
-    func stop() {
+    func stop(reason: String? = nil) {
         pendingAssistantDeltaFlushTask?.cancel()
         pendingAssistantDeltaFlushTask = nil
         pendingAssistantDeltas.removeAll()
+        stopReason = reason
         processManager.stop()
         hasInitializedProcess = false
         activeThreadID = nil
@@ -240,6 +242,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
                 throw CodexRPCError(message: "Codex thread did not start.")
             }
 
+            stopReason = nil
             status = .running
             lastErrorMessage = nil
             UserDefaults.standard.set(model, forKey: "clickyCodexModel")

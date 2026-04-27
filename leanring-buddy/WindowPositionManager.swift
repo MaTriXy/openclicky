@@ -235,20 +235,25 @@ class WindowPositionManager {
         // Get the focused window of the front app
         var focusedWindowValue: AnyObject?
         let focusedResult = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindowValue)
-        guard focusedResult == .success, let focusedWindow = focusedWindowValue else { return }
+        guard focusedResult == .success,
+              let focusedWindow = focusedWindowValue as? AXUIElement else {
+            return
+        }
 
         // Get position and size of the focused window
         var positionValue: AnyObject?
         var sizeValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(focusedWindow as! AXUIElement, kAXPositionAttribute as CFString, &positionValue) == .success,
-              AXUIElementCopyAttributeValue(focusedWindow as! AXUIElement, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+        guard AXUIElementCopyAttributeValue(focusedWindow, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(focusedWindow, kAXSizeAttribute as CFString, &sizeValue) == .success else {
             return
         }
 
         var otherPosition = CGPoint.zero
         var otherSize = CGSize.zero
-        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &otherPosition),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &otherSize) else {
+        guard let positionValue = positionValue as? AXValue,
+              let sizeValue = sizeValue as? AXValue,
+              AXValueGetValue(positionValue, .cgPoint, &otherPosition),
+              AXValueGetValue(sizeValue, .cgSize, &otherSize) else {
             return
         }
 
@@ -275,7 +280,7 @@ class WindowPositionManager {
 
             var newSize = CGSize(width: newWidth, height: otherSize.height)
             guard let newSizeValue = AXValueCreate(.cgSize, &newSize) else { return }
-            AXUIElementSetAttributeValue(focusedWindow as! AXUIElement, kAXSizeAttribute as CFString, newSizeValue)
+            AXUIElementSetAttributeValue(focusedWindow, kAXSizeAttribute as CFString, newSizeValue)
         }
     }
 }

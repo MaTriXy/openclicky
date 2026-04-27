@@ -477,12 +477,10 @@ final class CompanionManager: ObservableObject {
     private var activeRequestTiming: OpenClickyRequestTiming?
     private var agentRequestTimingsBySessionID: [UUID: OpenClickyRequestTiming] = [:]
     private var agentExecutionStartDatesBySessionID: [UUID: Date] = [:]
-    /// Sessions whose terminal outcome (success or failure) has already
-    /// been narrated — so we don't re-announce on every Combine republish.
-    /// Stores `true` for success and `false` for failure so a transition
-    /// from one to the other (rare, but possible if the agent recovers)
-    /// would still re-announce.
-    private var lastNarratedAgentSuccessBySessionID: [UUID: Bool] = [:]
+    /// Sessions whose terminal outcome (success, failure, cancellation) has
+    /// already been narrated — so we don't re-announce on every Combine republish.
+    /// Stores outcome labels like "success", "failed", "cancelled".
+    private var lastNarratedAgentOutcomeBySessionID: [UUID: String] = [:]
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var controlDoubleTapCancellable: AnyCancellable?
@@ -495,6 +493,7 @@ final class CompanionManager: ObservableObject {
     private var tutorIdleCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    private var pendingAgentDockItemRemovalTasks: [UUID: DispatchWorkItem] = [:]
 
     /// Screenshot captured in parallel with audio recording. Started the
     /// instant push-to-talk is pressed so capture latency overlaps with
@@ -507,6 +506,9 @@ final class CompanionManager: ObservableObject {
     /// Push-to-talk plus model latency rarely exceeds this; if it does,
     /// we fall back to a fresh capture so the AI sees current screen state.
     private static let prewarmedScreenshotMaxAge: TimeInterval = 8.0
+    /// Duration to keep a cancelled dock item visible so users can see
+    /// explicit completion text before it auto-dismisses.
+    private static let cancelledDockItemHoldDuration: TimeInterval = 0.45
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
@@ -865,7 +867,7 @@ final class CompanionManager: ObservableObject {
     func setCodexAgentAPIKey(_ apiKey: String) {
         persistOptionalSecret(apiKey, defaultsKey: AppBundleConfiguration.userCodexAgentAPIKeyDefaultsKey)
         openAIAPI.setAPIKey(AppBundleConfiguration.openAIAPIKey())
-        codexAgentSessions.forEach { $0.stop() }
+        codexAgentSessions.forEach { $0.stop(reason: "api_key_reconfigured") }
     }
 
     private func persistOptionalSecret(_ value: String, defaultsKey: String) {
@@ -1094,6 +1096,8 @@ final class CompanionManager: ObservableObject {
         codexVoiceSession.stop()
         pendingAgentActivityRefreshTasks.values.forEach { $0.cancel() }
         pendingAgentActivityRefreshTasks.removeAll()
+        pendingAgentDockItemRemovalTasks.values.forEach { $0.cancel() }
+        pendingAgentDockItemRemovalTasks.removeAll()
         agentTitleCancellables.removeAll()
         shortcutTransitionCancellable?.cancel()
         stopTutorIdleObservation()
@@ -1321,6 +1325,9 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self, sessionID = session.id] status in
                 guard let self else { return }
+                if status != .stopped {
+                    self.cancelPendingAgentDockItemRemoval(for: sessionID)
+                }
                 self.updateAgentDockItem(for: sessionID, status: status)
                 self.scheduleWidgetSnapshotPublish()
                 self.updateAgentProgressNarration()
@@ -4126,7 +4133,7 @@ final class CompanionManager: ObservableObject {
         return false
     }
 
-    private func cancelAllAgentTasks() {
+    private func cancelAllAgentTasks(reason: String = "agent.cancel_all") {
         let timing = activeRequestTiming
         let executionStartedAt = markRequestExecutionStarted(
             route: "agent.cancel_all",
@@ -4144,16 +4151,13 @@ final class CompanionManager: ObservableObject {
             guard sessionIDsToCancel.contains(session.id) || Self.isSteerableAgentStatus(session.status) else {
                 continue
             }
-            session.stop()
+            cancelAgentTask(sessionID: session.id, removeDockItems: true, reason: reason)
             cancelledCount += 1
         }
 
-        agentDockItems.removeAll()
-        agentDockWindowManager.hide()
         pendingAgentVoiceFollowUpSessionID = nil
         pendingAgentVoiceFollowUpCreatedAt = nil
         lastAgentContextSessionID = nil
-        scheduleWidgetSnapshotPublish()
 
         OpenClickyMessageLogStore.shared.append(
             lane: "agent",
@@ -4219,16 +4223,7 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        cancelAgentTask(sessionID: session.id, removeDockItems: true)
-        OpenClickyMessageLogStore.shared.append(
-            lane: "agent",
-            direction: "incoming",
-            event: "openclicky.agent_task.cancelled",
-            fields: [
-                "sessionID": session.id.uuidString,
-                "title": session.title
-            ]
-        )
+        cancelAgentTask(sessionID: session.id, removeDockItems: true, reason: "agent.cancel_current")
         markRequestCompleted(
             route: "agent.cancel_current",
             executionStartedAt: executionStartedAt,
@@ -4244,11 +4239,36 @@ final class CompanionManager: ObservableObject {
         speakShortSystemResponse("cancelled \(session.spokenAgentName).")
     }
 
-    private func cancelAgentTask(sessionID: UUID, removeDockItems: Bool) {
-        codexAgentSessions.first(where: { $0.id == sessionID })?.stop()
-        completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "cancelled")
+    private func cancelAgentTask(sessionID: UUID, removeDockItems: Bool, reason: String = "agent.cancel") {
+        cancelPendingAgentDockItemRemoval(for: sessionID)
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetSession = codexAgentSessions.first(where: { $0.id == sessionID })
+        targetSession?.stop(reason: normalizedReason.isEmpty ? nil : normalizedReason)
+        completeAgentRequestTimingIfNeeded(
+            sessionID: sessionID,
+            status: "cancelled",
+            extra: [
+                "cancelReason": normalizedReason.isEmpty ? "unknown" : normalizedReason
+            ]
+        )
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_task.cancelled",
+            fields: [
+                "sessionID": sessionID.uuidString,
+                "title": targetSession?.title ?? "Agent",
+                "reason": normalizedReason.isEmpty ? "unknown" : normalizedReason
+            ]
+        )
+        let announcementReason = Self.prettyCancelReason(for: normalizedReason)
+        announceAgentCompletionIfNeeded(
+            sessionID: sessionID,
+            outcome: "cancelled",
+            summary: announcementReason
+        )
         if removeDockItems {
-            agentDockItems.removeAll { $0.sessionID == sessionID }
+            scheduleAgentDockItemRemoval(for: sessionID)
         }
         if pendingAgentVoiceFollowUpSessionID == sessionID {
             pendingAgentVoiceFollowUpSessionID = nil
@@ -4295,7 +4315,8 @@ final class CompanionManager: ObservableObject {
                 return true
             }
 
-            if let folderRequest = folderOpenRequest(from: taskCreationInstruction) {
+            if let folderRequest = folderOpenRequest(from: taskCreationInstruction),
+               Self.shouldInlineDirectFolderOpenFromAgentInstruction(taskCreationInstruction) {
                 openRequestedFolder(folderRequest)
                 return true
             }
@@ -4336,7 +4357,8 @@ final class CompanionManager: ObservableObject {
             return true
         }
 
-        if let folderRequest = folderOpenRequest(from: instruction) {
+        if let folderRequest = folderOpenRequest(from: instruction),
+           Self.shouldInlineDirectFolderOpenFromAgentInstruction(instruction) {
             openRequestedFolder(folderRequest)
             return true
         }
@@ -4895,18 +4917,36 @@ final class CompanionManager: ObservableObject {
         let tokenMatches = folded.matches(of: /[A-Za-z0-9]+/)
         guard !tokenMatches.isEmpty else { return nil }
 
-        // Find the LAST occurrence of an exact "agent" / "agents" token —
-        // the user often says "have an agent <do thing>", so the instruction
-        // sits after the agent word, not before it.
-        var agentTokenRange: Range<String.Index>?
+        // Prefer the last exact "agent" / "agents" token, but fall back to
+        // earlier ones. Dictation can append trailing phrases like "agent
+        // work"; using only the last token can hide the real delegation.
+        var agentTokenRanges: [Range<String.Index>] = []
         for match in tokenMatches {
             let token = String(folded[match.range]).lowercased()
             if token == "agent" || token == "agents" {
-                agentTokenRange = match.range
+                agentTokenRanges.append(match.range)
             }
         }
-        guard let agentTokenRange else { return nil }
+        guard !agentTokenRanges.isEmpty else { return nil }
 
+        for agentTokenRange in agentTokenRanges.reversed() {
+            if let instruction = permissiveAgentInstructionCandidate(
+                from: transcript,
+                folded: folded,
+                agentTokenRange: agentTokenRange
+            ) {
+                return instruction
+            }
+        }
+
+        return nil
+    }
+
+    private static func permissiveAgentInstructionCandidate(
+        from transcript: String,
+        folded: String,
+        agentTokenRange: Range<String.Index>
+    ) -> String? {
         let afterAgent = String(transcript[agentTokenRange.upperBound...])
         let cleaned = afterAgent
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4957,6 +4997,48 @@ final class CompanionManager: ObservableObject {
         }
 
         return instruction
+    }
+
+    private static func shouldInlineDirectFolderOpenFromAgentInstruction(_ instruction: String) -> Bool {
+        let normalized = normalizedSpokenCommandText(instruction)
+        guard !normalized.isEmpty else { return false }
+
+        let agentWorkSignals = [
+            "look at",
+            "take a look",
+            "review",
+            "inspect",
+            "audit",
+            "go through",
+            "check",
+            "improve",
+            "improvement",
+            "recommend",
+            "make any",
+            "find",
+            "search",
+            "read",
+            "analyze",
+            "analyse"
+        ]
+        if agentWorkSignals.contains(where: { normalized.contains($0) }) {
+            return false
+        }
+
+        let directFolderPrefixes = [
+            "open ",
+            "show ",
+            "reveal ",
+            "bring up ",
+            "pull up ",
+            "go into ",
+            "go in ",
+            "go to ",
+            "navigate to ",
+            "switch to ",
+            "inside "
+        ]
+        return directFolderPrefixes.contains { normalized.hasPrefix($0) }
     }
 
     private static func normalizedAgentTaskInstruction(from instruction: String) -> String {
@@ -6387,6 +6469,28 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    private func cancelPendingAgentDockItemRemoval(for sessionID: UUID) {
+        pendingAgentDockItemRemovalTasks[sessionID]?.cancel()
+        pendingAgentDockItemRemovalTasks.removeValue(forKey: sessionID)
+    }
+
+    private func scheduleAgentDockItemRemoval(for sessionID: UUID, delay: TimeInterval = Self.cancelledDockItemHoldDuration) {
+        cancelPendingAgentDockItemRemoval(for: sessionID)
+        guard agentDockItems.contains(where: { $0.sessionID == sessionID }) else { return }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.agentDockItems.removeAll { $0.sessionID == sessionID }
+            if self.agentDockItems.isEmpty {
+                self.agentDockWindowManager.hide()
+            }
+            self.pendingAgentDockItemRemovalTasks[sessionID] = nil
+            self.scheduleWidgetSnapshotPublish()
+        }
+        pendingAgentDockItemRemovalTasks[sessionID] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     private static func shortAgentInstructionSummary(_ instruction: String) -> String {
         let flattenedInstruction = instruction
             .components(separatedBy: .whitespacesAndNewlines)
@@ -6438,7 +6542,7 @@ final class CompanionManager: ObservableObject {
                 agentDockItems[itemIndex].caption = "The agent has completed the task — \(activitySummary)"
             }
             completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "success")
-            announceAgentCompletionIfNeeded(sessionID: sessionID, isSuccess: true, summary: activitySummary)
+            announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "success", summary: activitySummary)
         case .failed:
             agentDockItems[itemIndex].status = .failed
             agentDockItems[itemIndex].caption = activitySummary ?? "The agent needs attention. Ask for status to hear the error."
@@ -6449,7 +6553,7 @@ final class CompanionManager: ObservableObject {
                     "activitySummary": activitySummary ?? ""
                 ]
             )
-            announceAgentCompletionIfNeeded(sessionID: sessionID, isSuccess: false, summary: activitySummary)
+            announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "failed", summary: activitySummary)
         case .stopped:
             if session?.status != .stopped {
                 break
@@ -6458,7 +6562,29 @@ final class CompanionManager: ObservableObject {
                session?.hasVisibleActivity == false {
                 break
             }
-            completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "cancelled")
+            let stopReason = session?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedStopReason = stopReason?.isEmpty == false ? (stopReason ?? "") : "session_stopped"
+            agentDockItems[itemIndex].status = .failed
+            if let summary = activitySummary,
+               !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                agentDockItems[itemIndex].caption = "Cancelled while: \(summary)"
+            } else {
+                agentDockItems[itemIndex].caption = "The agent was cancelled (\(Self.prettyCancelReason(for: normalizedStopReason)))."
+            }
+            completeAgentRequestTimingIfNeeded(
+                sessionID: sessionID,
+                status: "cancelled",
+                extra: [
+                    "activitySummary": activitySummary ?? "",
+                    "cancelledAt": Date().ISO8601Format(),
+                    "cancelReason": normalizedStopReason
+                ]
+            )
+            announceAgentCompletionIfNeeded(
+                sessionID: sessionID,
+                outcome: "cancelled",
+                summary: Self.prettyCancelReason(for: normalizedStopReason)
+            )
             break
         }
         scheduleWidgetSnapshotPublish()
@@ -6474,9 +6600,22 @@ final class CompanionManager: ObservableObject {
         guard timing != nil || executionStartedAt != nil else { return }
 
         var fields = extra
+        if status == "cancelled" {
+            if fields["cancelledAt"] == nil {
+                fields["cancelledAt"] = Date().ISO8601Format()
+            }
+            if fields["cancelReason"] == nil,
+               let stoppedSession = codexAgentSessions.first(where: { $0.id == sessionID })?.stopReason,
+               !stoppedSession.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fields["cancelReason"] = stoppedSession
+            }
+            fields["executionMethod"] = "CodexAgentSession.status"
+            fields["executionStatus"] = "cancelled"
+        }
+
         fields["sessionID"] = sessionID.uuidString
         fields["executor"] = "agent_mode"
-        fields["executionMethod"] = "CodexAgentSession.status"
+        fields["executionMethod"] = fields["executionMethod"] as? String ?? "CodexAgentSession.status"
         fields["controller"] = "CodexAgentSession"
         markRequestCompleted(
             route: "agent.start",
@@ -6493,11 +6632,11 @@ final class CompanionManager: ObservableObject {
     /// that's already mid-flight.
     private func announceAgentCompletionIfNeeded(
         sessionID: UUID,
-        isSuccess: Bool,
+        outcome: String,
         summary: String?
     ) {
-        if lastNarratedAgentSuccessBySessionID[sessionID] == isSuccess { return }
-        lastNarratedAgentSuccessBySessionID[sessionID] = isSuccess
+        if lastNarratedAgentOutcomeBySessionID[sessionID] == outcome { return }
+        lastNarratedAgentOutcomeBySessionID[sessionID] = outcome
 
         guard codexAgentSessions.contains(where: { $0.id == sessionID }) else { return }
 
@@ -6509,14 +6648,19 @@ final class CompanionManager: ObservableObject {
         let trimmedSummary = summary?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let line: String
-        if isSuccess {
+        switch outcome {
+        case "cancelled":
             line = trimmedSummary.isEmpty
-                ? "The agent has completed the task."
-                : "The agent has completed the task — \(Self.briefCompletionSummary(trimmedSummary))."
-        } else {
+                ? "The agent was cancelled."
+                : "The agent was cancelled — \(Self.briefCompletionSummary(trimmedSummary))."
+        case "failed":
             line = trimmedSummary.isEmpty
                 ? "The agent needs attention."
                 : "The agent needs attention — \(Self.briefCompletionSummary(trimmedSummary))."
+        default:
+            line = trimmedSummary.isEmpty
+                ? "The agent has completed the task."
+                : "The agent has completed the task — \(Self.briefCompletionSummary(trimmedSummary))."
         }
 
         // Defer to the next runloop tick — narration triggers voice-state
@@ -6531,6 +6675,30 @@ final class CompanionManager: ObservableObject {
     /// Trims an agent activity summary to a sentence-length spoken line.
     /// Activity summaries can be multi-line tool output; we want one
     /// short clause for TTS.
+    private static func prettyCancelReason(for reason: String) -> String {
+        let normalized = reason
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch normalized {
+        case "", "unknown", "session_stopped":
+            return "session was stopped"
+        case "agent.cancel_current", "agent.cancel":
+            return "the user requested cancellation"
+        case "agent.cancel_all":
+            return "all agents were cancelled"
+        case "agent_dock_stop":
+            return "dock stop"
+        case "response_card_dismissed":
+            return "response card dismissed"
+        case "api_key_reconfigured":
+            return "API configuration changed"
+        case "model_changed":
+            return "model changed"
+        default:
+            return reason
+        }
+    }
+
     private static func briefCompletionSummary(_ summary: String) -> String {
         let firstLine = summary
             .split(whereSeparator: { $0.isNewline })
@@ -6568,6 +6736,9 @@ final class CompanionManager: ObservableObject {
     func dismissAgentDockItem(_ itemID: UUID) {
         // Dismiss is a visual close/removal only. It must not cancel the
         // underlying Codex task; explicit Stop handles that after confirm.
+        if let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID {
+            cancelPendingAgentDockItemRemoval(for: sessionID)
+        }
         agentDockItems.removeAll { $0.id == itemID }
         if agentDockItems.isEmpty {
             agentDockWindowManager.hide()
@@ -6578,8 +6749,8 @@ final class CompanionManager: ObservableObject {
     func stopAgentDockItem(_ itemID: UUID) {
         let stoppedSessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID
         if let stoppedSessionID {
-            cancelAgentTask(sessionID: stoppedSessionID, removeDockItems: true)
-            lastNarratedAgentSuccessBySessionID.removeValue(forKey: stoppedSessionID)
+            cancelAgentTask(sessionID: stoppedSessionID, removeDockItems: true, reason: "agent_dock_stop")
+            lastNarratedAgentOutcomeBySessionID.removeValue(forKey: stoppedSessionID)
         } else {
             agentDockItems.removeAll { $0.id == itemID }
             if agentDockItems.isEmpty {
@@ -8755,7 +8926,7 @@ final class CompanionManager: ObservableObject {
         if codexAgentSession.latestResponseCard != nil {
             let sessionID = codexAgentSession.id
             codexAgentSession.dismissLatestResponseCard()
-            cancelAgentTask(sessionID: sessionID, removeDockItems: true)
+            cancelAgentTask(sessionID: sessionID, removeDockItems: true, reason: "response_card_dismissed")
         } else {
             latestVoiceResponseCard = nil
         }

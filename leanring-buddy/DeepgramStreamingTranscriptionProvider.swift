@@ -135,7 +135,7 @@ private final class DeepgramStreamingTranscriptionSession: BuddyStreamingTranscr
 
     func open() async throws {
         let websocketURL = try Self.makeWebsocketURL(modelName: modelName, keyterms: keyterms)
-        print("[Deepgram] opening WebSocket: \(websocketURL.absoluteString) (key=\(apiKey.prefix(4))…\(apiKey.suffix(4)), len=\(apiKey.count))")
+        print("[Deepgram] opening WebSocket: \(websocketURL.absoluteString)")
         var websocketRequest = URLRequest(url: websocketURL)
         websocketRequest.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
 

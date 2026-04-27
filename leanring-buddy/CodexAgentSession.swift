@@ -704,13 +704,28 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     }
 
     private func handleStderrLine(_ line: String) {
-        guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        if line.localizedCaseInsensitiveContains("error") || line.localizedCaseInsensitiveContains("unauthorized") {
-            lastErrorMessage = line
+        let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLine.isEmpty else { return }
+        if Self.isNonFatalCodexRuntimeStderrLine(trimmedLine) {
+            return
+        }
+
+        if trimmedLine.localizedCaseInsensitiveContains("error") || trimmedLine.localizedCaseInsensitiveContains("unauthorized") {
+            lastErrorMessage = trimmedLine
             if case .running = status {
-                status = .failed(line)
+                status = .failed(trimmedLine)
             }
         }
+    }
+
+    private static func isNonFatalCodexRuntimeStderrLine(_ line: String) -> Bool {
+        let normalized = line
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+
+        return normalized.contains("responses_websocket")
+            && normalized.contains("failed to connect to websocket")
+            && normalized.contains("bad gateway")
     }
 
     private func playAgentDoneSoundIfAvailable() {

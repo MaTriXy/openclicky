@@ -75,6 +75,36 @@ Do not use terminal `xcodebuild` for permission testing. macOS TCC permissions a
 
 For a lightweight syntax check that does not disturb macOS permissions, run `swiftc -parse` over the changed source files. Avoid launching unsigned or temporary build products for permission testing.
 
+## Swift SDK Embedding (Windowed)
+
+For Swift hosts that want an in-window OpenClicky instance that is separate from the OS-level menu-bar companion, use `OpenClickySDKSession` from `leanring-buddy/OpenClickySDK.swift`.
+
+Example:
+
+```swift
+import SwiftUI
+
+let sdk = OpenClickySDKSession(mode: .embeddedWindow)
+
+// In app startup
+sdk.start()
+
+// In SwiftUI
+var body: some View {
+    sdk.makePanelView(actions: .init(
+        onPanelDismiss: { /* dismiss host panel */ },
+        onQuit: { /* close host window if needed */ }
+    ))
+}
+
+// Send input
+sdk.submitTextPrompt("Summarize this page")
+```
+
+The host can either use SDK actions for Settings/HUD/Memory, or keep them no-op and route that experience separately.
+
+See [OpenClicky SDK Integration Guide](docs/OpenClickySDKIntegration.md) for step-by-step host app integration instructions.
+
 ## Direct Updates
 
 OpenClicky uses Sparkle for direct-distribution OTA updates. Installed builds check the signed `appcast.xml` feed from this repository's `main` branch, then download and install signed release DMGs from GitHub Releases. See [docs/APP_UPDATES.md](docs/APP_UPDATES.md) for the release checklist and appcast item template.

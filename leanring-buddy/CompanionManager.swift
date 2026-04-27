@@ -21,6 +21,11 @@ enum CompanionVoiceState {
     case responding
 }
 
+enum OpenClickyCompanionRuntimeMode {
+    case menuBar
+    case embeddedWindow
+}
+
 @MainActor
 final class CursorOverlayState: ObservableObject {
     @Published var voiceState: CompanionVoiceState = .idle
@@ -544,7 +549,11 @@ final class CompanionManager: ObservableObject {
         codexAgentSessions.first { $0.id == activeCodexAgentSessionID } ?? codexAgentSessions[0]
     }
 
-    init() {
+    private let runtimeMode: OpenClickyCompanionRuntimeMode
+
+    init(runtimeMode: OpenClickyCompanionRuntimeMode = .menuBar) {
+        self.runtimeMode = runtimeMode
+
         let initialAgentSession = CodexAgentSession(title: "Agent 1", accentTheme: .blue)
         codexAgentSessions = [initialAgentSession]
         activeCodexAgentSessionID = initialAgentSession.id
@@ -944,7 +953,9 @@ final class CompanionManager: ObservableObject {
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
-        bindShortcutTransitions()
+        if runtimeMode == .menuBar {
+            bindShortcutTransitions()
+        }
         bindAgentSessionObservation()
         if isTutorModeEnabled {
             startTutorIdleObservation()
@@ -985,7 +996,7 @@ final class CompanionManager: ObservableObject {
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
         // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
+        if runtimeMode == .menuBar && hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
@@ -1002,9 +1013,11 @@ final class CompanionManager: ObservableObject {
 
         ClickyAnalytics.trackOnboardingStarted()
 
-        overlayWindowManager.hasShownOverlayBefore = true
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
+        if runtimeMode == .menuBar {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
     }
 
     /// Onboarding replay is disabled. Keep this as a no-op for old call sites.
@@ -1117,7 +1130,7 @@ final class CompanionManager: ObservableObject {
         let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
         hasAccessibilityPermission = currentlyHasAccessibility
 
-        if currentlyHasAccessibility {
+        if runtimeMode == .menuBar && currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
         } else {
             globalPushToTalkShortcutMonitor.stop()
@@ -3223,6 +3236,10 @@ final class CompanionManager: ObservableObject {
                 self?.submitTextModePrompt(submittedText)
             }
         )
+    }
+
+    func submitTextPrompt(_ submittedText: String) {
+        submitTextModePrompt(submittedText)
     }
 
     private func submitTextModePrompt(_ submittedText: String) {
@@ -8981,6 +8998,17 @@ final class CompanionManager: ObservableObject {
         beginVoiceFollowUpCapture()
     }
 
+    func startSDKVoiceCapture() {
+        beginVoiceFollowUpCapture()
+    }
+
+    func stopSDKVoiceCapture() {
+        voiceFollowUpStopTask?.cancel()
+        voiceFollowUpStopTask = nil
+        ClickyAnalytics.trackPushToTalkReleased()
+        buddyDictationManager.stopPersistentDictationFromMicrophoneButton()
+    }
+
     private func beginVoiceFollowUpCapture() {
         guard !buddyDictationManager.isDictationInProgress else { return }
 
@@ -9008,8 +9036,7 @@ final class CompanionManager: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 self.voiceFollowUpStopTask = nil
-                ClickyAnalytics.trackPushToTalkReleased()
-                self.buddyDictationManager.stopPersistentDictationFromMicrophoneButton()
+                self.stopSDKVoiceCapture()
             }
         }
     }

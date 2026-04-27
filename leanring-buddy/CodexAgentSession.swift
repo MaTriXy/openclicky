@@ -33,14 +33,15 @@ struct CodexAgentScreenContextAttachment: Equatable {
 struct CodexAgentScreenContext: Equatable {
     let source: String
     let capturedAt: Date
+    let selectedText: String?
     let attachments: [CodexAgentScreenContextAttachment]
 
     var isEmpty: Bool {
-        attachments.isEmpty
+        attachments.isEmpty && (selectedText == nil || selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true)
     }
 
     func promptPrefix() -> String {
-        guard !attachments.isEmpty else { return "" }
+        guard !isEmpty else { return "" }
 
         var lines: [String] = [
             "OpenClicky screen context:",
@@ -48,6 +49,10 @@ struct CodexAgentScreenContext: Equatable {
             "- Captured at: \(ISO8601DateFormatter().string(from: capturedAt))",
             "- Screenshot files are saved locally. Inspect them if your runtime exposes image/file viewing; otherwise be explicit that screenshot inspection is unavailable."
         ]
+
+        if let selectedText, !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("- Selected text:\n\(selectedText.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
 
         for (index, attachment) in attachments.enumerated() {
             lines.append("\(index + 1). \(attachment.label): \(attachment.fileURL.path)")
@@ -59,6 +64,7 @@ struct CodexAgentScreenContext: Equatable {
         return lines.joined(separator: "\n")
     }
 }
+
 
 enum CodexAgentSessionStatus: Equatable {
     case stopped
@@ -334,9 +340,9 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         status = .starting
         let homeManager = self.homeManager
         let processManager = self.processManager
+        let preparedLayout = try homeManager.prepare(bundle: .main)
+        let executable = try CodexRuntimeLocator.codexExecutableURL(bundle: .main)
         let layout = try await Task.detached(priority: .userInitiated) {
-            let preparedLayout = try homeManager.prepare(bundle: .main)
-            let executable = try CodexRuntimeLocator.codexExecutableURL(bundle: .main)
             try processManager.start(executableURL: executable, codexHome: preparedLayout.homeDirectory)
             return preparedLayout
         }.value
@@ -719,48 +725,409 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             )
             try createLearnedSkillIfApplicable(userRequest: lastSubmittedPrompt, agentResponse: agentResponse)
         } catch {
-            entries.append(CodexTranscriptEntry(role: .system, text: "OpenClicky could not update persistent memory: \(error.localizedDescription)"))
+            entries.append(CodexTranscriptEntry(role: .system, text: "OpenClicky could not update persistent memory or learned skills: \(error.localizedDescription)"))
         }
     }
 
     private func createLearnedSkillIfApplicable(userRequest: String, agentResponse: String) throws {
-        let combinedText = "\(userRequest) \(agentResponse)"
+        let normalizedRequest = userRequest
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        let normalizedResponse = agentResponse
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        let normalizedCombined = "\(userRequest) \(agentResponse)"
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
 
-        guard combinedText.contains("note") || combinedText.contains("notes") else { return }
+        if isNoteWorkflow(combinedText: normalizedCombined) {
+            try homeManager.createLearnedSkillIfNeeded(
+                name: "create_apple_note",
+                title: "Create Apple Note",
+                description: "Use when the user asks OpenClicky to create, save, or update an Apple Note from spoken or typed instructions.",
+                body: """
+                Use this workflow when the user asks to create a note in Apple Notes or save something as a note.
 
+                ## Workflow
+
+                1. Derive a concise note title from the request. If the user provides a title, use it exactly.
+                2. Derive the note body from the request and any provided screen/file context. Keep formatting simple.
+                3. Use AppleScript through `osascript` to create the note in Apple Notes. Prefer the default account and the standard Notes folder.
+                4. Open or focus Notes only when useful for confirmation.
+                5. Keep the final response short: say the note was created and include the title.
+                6. Update `memory.md` with any durable preference or reusable detail learned during the note workflow.
+
+                ## AppleScript Pattern
+
+                ```applescript
+                tell application "Notes"
+                    activate
+                    set noteTitle to "Title"
+                    set noteBody to "Body"
+                    make new note at folder "Notes" of default account with properties {name:noteTitle, body:noteBody}
+                end tell
+                ```
+
+                If the default account or folder is unavailable, inspect the Notes accounts/folders and choose the most obvious personal Notes folder.
+                """
+            )
+            return
+        }
+
+        guard let workflow = reusableWorkflowTemplateIfRequested(
+            userRequest: userRequest,
+            agentResponse: agentResponse,
+            normalizedRequest: normalizedRequest,
+            normalizedResponse: normalizedResponse,
+            normalizedCombined: normalizedCombined
+        ) else { return }
         try homeManager.createLearnedSkillIfNeeded(
-            name: "create_apple_note",
-            title: "Create Apple Note",
-            description: "Use when the user asks OpenClicky to create, save, or update an Apple Note from spoken or typed instructions.",
+            name: workflow.name,
+            title: workflow.title,
+            description: workflow.description,
+            body: workflow.body
+        )
+    }
+
+    private func isNoteWorkflow(combinedText: String) -> Bool {
+        let noteTerms = ["note", "notes", "apple note", "apple notes"]
+        return noteTerms.contains { combinedText.contains($0) }
+    }
+
+    private func reusableWorkflowTemplateIfRequested(
+        userRequest: String,
+        agentResponse: String,
+        normalizedRequest: String,
+        normalizedResponse: String,
+        normalizedCombined: String
+    ) -> (name: String, title: String, description: String, body: String)? {
+        let requestSummary = oneLineSnippet(from: userRequest, maxLength: 160)
+        let responseSummary = oneLineSnippet(from: agentResponse, maxLength: 180)
+
+        if isReusableWorkflowSignal(normalizedCombined) {
+            return workflowTemplate(
+                requestSummary: requestSummary,
+                responseSummary: responseSummary,
+                trigger: "explicit"
+            )
+        }
+
+        guard isLikelyReusableWorkflow(
+            requestText: normalizedRequest,
+            responseText: normalizedResponse,
+            combinedText: normalizedCombined
+        ) else {
+            return nil
+        }
+
+        return workflowTemplate(
+            requestSummary: requestSummary,
+            responseSummary: responseSummary,
+            trigger: "implicit"
+        )
+    }
+
+    private func workflowTemplate(
+        requestSummary: String,
+        responseSummary: String,
+        trigger: String
+    ) -> (name: String, title: String, description: String, body: String) {
+        let triggerHint = trigger == "explicit" ? "for explicit reuse request" : "for an inferred repeated workflow pattern"
+        let name = "workflow_\(skillSlug(from: requestSummary))"
+
+        return (
+            name: name,
+            title: "Workflow: \(requestSummary)",
+            description: "Captured workflow for a repeated task or process the user can reuse",
             body: """
-            Use this workflow when the user asks to create a note in Apple Notes or save something as a note.
+            ## Goal
+
+            Capture a repeatable version of this task so future OpenClicky sessions can reuse it.
+
+            ## Source request
+
+            - User request: \(requestSummary)
+            - Observed response summary: \(responseSummary)
+
+            ## Trigger condition
+
+            The user workflow was recorded as reusable because OpenClicky detected \(triggerHint).
 
             ## Workflow
 
-            1. Derive a concise note title from the request. If the user provides a title, use it exactly.
-            2. Derive the note body from the request and any provided screen/file context. Keep formatting simple.
-            3. Use AppleScript through `osascript` to create the note in Apple Notes. Prefer the default account and the standard Notes folder.
-            4. Open or focus Notes only when useful for confirmation.
-            5. Keep the final response short: say the note was created and include the title.
-            6. Update `memory.md` with any durable preference or reusable detail learned during the note workflow.
-
-            ## AppleScript Pattern
-
-            ```applescript
-            tell application "Notes"
-                activate
-                set noteTitle to "Title"
-                set noteBody to "Body"
-                make new note at folder "Notes" of default account with properties {name:noteTitle, body:noteBody}
-            end tell
-            ```
-
-            If the default account or folder is unavailable, inspect the Notes accounts/folders and choose the most obvious personal Notes folder.
+            1. Follow the exact intent from the source request above.
+            2. Preserve user preferences, project context, and durable constraints from memory.
+            3. If an environment step is risky or destructive, confirm with the user before proceeding.
+            4. Keep the completion note concise and mention what changed.
             """
         )
     }
+
+    private func isLikelyReusableWorkflow(requestText: String, responseText: String, combinedText: String) -> Bool {
+        guard !isLikelyInformationalQuery(requestText) else { return false }
+
+        let actionSignals = [
+            "create",
+            "make",
+            "run",
+            "set up",
+            "setup",
+            "configure",
+            "update",
+            "generate",
+            "export",
+            "import",
+            "backup",
+            "restore",
+            "install",
+            "archive",
+            "cleanup",
+            "clean",
+            "build",
+            "deploy",
+            "send",
+            "apply",
+            "save",
+            "switch",
+            "open",
+            "close",
+            "launch",
+            "start",
+            "stop",
+            "restart",
+            "copy",
+            "move",
+            "rename"
+        ]
+
+        let targetSignals = [
+            "project",
+            "repo",
+            "repository",
+            "app",
+            "application",
+            "workflow",
+            "script",
+            "automation",
+            "notes",
+            "note",
+            "profile",
+            "setup",
+            "setting",
+            "settings",
+            "preference",
+            "config",
+            "configuration",
+            "environment",
+            "workspace",
+            "menu",
+            "window",
+            "file",
+            "folder",
+            "screen",
+            "task",
+            "pipeline",
+            "release",
+            "build",
+            "test",
+            "suite"
+        ]
+
+        let commandSignals = [
+            " cd ",
+            " npm ",
+            " node ",
+            " swift ",
+            " python ",
+            " pytest ",
+            " xcodebuild ",
+            " git ",
+            " docker ",
+            " make ",
+            " rg ",
+            " find ",
+            " ls ",
+            " grep ",
+            " chmod ",
+            " sudo "
+        ]
+
+        let workflowStructureSignals = [
+            " step",
+            " step:",
+            " then ",
+            " first,",
+            " next,",
+            " finally",
+            " after",
+            " before",
+            " once done"
+        ]
+
+        var score = 0
+        score += actionSignals.contains(where: { requestText.contains($0) }) ? 3 : 0
+        score += targetSignals.contains(where: { requestText.contains($0) }) ? 2 : 0
+        score += commandSignals.contains(where: { combinedText.contains($0) }) ? 2 : 0
+        score += workflowStructureSignals.contains(where: { requestText.contains($0) }) ? 1 : 0
+
+        if isLikelyProceduralPhrase(requestText) {
+            score += 2
+        }
+
+        // avoid capturing tiny single-line commands that are likely one-off answers
+        if requestText.count < 36 {
+            score -= 2
+        }
+
+        if responseText.contains("error") || responseText.contains("cannot") || responseText.contains("unable") {
+            score += 1
+        }
+
+        if responseText.contains("summary:") || responseText.contains("steps:") {
+            score += 1
+        }
+
+        return score >= 5
+    }
+
+    private func isLikelyInformationalQuery(_ text: String) -> Bool {
+        let informationalSignals = [
+            "what is",
+            "what are",
+            "how does",
+            "how do",
+            "how can",
+            "why did",
+            "explain",
+            "list ",
+            "show me",
+            "tell me",
+            "difference between",
+            "where is",
+            "where are",
+            "can you explain",
+            "i want to know",
+            "i need to know",
+            "what would",
+            "help me understand"
+        ]
+
+        return informationalSignals.contains(where: { text.contains($0) })
+    }
+
+    private func isLikelyProceduralPhrase(_ text: String) -> Bool {
+        let proceduralSignals = [
+            "if",
+            "once",
+            "after",
+            "before",
+            "when",
+            "until",
+            "while"
+        ]
+
+        var matches = 0
+        for signal in proceduralSignals {
+            if text.contains(signal) {
+                matches += 1
+            }
+        }
+        return matches >= 2
+    }
+
+
+
+    private func isReusableWorkflowSignal(_ text: String) -> Bool {
+        let explicitSignals = [
+            "save this as a skill",
+            "save this as a workflow",
+            "remember this",
+            "for next time",
+            "for the future",
+            "next time",
+            "repeat this",
+            "repeat these",
+            "repeatable",
+            "create a skill",
+            "make this a skill",
+            "capture this",
+            "capture this workflow",
+            "reusable workflow",
+            "workflow for the future",
+            "create a workflow",
+            "make it a skill",
+            "keep this as a skill",
+            "always do this",
+            "every time",
+            "standard procedure",
+            "standard process"
+        ]
+
+        guard explicitSignals.contains(where: { text.contains($0) }) else {
+            return false
+        }
+
+        let actionSignals = [
+            "create",
+            "make",
+            "run",
+            "set up",
+            "setup",
+            "configure",
+            "update",
+            "open",
+            "generate",
+            "export",
+            "import",
+            "backup",
+            "restore",
+            "install",
+            "archive",
+            "cleanup",
+            "clean",
+            "build",
+            "deploy",
+            "send",
+            "remember",
+            "reuse",
+            "repeat",
+            "use",
+            "apply",
+            "save"
+        ]
+
+        return actionSignals.contains(where: { text.contains($0) })
+    }
+
+    private func skillSlug(from title: String) -> String {
+        let folded = title.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        let lowered = folded.lowercased()
+        let pieces = lowered
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !pieces.isEmpty else { return "workflow" }
+        return pieces.joined(separator: "_").trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+    }
+
+    private func oneLineSnippet(from text: String, maxLength: Int) -> String {
+        let flattened = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard maxLength > 0 else { return "" }
+        guard flattened.count > maxLength else { return flattened }
+        let endIndex = flattened.index(flattened.startIndex, offsetBy: maxLength)
+        let prefix = String(flattened[..<endIndex])
+        if let lastSpace = prefix.lastIndex(of: " ") {
+            return "\(prefix[..<lastSpace])..."
+        }
+        return "\(prefix)..."
+    }
+
 
     private static func userFacingAgentMessage(from text: String) -> String {
         if let fileURL = firstOpenableFileURL(in: text) {

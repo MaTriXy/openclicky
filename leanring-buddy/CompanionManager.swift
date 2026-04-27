@@ -6499,7 +6499,7 @@ final class CompanionManager: ObservableObject {
         if lastNarratedAgentSuccessBySessionID[sessionID] == isSuccess { return }
         lastNarratedAgentSuccessBySessionID[sessionID] = isSuccess
 
-        guard let session = codexAgentSessions.first(where: { $0.id == sessionID }) else { return }
+        guard codexAgentSessions.contains(where: { $0.id == sessionID }) else { return }
 
         // Skip narration if the user is mid-conversation with the voice
         // responder — the dock item still updates visually, and we don't
@@ -6725,8 +6725,9 @@ final class CompanionManager: ObservableObject {
 
         lastAgentContextSessionID = session.id
         activeCodexAgentSessionID = session.id
+        let baselinePasteboardChangeCount = NSPasteboard.general.changeCount
         Task {
-            let screenContext = includeScreenContext ? await prepareAgentScreenContextForNextTurn() : nil
+            let screenContext = includeScreenContext ? await prepareAgentScreenContextForNextTurn(minimumPasteboardChangeCount: baselinePasteboardChangeCount) : nil
             if !includeScreenContext {
                 OpenClickyMessageLogStore.shared.append(
                     lane: "agent",
@@ -6754,11 +6755,11 @@ final class CompanionManager: ObservableObject {
         voiceTTSClient.stopPlayback()
     }
 
-    private func prepareAgentScreenContextForNextTurn() async -> CodexAgentScreenContext? {
+    private func prepareAgentScreenContextForNextTurn(minimumPasteboardChangeCount: Int) async -> CodexAgentScreenContext? {
         if !handoffQueue.isEmpty {
             let queuedRegions = handoffQueue
             do {
-                let context = try writeQueuedHandoffScreenContext(queuedRegions)
+                let context = try writeQueuedHandoffScreenContext(queuedRegions, minimumPasteboardChangeCount: minimumPasteboardChangeCount)
                 handoffQueue.removeAll { queued in
                     queuedRegions.contains { $0.id == queued.id }
                 }
@@ -6774,7 +6775,7 @@ final class CompanionManager: ObservableObject {
                 if backgroundStatus.isRuntimeReady {
                     do {
                         let capture = try await backgroundComputerUseController.captureFrontmostWindowAsJPEG()
-                        return try writeBackgroundComputerUseScreenContext(capture)
+                        return try writeBackgroundComputerUseScreenContext(capture, minimumPasteboardChangeCount: minimumPasteboardChangeCount)
                     } catch {
                         OpenClickyMessageLogStore.shared.append(
                             lane: "computer-use",
@@ -6802,21 +6803,21 @@ final class CompanionManager: ObservableObject {
             } else if nativeComputerUseController.isEnabled {
                 do {
                     let capture = try await nativeComputerUseController.captureFocusedWindowAsJPEG()
-                    return try writeNativeComputerUseScreenContext(capture)
+                    return try writeNativeComputerUseScreenContext(capture, minimumPasteboardChangeCount: minimumPasteboardChangeCount)
                 } catch {
                     print("OpenClicky Agent Mode: native CUA Swift focused-window context unavailable: \(error)")
                 }
             }
 
             let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-            return try writeCapturedScreenContext(captures)
+            return try writeCapturedScreenContext(captures, minimumPasteboardChangeCount: minimumPasteboardChangeCount)
         } catch {
             print("OpenClicky Agent Mode: current screen context unavailable: \(error)")
             return nil
         }
     }
 
-    private func writeQueuedHandoffScreenContext(_ queuedRegions: [HandoffQueuedRegionScreenshot]) throws -> CodexAgentScreenContext {
+    private func writeQueuedHandoffScreenContext(_ queuedRegions: [HandoffQueuedRegionScreenshot], minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let attachments = try queuedRegions.enumerated().map { index, queuedRegion in
@@ -6837,14 +6838,19 @@ final class CompanionManager: ObservableObject {
             )
         }
 
+        let queuedNotes = queuedRegions
+            .compactMap { $0.selection.comment.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
         return CodexAgentScreenContext(
             source: "queued screen handoff",
             capturedAt: Date(),
+            selectedText: resolveSelectedText(from: queuedNotes, minimumPasteboardChangeCount: minimumPasteboardChangeCount),
             attachments: attachments
         )
     }
 
-    private func writeNativeComputerUseScreenContext(_ capture: OpenClickyComputerUseWindowCapture) throws -> CodexAgentScreenContext {
+    private func writeNativeComputerUseScreenContext(_ capture: OpenClickyComputerUseWindowCapture, minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let fileURL = directory.appendingPathComponent("\(batchID)-cua-swift-window.jpg", isDirectory: false)
@@ -6853,6 +6859,7 @@ final class CompanionManager: ObservableObject {
         return CodexAgentScreenContext(
             source: "native CUA Swift focused-window context",
             capturedAt: Date(),
+            selectedText: readSelectedTextForAgentContext(minimumPasteboardChangeCount: minimumPasteboardChangeCount),
             attachments: [
                 CodexAgentScreenContextAttachment(
                     label: capture.label,
@@ -6863,7 +6870,7 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    private func writeBackgroundComputerUseScreenContext(_ capture: OpenClickyBackgroundComputerUseWindowCapture) throws -> CodexAgentScreenContext {
+    private func writeBackgroundComputerUseScreenContext(_ capture: OpenClickyBackgroundComputerUseWindowCapture, minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let fileURL = directory.appendingPathComponent("\(batchID)-background-computer-use-window.jpg", isDirectory: false)
@@ -6872,6 +6879,7 @@ final class CompanionManager: ObservableObject {
         return CodexAgentScreenContext(
             source: "Background Computer Use focused-window context",
             capturedAt: Date(),
+            selectedText: readSelectedTextForAgentContext(minimumPasteboardChangeCount: minimumPasteboardChangeCount),
             attachments: [
                 CodexAgentScreenContextAttachment(
                     label: capture.label,
@@ -6882,7 +6890,7 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    private func writeCapturedScreenContext(_ captures: [CompanionScreenCapture]) throws -> CodexAgentScreenContext {
+    private func writeCapturedScreenContext(_ captures: [CompanionScreenCapture], minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let attachments = try captures.enumerated().map { index, capture in
@@ -6902,8 +6910,44 @@ final class CompanionManager: ObservableObject {
         return CodexAgentScreenContext(
             source: "current desktop screenshot",
             capturedAt: Date(),
+            selectedText: readSelectedTextForAgentContext(minimumPasteboardChangeCount: minimumPasteboardChangeCount),
             attachments: attachments
         )
+    }
+
+    private func readSelectedTextForAgentContext(minimumPasteboardChangeCount: Int) -> String? {
+        let selection = readSelectedTextFromPasteboard(minimumChangeCount: minimumPasteboardChangeCount)
+        guard let selection else { return nil }
+        return selection
+    }
+
+    private func resolveSelectedText(from notes: [String], minimumPasteboardChangeCount: Int) -> String? {
+        let cleanedNotes = notes
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if let first = cleanedNotes.first {
+            return first
+        }
+
+        return readSelectedTextForAgentContext(minimumPasteboardChangeCount: minimumPasteboardChangeCount)
+    }
+
+    private func readSelectedTextFromPasteboard(minimumChangeCount: Int) -> String? {
+        let pasteboard = NSPasteboard.general
+        let currentChangeCount = pasteboard.changeCount
+
+        guard currentChangeCount > minimumChangeCount else { return nil }
+        guard let rawText = pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawText.isEmpty else {
+            return nil
+        }
+
+        let compact = rawText.replacingOccurrences(of: "\\n{2,}", with: "\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !compact.isEmpty else { return nil }
+        return String(compact.prefix(1_500))
     }
 
     private func createAgentScreenContextDirectory() throws -> URL {
@@ -7147,7 +7191,8 @@ final class CompanionManager: ObservableObject {
         - runtime map: \(codexHomeManager.runtimeMapFile.path)
         - soul/persona: \(codexHomeManager.soulFile.path)
         - codex home: \(codexHomeManager.codexHomeDirectory.path)
-        - persistent memory: \(codexHomeManager.persistentMemoryFile.path)
+        - persistent memory (current): \(codexHomeManager.persistentMemoryFile.path)
+        - persistent memory archives: \(codexHomeManager.persistentMemoryArchivesDirectory.path)
         - memory articles: \(codexHomeManager.memoriesDirectory.path)
         - learned skills: \(codexHomeManager.learnedSkillsDirectory.path)
         - bundled skills: \(codexHomeManager.codexHomeDirectory.appendingPathComponent(codexHomeManager.bundledSkillsDirectoryName, isDirectory: true).path)
@@ -8846,7 +8891,7 @@ final class CompanionManager: ObservableObject {
         Task {
             do {
                 let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-                let context = try writeCapturedScreenContext(captures)
+                let context = try writeCapturedScreenContext(captures, minimumPasteboardChangeCount: NSPasteboard.general.changeCount)
                 let fileSummary = context.attachments
                     .map { $0.fileURL.lastPathComponent }
                     .joined(separator: ", ")

@@ -685,6 +685,9 @@ struct OpenClickySettingsView: View {
                 actionRow(title: "Open memory file", systemImageName: "doc.text") {
                     NSWorkspace.shared.open(companionManager.codexHomeManager.persistentMemoryFile)
                 }
+                actionRow(title: "Open memory archive folder", systemImageName: "archivebox") {
+                    NSWorkspace.shared.open(companionManager.codexHomeManager.persistentMemoryArchivesDirectory)
+                }
                 actionRow(title: "Open learned skills folder", systemImageName: "folder") {
                     NSWorkspace.shared.open(companionManager.codexHomeManager.learnedSkillsDirectory)
                 }

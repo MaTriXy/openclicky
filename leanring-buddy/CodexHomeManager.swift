@@ -21,6 +21,8 @@ final class CodexHomeManager {
     let learnedSkillsDirectoryName = "OpenClickyLearnedSkills"
     let bundledWikiSeedDirectoryName = "OpenClickyBundledWikiSeed"
     let persistentMemoryFileName = "memory.md"
+    let persistentMemoryArchivesDirectoryName = "memory"
+    let maxPersistentMemoryBytes = 120_000
 
     let fileManager: FileManager
     let applicationSupportDirectory: URL
@@ -64,6 +66,10 @@ final class CodexHomeManager {
         codexHomeDirectory.appendingPathComponent(persistentMemoryFileName, isDirectory: false)
     }
 
+    var persistentMemoryArchivesDirectory: URL {
+        archivesDirectory.appendingPathComponent(persistentMemoryArchivesDirectoryName, isDirectory: true)
+    }
+
     var runtimeMapFile: URL {
         codexHomeDirectory.appendingPathComponent(runtimeMapFileName, isDirectory: false)
     }
@@ -85,6 +91,7 @@ final class CodexHomeManager {
         try fileManager.createDirectory(at: memoriesDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: learnedSkillsDirectory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: archivesDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: persistentMemoryArchivesDirectory, withIntermediateDirectories: true)
         OpenClickyMessageLogStore.shared.ensureAgentReviewCommentsFile()
         try ensurePersistentMemoryFile()
 
@@ -170,6 +177,8 @@ final class CodexHomeManager {
         - Result: \(Self.singleLineSnippet(from: agentResponse, maxLength: 520))
         """
 
+        try archivePersistentMemoryIfNeeded(beforeAppending: entry)
+
         let fileHandle = try FileHandle(forWritingTo: persistentMemoryFile)
         defer { try? fileHandle.close() }
         try fileHandle.seekToEnd()
@@ -178,25 +187,70 @@ final class CodexHomeManager {
         }
     }
 
-    func persistentMemoryContext(maxCharacters: Int = 6_000) -> String {
+    func persistentMemoryContext(maxCharacters: Int = 6_000, includeArchives: Bool = false) -> String {
         do {
             try ensurePersistentMemoryFile()
-            let text = try String(contentsOf: persistentMemoryFile, encoding: .utf8)
-            guard text.count > maxCharacters else { return text }
-            let startIndex = text.index(text.endIndex, offsetBy: -maxCharacters)
-            return String(text[startIndex...])
+            let files = persistentMemoryFiles(includeArchived: includeArchives)
+            guard maxCharacters > 0 else { return "" }
+
+            var remainingCharacters = maxCharacters
+            var fragments: [String] = []
+            for file in files {
+                let text = (try String(contentsOf: file, encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                if text.count <= remainingCharacters {
+                    fragments.append(text)
+                    remainingCharacters -= text.count
+                    if remainingCharacters <= 0 {
+                        break
+                    }
+                    continue
+                }
+                let startIndex = text.index(text.endIndex, offsetBy: -remainingCharacters)
+                fragments.append(String(text[startIndex...]))
+                break
+            }
+
+            guard !fragments.isEmpty else { return "" }
+            return fragments.joined(separator: "\n\n")
         } catch {
             return "OpenClicky persistent memory is not available yet: \(error.localizedDescription)"
         }
     }
 
+    func persistentMemoryFiles(includeArchived: Bool = false) -> [URL] {
+        var files = [persistentMemoryFile]
+
+        guard includeArchived else { return files }
+        guard fileManager.fileExists(atPath: persistentMemoryArchivesDirectory.path) else { return files }
+
+        let archived = (try? fileManager.contentsOfDirectory(
+            at: persistentMemoryArchivesDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        let sortedArchived = archived
+            .filter { $0.pathExtension.lowercased() == "md" }
+            .sorted { lhs, rhs in
+                let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                return leftDate > rightDate
+            }
+
+        files.append(contentsOf: sortedArchived)
+        return files
+    }
+
     func createLearnedSkillIfNeeded(name: String, title: String, description: String, body: String) throws {
+        _ = try createOrUpdateLearnedSkillIfNeeded(name: name, title: title, description: description, body: body)
+    }
+
+    @discardableResult
+    func createOrUpdateLearnedSkillIfNeeded(name: String, title: String, description: String, body: String) throws -> Bool {
         let skillDirectory = learnedSkillsDirectory.appendingPathComponent(Self.slug(from: name).replacingOccurrences(of: "-", with: "_"), isDirectory: true)
         let skillFile = skillDirectory.appendingPathComponent("SKILL.md", isDirectory: false)
-        guard !fileManager.fileExists(atPath: skillFile.path) else { return }
-
-        try fileManager.createDirectory(at: skillDirectory, withIntermediateDirectories: true)
-        let skillMarkdown = """
+        let desiredSkillMarkdown = """
         ---
         name: "\(Self.escapeFrontmatterValue(name))"
         description: "\(Self.escapeFrontmatterValue(description))"
@@ -206,7 +260,19 @@ final class CodexHomeManager {
 
         \(body)
         """
-        try skillMarkdown.write(to: skillFile, atomically: true, encoding: .utf8)
+
+        if fileManager.fileExists(atPath: skillFile.path) {
+            let existing = try? String(contentsOf: skillFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if existing == desiredSkillMarkdown.trimmingCharacters(in: .whitespacesAndNewlines) {
+                return false
+            }
+            try archiveExistingItem(at: skillDirectory, reason: "learned-skill-update")
+        }
+
+        try fileManager.createDirectory(at: skillDirectory, withIntermediateDirectories: true)
+        try desiredSkillMarkdown.write(to: skillFile, atomically: true, encoding: .utf8)
+        return true
     }
 
     @discardableResult
@@ -391,8 +457,11 @@ final class CodexHomeManager {
 
     private func ensurePersistentMemoryFile() throws {
         guard !fileManager.fileExists(atPath: persistentMemoryFile.path) else { return }
+        try initialPersistentMemoryFileContent().write(to: persistentMemoryFile, atomically: true, encoding: .utf8)
+    }
 
-        let initialMemory = """
+    private func initialPersistentMemoryFileContent() -> String {
+        """
         # OpenClicky Persistent Memory
 
         This file is OpenClicky's durable memory for Agent Mode. Agents must read it before starting user tasks and update it when they learn stable facts, preferences, project context, or reusable workflow knowledge.
@@ -404,8 +473,22 @@ final class CodexHomeManager {
         - Keep entries short and useful. Prefer durable context over raw logs.
         - When a task reveals a repeatable workflow, create or update a skill in `OpenClickyLearnedSkills/<workflow_name>/SKILL.md`.
         """
+    }
 
-        try initialMemory.write(to: persistentMemoryFile, atomically: true, encoding: .utf8)
+    private func archivePersistentMemoryIfNeeded(beforeAppending entry: String) throws {
+        guard shouldArchivePersistentMemory(beforeAppending: entry) else { return }
+        try archiveExistingItem(at: persistentMemoryFile, reason: "persistent-memory")
+        try initialPersistentMemoryFileContent().write(to: persistentMemoryFile, atomically: true, encoding: .utf8)
+    }
+
+    private func shouldArchivePersistentMemory(beforeAppending entry: String) -> Bool {
+        guard fileManager.fileExists(atPath: persistentMemoryFile.path) else { return false }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: persistentMemoryFile.path),
+              let fileSize = attributes[.size] as? NSNumber else {
+            return false
+        }
+
+        return fileSize.intValue + entry.utf8.count > maxPersistentMemoryBytes
     }
 
     private func writeRuntimeMap(
@@ -436,7 +519,8 @@ final class CodexHomeManager {
 
         ## Memory And Skills
 
-        - Persistent memory: \(persistentMemoryFile.path)
+        - Persistent memory (current): \(persistentMemoryFile.path)
+        - Persistent memory archives: \(persistentMemoryArchivesDirectory.path)
         - Memory articles: \(memoriesDirectory.path)
         - Bundled skills: \(bundledSkillsDirectory.path)
         - Learned workflow skills: \(learnedSkillsDirectory.path)

@@ -1650,6 +1650,7 @@ private final class ClickyAgentDockPanel: NSPanel {
 final class ClickyAgentDockWindowManager {
     private var panel: NSPanel?
     private var dragStartFrame: NSRect?
+    private var dragStartMouseLocation: CGPoint?
     private var customFrame: NSRect?
     private let dockSize = NSSize(width: 860, height: 480)
     private let hoverCardWidth: CGFloat = 560
@@ -1686,23 +1687,43 @@ final class ClickyAgentDockWindowManager {
 
     func beginDrag() {
         dragStartFrame = panel?.frame
+        dragStartMouseLocation = NSEvent.mouseLocation
     }
 
     func drag(by translation: CGSize) {
         guard let panel, let dragStartFrame else { return }
-        let frame = NSRect(
-            x: dragStartFrame.origin.x + translation.width,
-            y: dragStartFrame.origin.y - translation.height,
-            width: dragStartFrame.width,
-            height: dragStartFrame.height
-        )
-        panel.setFrame(frame, display: true)
+        let frame: NSRect
+        if let dragStartMouseLocation {
+            // Keep the dock visually locked to the cursor by computing deltas
+            // from global mouse positions. This avoids SwiftUI gesture
+            // translation lag when the panel itself is moving during drag.
+            let currentMouseLocation = NSEvent.mouseLocation
+            let dx = currentMouseLocation.x - dragStartMouseLocation.x
+            let dy = currentMouseLocation.y - dragStartMouseLocation.y
+            frame = NSRect(
+                x: dragStartFrame.origin.x + dx,
+                y: dragStartFrame.origin.y + dy,
+                width: dragStartFrame.width,
+                height: dragStartFrame.height
+            )
+        } else {
+            frame = NSRect(
+                x: dragStartFrame.origin.x + translation.width,
+                y: dragStartFrame.origin.y - translation.height,
+                width: dragStartFrame.width,
+                height: dragStartFrame.height
+            )
+        }
+        // Keep updates lightweight while dragging; AppKit redraws naturally
+        // on the next pass and this reduces perceived "left behind" lag.
+        panel.setFrame(frame, display: false)
         customFrame = frame
     }
 
     func endDrag() {
         customFrame = panel?.frame ?? customFrame
         dragStartFrame = nil
+        dragStartMouseLocation = nil
     }
 
     func textFollowUpOrigin() -> CGPoint? {

@@ -355,8 +355,15 @@ private final class PermissionDragAssistantWindowManager {
         guard let targetScreen else { return }
 
         let visibleFrame = targetScreen.visibleFrame
-        let x = visibleFrame.midX - panelSize.width / 2
-        let y = visibleFrame.minY + max(70, visibleFrame.height * 0.22)
+
+        // Position on the left side of the screen near mid-height.
+        // System Settings > Security & Privacy shows the app permissions list
+        // on the left side of the window, so placing the drag assistant here
+        // minimizes the distance the user has to drag the app icon.
+        let leftMargin: CGFloat = 40
+        let x = visibleFrame.minX + leftMargin
+        let y = visibleFrame.midY - panelSize.height / 2
+
         panel.setFrame(NSRect(x: x, y: y, width: panelSize.width, height: panelSize.height), display: true)
     }
 }

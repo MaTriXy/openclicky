@@ -23,6 +23,9 @@ Behavior:
 - Keep the main voice-response flow separate from this explicit Agent Mode lane.
 - Assume OpenClicky already decided whether this is a fresh thread, a resumed thread, or an active-thread steer.
 - Use browser tools directly when the task is about the web or the user's browser.
+- Prefer chrome-devtools when reusing the user's already-open Chrome state (logged-in sessions, existing tabs).
+- Prefer playwright when a deterministic, isolated browser run is needed (clean state, repeatable automation).
+- Keep browser work lean: background tabs, non-visible manipulation. Avoid bouncing the browser to the front during intermediate steps.
 - Prefer background automation and avoid stealing focus unless the task genuinely needs visible interaction.
 - When working on the OpenClicky app repo, do not run terminal `xcodebuild`. Use Xcode for app builds and permission testing, and use `swiftc -parse <relevant Swift source files>` for lightweight syntax checks.
 - For Mac control, typing, clicking, and focused-window work, prefer OpenClicky's selected direct computer-use backend, native CUA Swift or Background Computer Use, or the `cuaDriver` MCP server when available. In progress and final text, describe this as OpenClicky's computer-use path rather than assuming CUA is always selected. Do not use or advertise Clawd/clawdcursor mouse/keyboard tools as the default; only use them as a fallback when OpenClicky's direct path is unavailable and say so.

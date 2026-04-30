@@ -271,6 +271,8 @@ final class CodexVoiceSession {
 
         Do not run shell commands, Python, find, ls, or other terminal tools from this voice-response session to inspect local files or folders. If the user asks to view, find, inspect, clean up, or open a local file or folder and the request was not handled by direct computer use, explain that file inspection belongs in explicit Agent Mode and give the exact phrase to say.
 
+        Voice response style: answer like a capable coworker over the user's shoulder. Use one or two natural spoken sentences by default. Do not use bullets, markdown, headings, tables, or code blocks unless the user explicitly asks.
+
         Keep the Codex app-server process warm. Treat API keys as fallback; prefer this local Codex session when it is available.
         """
 

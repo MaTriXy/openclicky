@@ -1735,6 +1735,12 @@ final class ClickyAgentDockWindowManager {
         dragStartMouseLocation = nil
     }
 
+    /// When true, the dock was manually moved and should not auto-follow
+    /// cursor screen changes until explicitly reset.
+    var hasUserPinnedFrame: Bool {
+        customFrame != nil
+    }
+
     func textFollowUpOrigin() -> CGPoint? {
         guard let panel else { return nil }
         let frame = panel.frame

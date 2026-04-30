@@ -624,10 +624,32 @@ final class CompanionManager: ObservableObject {
         guard !agentDockItems.isEmpty else { return }
         showAgentDockWindowNearCurrentScreen()
     }
+
+    private func refreshAgentDockFollowBehavior() {
+        let shouldAutoFollowCursor = agentDockItems.contains { item in
+            item.status == .starting || item.status == .running
+        }
+        if shouldAutoFollowCursor {
+            if agentDockFollowTimer == nil {
+                let timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                    guard let self else { return }
+                    guard !self.agentDockItems.isEmpty else { return }
+                    guard !self.agentDockWindowManager.hasUserPinnedFrame else { return }
+                    self.showAgentDockWindowNearCurrentScreen()
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                agentDockFollowTimer = timer
+            }
+        } else {
+            agentDockFollowTimer?.invalidate()
+            agentDockFollowTimer = nil
+        }
+    }
     private let userActivityIdleDetector = UserActivityIdleDetector()
     private var isTutorObservationInFlight = false
     private var lastVoiceInteractionCompletedAt: Date = .distantPast
     private static let tutorObservationVoiceCooldown: TimeInterval = 90
+    private var agentDockFollowTimer: Timer?
 
     func setSelectedModel(_ model: String) {
         let selectedVoiceResponseModel = OpenClickyModelCatalog.voiceResponseModel(withID: model)
@@ -6501,6 +6523,7 @@ final class CompanionManager: ObservableObject {
             if agentDockItems.count > 6 {
                 agentDockItems.removeFirst(agentDockItems.count - 6)
             }
+            refreshAgentDockFollowBehavior()
             scheduleWidgetSnapshotPublish()
             OpenClickyMessageLogStore.shared.append(
                 lane: "agent",
@@ -6621,6 +6644,7 @@ final class CompanionManager: ObservableObject {
         if agentDockItems.count > 6 {
             agentDockItems.removeFirst(agentDockItems.count - 6)
         }
+        refreshAgentDockFollowBehavior()
         scheduleWidgetSnapshotPublish()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
@@ -6629,6 +6653,7 @@ final class CompanionManager: ObservableObject {
             if self.agentDockItems.isEmpty {
                 self.agentDockWindowManager.hide()
             }
+            self.refreshAgentDockFollowBehavior()
             self.scheduleWidgetSnapshotPublish()
         }
     }
@@ -6650,6 +6675,7 @@ final class CompanionManager: ObservableObject {
                 self.agentDockWindowManager.hide()
             }
             self.pendingAgentDockItemRemovalTasks[sessionID] = nil
+            self.refreshAgentDockFollowBehavior()
             self.scheduleWidgetSnapshotPublish()
         }
         pendingAgentDockItemRemovalTasks[sessionID] = workItem

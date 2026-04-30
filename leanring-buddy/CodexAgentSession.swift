@@ -516,8 +516,19 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             let itemID = CodexJSON.string(params["itemId"])
                 ?? CodexJSON.string(params["callId"])
                 ?? "active-command-progress"
+            let commandText = CodexJSON.string(params["command"])
+                ?? CodexJSON.string(CodexJSON.dictionary(params["item"])?["command"])
+                ?? ""
+            let outputDelta = CodexJSON.string(params["delta"])
+                ?? CodexJSON.string(params["outputDelta"])
+                ?? CodexJSON.string(CodexJSON.dictionary(params["item"])?["outputDelta"])
+                ?? ""
             progressStage = .executing
-            upsertEntryIfChanged(id: itemID, role: .command, text: "Working through the task...")
+            upsertEntryIfChanged(
+                id: itemID,
+                role: .command,
+                text: Self.liveCommandProgressSummary(command: commandText, outputDelta: outputDelta)
+            )
         case "turn/completed":
             flushPendingAssistantDeltas()
             currentAssistantEntryID = nil
@@ -1479,6 +1490,20 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         }
 
         return spokenSnippet(from: latestEntry.text, maxLength: 120)
+    }
+
+    private static func liveCommandProgressSummary(command: String, outputDelta: String) -> String {
+        let trimmedDelta = outputDelta.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedDelta.isEmpty {
+            return spokenSnippet(from: trimmedDelta, maxLength: 120)
+        }
+
+        let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedCommand.isEmpty {
+            return "Running: \(spokenSnippet(from: trimmedCommand, maxLength: 90))"
+        }
+
+        return "Executing command…"
     }
 
     private static func spokenSnippet(from text: String, maxLength: Int) -> String {

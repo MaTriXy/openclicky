@@ -962,7 +962,10 @@ private struct ClickyAgentDockStackView: View {
                             voice: { companionManager.prepareVoiceFollowUpForAgentDockItem(item.id) },
                             close: { companionManager.closeAgentDockPanel() },
                             stop: { companionManager.stopAgentDockItem(item.id) },
-                            dismiss: { companionManager.dismissAgentDockItem(item.id) }
+                            dismiss: { companionManager.dismissAgentDockItem(item.id) },
+                            runSuggestedAction: { actionTitle in
+                                companionManager.runSuggestedNextAction(actionTitle)
+                            }
                         )
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
                     }
@@ -1010,7 +1013,7 @@ private struct ClickyAgentDockStackView: View {
                 }
             }
         }
-        .frame(width: 820, height: 430, alignment: .topTrailing)
+        .frame(width: 760, height: 500, alignment: .topTrailing)
         .padding(.top, 0)
         .padding(.trailing, 4)
         .animation(.easeOut(duration: 0.16), value: companionManager.agentDockItems)
@@ -1384,6 +1387,7 @@ private struct ClickyAgentDockHoverCard: View {
     /// agent. Distinct from `stop` (which sends a cancel signal) — this
     /// just removes the dock item visually.
     let dismiss: () -> Void
+    let runSuggestedAction: (String) -> Void
     @State private var isConfirmingStop = false
 
     var body: some View {
@@ -1405,6 +1409,23 @@ private struct ClickyAgentDockHoverCard: View {
                     .background(Capsule().fill(statusBackgroundColor))
             }
 
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Stage: \(item.progressStageLabel)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .lineLimit(1)
+
+                if let progressStep = item.progressStepText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !progressStep.isEmpty {
+                    Text("Step: \(progressStep)")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 2)
+
             agentProgressContent
                 .padding(.top, 4)
 
@@ -1413,26 +1434,41 @@ private struct ClickyAgentDockHoverCard: View {
                     .font(.system(size: 10, weight: .heavy))
                     .foregroundColor(DS.Colors.textTertiary)
 
-                HStack(spacing: 8) {
-                    stopControls
-
-                    Spacer(minLength: 10)
-
-                    Button(action: voice) {
-                        Label("Voice", systemImage: "mic")
+                VStack(alignment: .leading, spacing: 8) {
+                    if !item.suggestedNextActions.isEmpty {
+                        HStack(spacing: 8) {
+                            ForEach(item.suggestedNextActions, id: \.self) { actionTitle in
+                                Button(action: {
+                                    runSuggestedAction(actionTitle)
+                                }) {
+                                    Text(actionTitle)
+                                }
+                                .buttonStyle(ClickyAgentDockPillButtonStyle())
+                            }
+                        }
                     }
-                    .buttonStyle(ClickyAgentDockPillButtonStyle())
 
-                    Button(action: text) {
-                        Label("Text", systemImage: "text.cursor")
-                    }
-                    .buttonStyle(ClickyAgentDockPillButtonStyle())
+                    HStack(spacing: 8) {
+                        stopControls
 
-                    if canOpenDashboard {
-                        Button(action: chat) {
-                            Label("Dashboard", systemImage: "rectangle.grid.2x2")
+                        Spacer(minLength: 10)
+
+                        Button(action: voice) {
+                            Label("Voice", systemImage: "mic")
                         }
                         .buttonStyle(ClickyAgentDockPillButtonStyle())
+
+                        Button(action: text) {
+                            Label("Text", systemImage: "text.cursor")
+                        }
+                        .buttonStyle(ClickyAgentDockPillButtonStyle())
+
+                        if canOpenDashboard {
+                            Button(action: chat) {
+                                Label("Dashboard", systemImage: "rectangle.grid.2x2")
+                            }
+                            .buttonStyle(ClickyAgentDockPillButtonStyle())
+                        }
                     }
                 }
             }
@@ -1454,7 +1490,7 @@ private struct ClickyAgentDockHoverCard: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
-        .frame(width: 560, alignment: .leading)
+        .frame(width: 500, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(
@@ -1712,7 +1748,7 @@ final class ClickyAgentDockWindowManager {
     private var dragStartFrame: NSRect?
     private var dragStartMouseLocation: CGPoint?
     private var customFrame: NSRect?
-    private let dockSize = NSSize(width: 860, height: 480)
+    private let dockSize = NSSize(width: 800, height: 540)
     private let hoverCardWidth: CGFloat = 560
     // Track the icon container size used by `ClickyAgentDockItemView`. Used
     // by `textFollowUpOrigin()` to position follow-up popovers relative to

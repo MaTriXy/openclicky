@@ -53,7 +53,10 @@ struct ClickyAgentDockItem: Identifiable, Equatable {
     var userInstruction: String
     var accentTheme: ClickyAccentTheme
     var status: ClickyAgentDockStatus
+    var progressStageLabel: String
+    var progressStepText: String?
     var caption: String?
+    var suggestedNextActions: [String]
     var createdAt: Date
 }
 
@@ -6523,7 +6526,10 @@ final class CompanionManager: ObservableObject {
                 userInstruction: instruction.trimmingCharacters(in: .whitespacesAndNewlines),
                 accentTheme: accentTheme,
                 status: .starting,
+                progressStageLabel: "Starting",
+                progressStepText: acknowledgement,
                 caption: acknowledgement,
+                suggestedNextActions: [],
                 createdAt: Date()
             )
 
@@ -6645,7 +6651,10 @@ final class CompanionManager: ObservableObject {
             userInstruction: caption,
             accentTheme: Self.nextAgentDockAccentTheme(existingCount: agentDockItems.count),
             status: .done,
+            progressStageLabel: "Completed",
+            progressStepText: caption,
             caption: caption,
+            suggestedNextActions: [],
             createdAt: Date()
         )
         agentDockItems.append(dockItem)
@@ -6813,6 +6822,14 @@ final class CompanionManager: ObservableObject {
         guard let itemIndex = agentDockItems.lastIndex(where: { $0.sessionID == sessionID }) else { return }
         let session = codexAgentSessions.first(where: { $0.id == sessionID })
         let activitySummary = session?.latestActivitySummary
+        let stageLabel = session?.progressStage.label ?? (status == .starting ? "Starting" : "Working")
+        let suggestedNextActions = session?.latestResponseCard?.suggestedNextActions ?? []
+        let trimmedActivitySummary = activitySummary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasActivitySummary = trimmedActivitySummary?.isEmpty == false
+
+        agentDockItems[itemIndex].progressStageLabel = stageLabel
+        agentDockItems[itemIndex].progressStepText = hasActivitySummary ? trimmedActivitySummary : nil
+        agentDockItems[itemIndex].suggestedNextActions = suggestedNextActions
 
         switch status {
         case .starting:
@@ -6823,8 +6840,7 @@ final class CompanionManager: ObservableObject {
             // generic "An agent is getting ready." placeholder. When neither
             // is present, leave caption nil so the view can render its own
             // streaming "thinking" affordance.
-            if let activitySummary,
-               !activitySummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let activitySummary, hasActivitySummary {
                 agentDockItems[itemIndex].caption = activitySummary
             }
         case .running:
@@ -6832,8 +6848,7 @@ final class CompanionManager: ObservableObject {
             // Same rationale as .starting — never replace the caption with
             // "An agent is working on this." Leave nil to surface the
             // animated thinking indicator until real tokens stream in.
-            if let activitySummary,
-               !activitySummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let activitySummary, hasActivitySummary {
                 agentDockItems[itemIndex].caption = activitySummary
             }
         case .ready:
@@ -6849,12 +6864,16 @@ final class CompanionManager: ObservableObject {
             if agentDockItems[itemIndex].status == .running || agentDockItems[itemIndex].status == .starting {
                 agentDockItems[itemIndex].status = .done
                 agentDockItems[itemIndex].caption = "The agent has completed the task — \(activitySummary)"
+                agentDockItems[itemIndex].progressStageLabel = "Completed"
+                agentDockItems[itemIndex].progressStepText = activitySummary
             }
             completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "success")
             announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "success", summary: activitySummary)
         case .failed:
             agentDockItems[itemIndex].status = .failed
             agentDockItems[itemIndex].caption = activitySummary ?? "The agent needs attention. Ask for status to hear the error."
+            agentDockItems[itemIndex].progressStageLabel = "Needs attention"
+            agentDockItems[itemIndex].progressStepText = activitySummary
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
                 status: "failed",
@@ -6877,9 +6896,12 @@ final class CompanionManager: ObservableObject {
             if let summary = activitySummary,
                !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 agentDockItems[itemIndex].caption = "Cancelled while: \(summary)"
+                agentDockItems[itemIndex].progressStepText = summary
             } else {
                 agentDockItems[itemIndex].caption = "The agent was cancelled (\(Self.prettyCancelReason(for: normalizedStopReason)))."
+                agentDockItems[itemIndex].progressStepText = Self.prettyCancelReason(for: normalizedStopReason)
             }
+            agentDockItems[itemIndex].progressStageLabel = "Needs attention"
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
                 status: "cancelled",

@@ -172,6 +172,7 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
                 data.append(0x0A)
 
                 try self.append(data, to: self.currentLogFile)
+                self.emitConsoleLog(entry: entry)
             } catch {
                 print("OpenClicky message log write failed: \(error.localizedDescription)")
             }
@@ -262,5 +263,27 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
         guard string.count > maxLength else { return string }
         let endIndex = string.index(string.startIndex, offsetBy: maxLength)
         return "\(string[..<endIndex])... [truncated \(string.count - maxLength) chars]"
+    }
+
+    private func emitConsoleLog(entry: [String: Any]) {
+        guard let timestamp = entry["timestamp"] as? String,
+              let lane = entry["lane"] as? String,
+              let direction = entry["direction"] as? String,
+              let event = entry["event"] as? String else {
+            return
+        }
+
+        let fields = (entry["fields"] as? [String: Any]) ?? [:]
+        let previewText: String
+        if fields.isEmpty {
+            previewText = "{}"
+        } else if let json = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+                  let text = String(data: json, encoding: .utf8) {
+            previewText = Self.truncated(text, maxLength: 420)
+        } else {
+            previewText = Self.truncated(String(describing: fields), maxLength: 420)
+        }
+
+        NSLog("[OpenClickyLog][%@][%@/%@] %@ %@", timestamp, lane, direction, event, previewText)
     }
 }

@@ -84,6 +84,28 @@ enum CodexAgentSessionStatus: Equatable {
     }
 }
 
+enum CodexAgentProgressStage: Equatable {
+    case idle
+    case starting
+    case planning
+    case executing
+    case composing
+    case completed
+    case failed
+
+    var label: String {
+        switch self {
+        case .idle: return "Idle"
+        case .starting: return "Starting"
+        case .planning: return "Planning"
+        case .executing: return "Executing"
+        case .composing: return "Composing reply"
+        case .completed: return "Completed"
+        case .failed: return "Needs attention"
+        }
+    }
+}
+
 @MainActor
 final class CodexAgentSession: ObservableObject, Identifiable {
     let id: UUID
@@ -95,6 +117,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     @Published private(set) var latestResponseCard: ClickyResponseCard?
     @Published private(set) var stopReason: String?
     @Published private(set) var title: String
+    @Published private(set) var progressStage: CodexAgentProgressStage = .idle
     @Published var model: String = OpenClickyModelCatalog.codexActionsModel(
         withID: UserDefaults.standard.string(forKey: "clickyCodexModel") ?? OpenClickyModelCatalog.defaultCodexActionsModelID
     ).id
@@ -233,6 +256,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         activeThreadID = nil
         currentAssistantEntryID = nil
         status = .stopped
+        progressStage = .idle
     }
 
     private func runPrompt(_ prompt: String, didRetryCompatibilityFallback: Bool = false) async {
@@ -244,6 +268,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
 
             stopReason = nil
             status = .running
+            progressStage = .starting
             lastErrorMessage = nil
             UserDefaults.standard.set(model, forKey: "clickyCodexModel")
             UserDefaults.standard.set(workingDirectoryPath, forKey: "clickyCodexWorkingDirectory")
@@ -282,6 +307,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
 
             lastErrorMessage = text
             status = .failed(text)
+            progressStage = .failed
             entries.append(CodexTranscriptEntry(role: .system, text: text))
         }
     }
@@ -423,6 +449,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
            let threadID = CodexJSON.string(thread["id"]) {
             activeThreadID = threadID
             status = .ready
+            progressStage = .idle
         } else {
             throw CodexRPCError(message: "Codex app-server did not return a thread id.")
         }
@@ -461,12 +488,15 @@ final class CodexAgentSession: ObservableObject, Identifiable {
                let threadID = CodexJSON.string(thread["id"]) {
                 activeThreadID = threadID
                 status = .ready
+                progressStage = .idle
             }
         case "turn/started":
             status = .running
+            progressStage = .starting
         case "item/agentMessage/delta":
             let itemID = CodexJSON.string(params["itemId"]) ?? UUID().uuidString
             let delta = CodexJSON.string(params["delta"]) ?? ""
+            progressStage = .composing
             appendAssistantDelta(itemID: itemID, delta: delta)
         case "item/started":
             if blockForbiddenCommandIfNeeded(params["item"]) {
@@ -476,17 +506,20 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             handleCompletedItem(params["item"])
         case "turn/plan/updated":
             if let text = CodexJSON.string(params["text"]), !text.isEmpty {
+                progressStage = .planning
                 entries.append(CodexTranscriptEntry(role: .plan, text: text))
             }
         case "command/exec/outputDelta", "item/commandExecution/outputDelta":
             let itemID = CodexJSON.string(params["itemId"])
                 ?? CodexJSON.string(params["callId"])
                 ?? "active-command-progress"
+            progressStage = .executing
             upsertEntryIfChanged(id: itemID, role: .command, text: "Working through the task...")
         case "turn/completed":
             flushPendingAssistantDeltas()
             currentAssistantEntryID = nil
             status = .ready
+            progressStage = .completed
             // Chime intentionally NOT played here. CompanionManager owns
             // the audio choreography and plays the chime *after* any
             // in-flight TTS finishes, so the chime can't cut the
@@ -497,6 +530,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             )
             lastErrorMessage = text
             status = .failed(text)
+            progressStage = .failed
             entries.append(CodexTranscriptEntry(role: .system, text: text))
         case "account/login/completed":
             if CodexJSON.bool(params["success"]) == true {
@@ -504,6 +538,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             } else if let text = CodexJSON.string(params["error"]), !text.isEmpty {
                 lastErrorMessage = text
                 status = .failed(text)
+                progressStage = .failed
                 entries.append(CodexTranscriptEntry(role: .system, text: text))
             }
         default:

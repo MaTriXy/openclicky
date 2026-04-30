@@ -60,6 +60,8 @@ struct CodexAgentModePanelSection: View {
                 .foregroundColor(DS.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            stageStatusRow
+
             TextField("Ask OpenClicky to do something...", text: $prompt, axis: .vertical)
                 .lineLimit(1...3)
                 .textFieldStyle(.plain)
@@ -87,6 +89,10 @@ struct CodexAgentModePanelSection: View {
 
             if shouldShowInlineAgentResponse {
                 inlineAgentResponse
+            }
+
+            if shouldShowNextStepChoices {
+                nextStepChoices
             }
 
             HStack(spacing: 8) {
@@ -210,6 +216,68 @@ struct CodexAgentModePanelSection: View {
             return "Agent needs attention. Open the dashboard for details."
         }
         return "Ask for coding, research, writing, or app tasks."
+    }
+
+    private var stageStatusRow: some View {
+        HStack(spacing: 6) {
+            Text("Stage")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(DS.Colors.textTertiary)
+            Text(session.progressStage.label)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+        }
+    }
+
+    private var shouldShowNextStepChoices: Bool {
+        switch session.status {
+        case .ready, .failed:
+            return session.hasVisibleActivity
+        case .starting, .running, .stopped:
+            return false
+        }
+    }
+
+    private var nextStepChoices: some View {
+        HStack(spacing: 8) {
+            compactChoiceButton(
+                title: "Voice follow-up",
+                systemImage: "mic"
+            ) {
+                prepareVoiceFollowUp()
+            }
+
+            compactChoiceButton(
+                title: "Open dashboard",
+                systemImage: "rectangle.grid.2x2"
+            ) {
+                openHUD()
+            }
+        }
+    }
+
+    private func compactChoiceButton(
+        title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(DS.Colors.textPrimary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.07))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle.opacity(0.8), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
     private var visibleInlineErrorMessage: String? {

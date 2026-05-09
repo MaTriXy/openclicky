@@ -40,6 +40,7 @@ final class CursorOverlayState: ObservableObject {
     @Published var detectedElementScreenLocation: CGPoint?
     @Published var detectedElementDisplayFrame: CGRect?
     @Published var detectedElementBubbleText: String?
+    @Published var detectedElementReturnsImmediately: Bool = false
     @Published var agentTaskBubbleText: String?
     @Published var externalPrimaryCaptionText: String?
     @Published var externalPrimaryCaptionAccentHex: String?
@@ -208,6 +209,13 @@ final class CompanionManager: ObservableObject {
     @Published var detectedElementBubbleText: String? {
         didSet {
             cursorOverlayState.detectedElementBubbleText = detectedElementBubbleText
+        }
+    }
+    /// True for task-start handoff flights that should tag the corner briefly
+    /// and come straight back instead of holding a pointing caption.
+    @Published var detectedElementReturnsImmediately: Bool = false {
+        didSet {
+            cursorOverlayState.detectedElementReturnsImmediately = detectedElementReturnsImmediately
         }
     }
 
@@ -473,6 +481,10 @@ final class CompanionManager: ObservableObject {
     /// Whether speculative pre-fire is enabled (Settings → Voice).
     @Published var speculativePreFireEnabled: Bool =
         UserDefaults.standard.bool(forKey: AppBundleConfiguration.userSpeculativePreFireDefaultsKey)
+
+    private var voiceResponseCaptionsEnabled: Bool {
+        UserDefaults.standard.object(forKey: AppBundleConfiguration.userVoiceResponseCaptionsEnabledDefaultsKey) as? Bool ?? false
+    }
 
     private struct SpeculativeFire {
         let partialTranscript: String
@@ -1157,6 +1169,7 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+        detectedElementReturnsImmediately = false
     }
 
     private func startExternalControlBridgeIfNeeded() {
@@ -1213,6 +1226,7 @@ final class CompanionManager: ObservableObject {
             ?? NSScreen.main?.frame
             ?? CGRect(origin: targetPoint, size: .zero)
         detectedElementBubbleText = caption?.trimmingCharacters(in: .whitespacesAndNewlines)
+        detectedElementReturnsImmediately = false
         cursorOverlayState.externalPrimaryCaptionText = nil
         cursorOverlayState.externalPrimaryCaptionAccentHex = nil
         showCursorOverlayIfAvailable()
@@ -1243,28 +1257,19 @@ final class CompanionManager: ObservableObject {
     private func animateAgentSpawnProxyFromCursorToDock(accentTheme: ClickyAccentTheme, caption: String? = nil) {
         let startPoint = Self.clampedExternalCursorPoint(NSEvent.mouseLocation)
         let targetPoint = agentDockSpawnProxyTargetPoint(from: startPoint)
-        let id = UUID()
-        let cursor = OpenClickyExternalProxyCursor(
-            id: id,
-            screenLocation: startPoint,
-            caption: caption?.trimmingCharacters(in: .whitespacesAndNewlines),
-            accentHex: Self.cursorHex(for: accentTheme)
-        )
-        cursorOverlayState.externalSecondaryCursors.append(cursor)
+
+        // For agent starts, use the primary OpenClicky buddy itself rather
+        // than a disposable proxy cursor: it should visibly fly to the agent
+        // corner, tag the handoff, and immediately return to the user's real
+        // pointer so the working cursor never feels abandoned.
+        detectedElementDisplayFrame = NSScreen.screens.first { $0.frame.contains(targetPoint) }?.frame
+            ?? NSScreen.screens.first { $0.frame.contains(startPoint) }?.frame
+            ?? NSScreen.main?.frame
+            ?? CGRect(origin: targetPoint, size: .zero)
+        detectedElementBubbleText = caption?.trimmingCharacters(in: .whitespacesAndNewlines)
+        detectedElementReturnsImmediately = true
+        detectedElementScreenLocation = targetPoint
         showCursorOverlayIfAvailable()
-
-        externalSecondaryCursorClearTasks[id]?.cancel()
-        externalSecondaryCursorClearTasks[id] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 45_000_000)
-            await MainActor.run {
-                self?.moveExternalSecondaryCursor(id, to: targetPoint)
-            }
-
-            try? await Task.sleep(nanoseconds: 620_000_000)
-            await MainActor.run {
-                self?.removeExternalSecondaryCursor(id)
-            }
-        }
     }
 
     private func moveExternalSecondaryCursor(_ id: UUID, to point: CGPoint) {
@@ -1314,6 +1319,8 @@ final class CompanionManager: ObservableObject {
             return "#FACC15"
         case .rose:
             return "#FF4F5E"
+        case .white:
+            return "#F8FAFC"
         }
     }
 
@@ -1625,11 +1632,12 @@ final class CompanionManager: ObservableObject {
     private func bindVoiceStateObservation() {
         voiceStateCancellable = buddyDictationManager.$isRecordingFromKeyboardShortcut
             .combineLatest(
+                buddyDictationManager.$isRecordingFromMicrophoneButton,
                 buddyDictationManager.$isFinalizingTranscript,
                 buddyDictationManager.$isPreparingToRecord
             )
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording, isFinalizing, isPreparing in
+            .sink { [weak self] isKeyboardRecording, isMicrophoneButtonRecording, isFinalizing, isPreparing in
                 guard let self else { return }
                 // Don't override .responding — the AI response pipeline
                 // manages that state directly until streaming finishes.
@@ -1637,7 +1645,11 @@ final class CompanionManager: ObservableObject {
 
                 if isFinalizing {
                     self.voiceState = .processing
-                } else if isRecording {
+                } else if isKeyboardRecording || isMicrophoneButtonRecording {
+                    // Agent overlay / HUD Voice buttons use the microphone-
+                    // button path, not the global keyboard shortcut path.
+                    // Treat both as active listening so the cursor swaps to
+                    // the recording waveform in every voice-capture entry.
                     self.voiceState = .listening
                 } else if isPreparing {
                     self.voiceState = .processing
@@ -2189,6 +2201,9 @@ final class CompanionManager: ObservableObject {
         if acceptPendingAgentOfferIfConfirmed(from: finalTranscript) {
             return
         }
+        if submitPendingAgentVoiceFollowUp(finalTranscript) {
+            return
+        }
         if startExplicitAgentTaskIfRequested(from: finalTranscript) {
             return
         }
@@ -2199,9 +2214,6 @@ final class CompanionManager: ObservableObject {
             return
         }
         if handleQuickLocalVoiceResponseIfNeeded(from: finalTranscript) {
-            return
-        }
-        if submitPendingAgentVoiceFollowUp(finalTranscript) {
             return
         }
         if submitContextualAgentFollowUp(finalTranscript, source: "voice") {
@@ -3769,6 +3781,10 @@ final class CompanionManager: ObservableObject {
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty else { return false }
         guard let sessionID = pendingAgentVoiceFollowUpSessionID else { return false }
+        // The user explicitly pressed a dock/HUD Voice follow-up button, so
+        // the next utterance belongs to that agent even if it sounds like a
+        // normal local OpenClicky command such as “open Clicky.” Keep this
+        // ahead of new-task, direct computer-use, and quick local routing.
         pendingAgentVoiceFollowUpSessionID = nil
         pendingAgentVoiceFollowUpCreatedAt = nil
         let timing = activeRequestTiming
@@ -6967,10 +6983,10 @@ final class CompanionManager: ObservableObject {
             contextTitle: "OpenClicky Agent"
         )
 
-        // Spawn the dock representation independently. The live cursor buddy
-        // should stay with the user's cursor; starting a background agent
-        // creates a separate dock item in the top-right instead of flying the
-        // current cursor/avatar away from the user's working position.
+        // Spawn the dock representation while the live OpenClicky buddy makes
+        // a short handoff flight to the corner and then returns to the user's
+        // cursor, so the task start feels intentional without leaving the
+        // working position abandoned.
         clearDetectedElementLocation()
 
         Task { @MainActor in
@@ -7018,7 +7034,7 @@ final class CompanionManager: ObservableObject {
                     "title": agentSession.title,
                     "instruction": instruction,
                     "requestID": timing?.requestID ?? "none",
-                    "spawnChoreography": "cursor_proxy_to_dock"
+                    "spawnChoreography": "cursor_to_dock_and_back"
                 ]
             )
             markRequestStageCompleted(
@@ -7033,7 +7049,7 @@ final class CompanionManager: ObservableObject {
                     "model": agentSession.model,
                     "sessionID": agentSession.id.uuidString,
                     "title": agentSession.title,
-                    "spawnChoreography": "cursor_proxy_to_dock"
+                    "spawnChoreography": "cursor_to_dock_and_back"
                 ]
             )
 
@@ -7168,6 +7184,15 @@ final class CompanionManager: ObservableObject {
             .joined(separator: " ")
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
+        let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:proper|better|concise|short|compact)\s+(?:task\s+)?titles?\b"#, "Task Title Cleanup"),
+            (#"(?i)\btask\s+titles?\b.*\b(?:read(?:ing)?\s+out|raw|asked\s+for|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup")
+        ]
+        for rule in directTitleRules where title.range(of: rule.pattern, options: .regularExpression) != nil {
+            return rule.title
+        }
+
         let fillerPatterns = [
             #"(?i)^hey\s+(?:clicky\s+)?agent[,\s]+"#,
             #"(?i)^clicky\s+agent[,\s]+"#,
@@ -7202,7 +7227,7 @@ final class CompanionManager: ObservableObject {
             options: .regularExpression
         )
         title = title.replacingOccurrences(
-            of: #"(?i)\b(?:the|a|an|this|that|it|them|you|your|then|also|with|from|into|and|or|but|for|of|to|in|on|as|is|are|be)\b"#,
+            of: #"(?i)\b(?:the|a|an|this|that|it|them|you|your|then|also|with|from|into|and|or|but|for|of|to|in|on|as|is|are|be|have|has|had|asked)\b"#,
             with: " ",
             options: .regularExpression
         )
@@ -7237,44 +7262,27 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Build the spoken/displayed acknowledgement for a freshly invoked
-    /// agent task. Echoes the user's intent back so they immediately hear
-    /// confirmation of what was understood and what happens next, instead
-    /// of the previous generic "got it. an agent is starting." line.
-    ///
-    /// Format: "got it — \(intentClause). starting an agent now."
-    /// - intentClause is a short, lower-cased, verb-leading paraphrase of
-    ///   the instruction (capped at ~80 chars on a word boundary).
+    /// agent task. Use the same compact task title shown in the dock so
+    /// OpenClicky confirms the job without reading the raw dictated request
+    /// back to the user.
     private static func acknowledgementForAgentInstruction(_ instruction: String) -> String {
-        let flattened = instruction
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        guard !flattened.isEmpty else {
+        let title = shortAgentInstructionSummary(instruction)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title != "Agent Task" else {
             return "got it. starting an agent now."
         }
-        let trimmed: String = {
-            guard flattened.count > 80 else { return flattened }
-            let endIndex = flattened.index(flattened.startIndex, offsetBy: 80)
-            let prefix = String(flattened[..<endIndex])
-            if let lastSpace = prefix.lastIndex(of: " ") {
-                return String(prefix[..<lastSpace])
-            }
-            return prefix
-        }()
-        // Lower-case the first character so the echoed clause reads naturally
-        // in the middle of the spoken sentence ("got it — open the README ...").
-        let lowercasedFirst: String
-        if let first = trimmed.first {
-            lowercasedFirst = String(first).lowercased() + trimmed.dropFirst()
+
+        let spokenTitle: String
+        if let first = title.first {
+            spokenTitle = String(first).lowercased() + title.dropFirst()
         } else {
-            lowercasedFirst = trimmed
+            spokenTitle = title
         }
-        let stripped = lowercasedFirst.trimmingCharacters(in: CharacterSet(charactersIn: ".!?"))
-        return "got it — \(stripped). starting an agent now."
+        return "got it — \(spokenTitle). starting an agent now."
     }
 
     private static func nextAgentDockAccentTheme(existingCount: Int) -> ClickyAccentTheme {
-        let accentThemes: [ClickyAccentTheme] = [.blue, .mint, .rose, .blue, .amber]
+        let accentThemes: [ClickyAccentTheme] = [.blue, .mint, .rose, .amber, .white]
         return accentThemes[existingCount % accentThemes.count]
     }
 
@@ -7337,8 +7345,8 @@ final class CompanionManager: ObservableObject {
             announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "success", summary: completionSpeechSummary)
         case .failed:
             agentDockItems[itemIndex].status = .failed
-            agentDockItems[itemIndex].caption = activitySummary ?? "The agent needs attention. Ask for status to hear the error."
-            agentDockItems[itemIndex].progressStageLabel = "Needs attention"
+            agentDockItems[itemIndex].caption = activitySummary ?? "The agent stopped. Open the agent for details."
+            agentDockItems[itemIndex].progressStageLabel = "Stopped"
             agentDockItems[itemIndex].progressStepText = activitySummary
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
@@ -7367,7 +7375,7 @@ final class CompanionManager: ObservableObject {
                 agentDockItems[itemIndex].caption = "The agent was cancelled (\(Self.prettyCancelReason(for: normalizedStopReason)))."
                 agentDockItems[itemIndex].progressStepText = Self.prettyCancelReason(for: normalizedStopReason)
             }
-            agentDockItems[itemIndex].progressStageLabel = "Needs attention"
+            agentDockItems[itemIndex].progressStageLabel = "Stopped"
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
                 status: "cancelled",
@@ -7526,8 +7534,8 @@ final class CompanionManager: ObservableObject {
                 : "the agent was cancelled \(Self.briefCompletionSummary(trimmedSummary))"
         case "failed":
             line = trimmedSummary.isEmpty
-                ? "the agent needs attention"
-                : "the agent needs attention \(Self.briefCompletionSummary(trimmedSummary))"
+                ? "the agent stopped"
+                : "the agent stopped \(Self.briefCompletionSummary(trimmedSummary))"
         default:
             line = trimmedSummary.isEmpty
                 ? "the agent has completed the task"
@@ -7782,7 +7790,7 @@ final class CompanionManager: ObservableObject {
               let sessionID = item.sessionID else { return }
         selectCodexAgentSession(sessionID)
         let submitText: (String) -> Void = { [weak self] submittedText in
-            self?.submitTextFollowUpForActiveAgent(submittedText)
+            self?.submitTextFollowUp(submittedText, toAgentSessionID: sessionID)
         }
 
         if let textFollowUpOrigin = agentDockWindowManager.textFollowUpOrigin() {
@@ -7804,9 +7812,22 @@ final class CompanionManager: ObservableObject {
         agentDockWindowManager.endDrag()
     }
 
-    private func submitTextFollowUpForActiveAgent(_ submittedText: String) {
+    private func submitTextFollowUp(_ submittedText: String, toAgentSessionID sessionID: UUID) {
         let trimmedText = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
+        guard let session = codexAgentSessions.first(where: { $0.id == sessionID }) else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "error",
+                event: "openclicky.agent_followup.missing_session",
+                fields: [
+                    "source": "agent_text_followup",
+                    "sessionID": sessionID.uuidString,
+                    "instructionLength": trimmedText.count
+                ]
+            )
+            return
+        }
         let timing = beginRequestTiming(source: "agent_text_followup", text: trimmedText)
         let executionStartedAt = markRequestExecutionStarted(
             route: "agent.followup",
@@ -7816,13 +7837,13 @@ final class CompanionManager: ObservableObject {
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
                 "source": "agent_text_followup",
-                "sessionID": codexAgentSession.id.uuidString,
-                "title": codexAgentSession.title,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
                 "instructionLength": trimmedText.count
             ]
         )
-        submitAgentPrompt(trimmedText, to: codexAgentSession)
-        lastAgentContextSessionID = codexAgentSession.id
+        submitAgentPrompt(trimmedText, to: session)
+        lastAgentContextSessionID = session.id
         markRequestCompleted(
             route: "agent.followup",
             executionStartedAt: executionStartedAt,
@@ -7832,9 +7853,9 @@ final class CompanionManager: ObservableObject {
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
                 "source": "agent_text_followup",
-                "sessionID": codexAgentSession.id.uuidString,
-                "title": codexAgentSession.title,
-                "model": codexAgentSession.model
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "model": session.model
             ]
         )
         if isAdvancedModeEnabled {
@@ -7902,8 +7923,8 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Keeps chat-driven turns aligned with the same corner-dock UX as
-    /// voice starts: hoverable dock card and menu item, without moving the
-    /// user's live cursor buddy away from the cursor.
+    /// voice starts: hoverable dock card and a quick buddy flight to the
+    /// parking corner before returning to the user's cursor.
     private func stageDashboardAgentSubmission(prompt: String, session: CodexAgentSession) {
         let summary = Self.shortAgentInstructionSummary(prompt)
         let activity = "Starting \(summary)"
@@ -7992,6 +8013,7 @@ final class CompanionManager: ObservableObject {
         currentResponseTask = nil
         codexVoiceSession.cancelActiveTurn(reason: "voice_response_interrupted")
         voiceTTSClient.stopPlayback()
+        clearVoiceResponseCaption()
     }
 
     private func prepareAgentScreenContextForNextTurn(minimumPasteboardChangeCount: Int) async -> CodexAgentScreenContext? {
@@ -8246,6 +8268,67 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+    func testVoiceResponseCaptionPlayback() {
+        let line = "This is OpenClicky's caption playback test. The selected caption font should show beside the cursor."
+        latestVoiceResponseCard = ClickyResponseCard(
+            source: .voice,
+            rawText: line,
+            contextTitle: "Caption playback test"
+        )
+        speakShortSystemResponse(line)
+        updateVoiceResponseCaption(line, force: true)
+        let currentCaption = cursorOverlayState.externalPrimaryCaptionText
+        externalProxyClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_500_000_000)
+            await MainActor.run {
+                guard let self, self.cursorOverlayState.externalPrimaryCaptionText == currentCaption else { return }
+                self.clearVoiceResponseCaption()
+            }
+        }
+    }
+
+    private func updateVoiceResponseCaption(_ text: String, force: Bool = false) {
+        guard force || voiceResponseCaptionsEnabled else { return }
+        let caption = Self.voiceResponseCaptionText(from: text)
+        guard !caption.isEmpty else { return }
+        externalProxyClearTask?.cancel()
+        externalProxyClearTask = nil
+        showCursorOverlayIfAvailable()
+        cursorOverlayState.externalPrimaryCaptionText = caption
+        cursorOverlayState.externalPrimaryCaptionAccentHex = nil
+    }
+
+    private func clearVoiceResponseCaption() {
+        externalProxyClearTask?.cancel()
+        externalProxyClearTask = nil
+        cursorOverlayState.externalPrimaryCaptionText = nil
+        cursorOverlayState.externalPrimaryCaptionAccentHex = nil
+    }
+
+    private func scheduleVoiceResponseCaptionClear(after delay: TimeInterval = 2.2) {
+        guard voiceResponseCaptionsEnabled else { return }
+        let currentCaption = cursorOverlayState.externalPrimaryCaptionText
+        externalProxyClearTask?.cancel()
+        externalProxyClearTask = Task { [weak self] in
+            let nanoseconds = UInt64(max(0.1, delay) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            await MainActor.run {
+                guard let self, self.cursorOverlayState.externalPrimaryCaptionText == currentCaption else { return }
+                self.clearVoiceResponseCaption()
+            }
+        }
+    }
+
+    private static func voiceResponseCaptionText(from text: String) -> String {
+        let parsed = parsePointingCoordinates(from: text).spokenText
+        let singleLine = parsed
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let maxCharacters = 180
+        guard singleLine.count > maxCharacters else { return singleLine }
+        return String(singleLine.prefix(maxCharacters)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
     private func speakShortSystemResponse(
         _ text: String,
         interruptExisting: Bool = true,
@@ -8279,6 +8362,8 @@ final class CompanionManager: ObservableObject {
                         extra: fields
                     )
                 }
+
+                self.scheduleVoiceResponseCaptionClear()
 
                 if let route {
                     var stageFields = extra
@@ -8324,8 +8409,10 @@ final class CompanionManager: ObservableObject {
                             extra: fields
                         )
                     }
+                    self.clearVoiceResponseCaption()
                     return
                 }
+                self.clearVoiceResponseCaption()
                 speakResponseFailureFallback(error)
                 if let route {
                     var stageFields = extra
@@ -8526,6 +8613,7 @@ final class CompanionManager: ObservableObject {
                         self.currentVoiceResponseRequestID = nil
                         self.currentVoiceResponseCompletionToken = nil
                     }
+                    self.scheduleVoiceResponseCaptionClear()
                     var completionFields = self.voiceResponseExecutionFields()
                     extra.forEach { completionFields[$0.key] = $0.value }
                     self.markRequestCompleted(
@@ -8722,6 +8810,7 @@ final class CompanionManager: ObservableObject {
                                     rawText: displayed,
                                     contextTitle: transcript
                                 )
+                                self.updateVoiceResponseCaption(displayed)
                             }
                         }
 
@@ -8888,6 +8977,7 @@ final class CompanionManager: ObservableObject {
                     rawText: spokenText,
                     contextTitle: transcript
                 )
+                self.updateVoiceResponseCaption(spokenText)
                 self.scheduleWidgetSnapshotPublish()
 
                 // If Haiku just offered to spin up an agent, remember
@@ -10026,6 +10116,29 @@ final class CompanionManager: ObservableObject {
     }
 
     func runSuggestedNextAction(_ actionTitle: String) {
+        runSuggestedNextAction(actionTitle, toAgentSession: codexAgentSession)
+    }
+
+    func runSuggestedNextAction(_ actionTitle: String, forAgentDockItem itemID: UUID) {
+        guard let item = agentDockItems.first(where: { $0.id == itemID }),
+              let sessionID = item.sessionID,
+              let session = codexAgentSessions.first(where: { $0.id == sessionID }) else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "error",
+                event: "openclicky.agent_suggested_action.missing_session",
+                fields: [
+                    "itemID": itemID.uuidString,
+                    "instructionLength": actionTitle.count
+                ]
+            )
+            return
+        }
+
+        runSuggestedNextAction(actionTitle, toAgentSession: session)
+    }
+
+    private func runSuggestedNextAction(_ actionTitle: String, toAgentSession session: CodexAgentSession) {
         let trimmedActionTitle = actionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedActionTitle.isEmpty else { return }
         let timing = beginRequestTiming(source: "agent_suggested_action", text: trimmedActionTitle)
@@ -10037,12 +10150,12 @@ final class CompanionManager: ObservableObject {
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
                 "source": "agent_suggested_action",
-                "sessionID": codexAgentSession.id.uuidString,
-                "title": codexAgentSession.title,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
                 "instructionLength": trimmedActionTitle.count
             ]
         )
-        submitAgentPrompt(trimmedActionTitle, to: codexAgentSession)
+        submitAgentPrompt(trimmedActionTitle, to: session)
         markRequestCompleted(
             route: "agent.followup",
             executionStartedAt: executionStartedAt,
@@ -10052,9 +10165,9 @@ final class CompanionManager: ObservableObject {
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
                 "source": "agent_suggested_action",
-                "sessionID": codexAgentSession.id.uuidString,
-                "title": codexAgentSession.title,
-                "model": codexAgentSession.model
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "model": session.model
             ]
         )
         if isAdvancedModeEnabled {
@@ -10381,7 +10494,7 @@ private struct ClickyTextModeInputView: View {
 
     private var borderColor: Color {
         switch accentTheme {
-        case .amber:
+        case .amber, .white:
             return Color.white.opacity(0.62)
         default:
             return Color.white.opacity(0.26)
@@ -10392,19 +10505,23 @@ private struct ClickyTextModeInputView: View {
         switch accentTheme {
         case .amber:
             return Color(hex: "#211B05")
+        case .white:
+            return Color(hex: "#111827")
         default:
             return Color.white
         }
     }
 
     private var placeholderColor: Color {
-        textColor.opacity(accentTheme == .amber ? 0.66 : 0.72)
+        textColor.opacity((accentTheme == .amber || accentTheme == .white) ? 0.66 : 0.72)
     }
 
     private var controlColor: Color {
         switch accentTheme {
         case .amber:
             return Color(hex: "#3A3006")
+        case .white:
+            return Color(hex: "#1F2937")
         default:
             return Color.white.opacity(0.88)
         }

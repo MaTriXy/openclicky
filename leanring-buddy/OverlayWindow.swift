@@ -301,6 +301,64 @@ struct ExternalProxyBubbleSizePreferenceKey: PreferenceKey {
 
 /// The buddy's behavioral mode. Controls whether it follows the cursor,
 /// is flying toward a detected UI element, or is pointing at an element.
+
+nonisolated enum OpenClickyResponseCaptionFont: String, CaseIterable, Identifiable {
+    case systemRounded
+    case avenirRounded
+    case markerFelt
+    case chalkboard
+    case comicSans
+    case noteworthy
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .systemRounded: return "System Rounded"
+        case .avenirRounded: return "Avenir Rounded"
+        case .markerFelt: return "Marker Felt"
+        case .chalkboard: return "Chalkboard"
+        case .comicSans: return "Comic Sans"
+        case .noteworthy: return "Noteworthy"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .systemRounded: return "Clean default"
+        case .avenirRounded: return "Friendly rounded"
+        case .markerFelt: return "Cartoon marker"
+        case .chalkboard: return "Comic board"
+        case .comicSans: return "Comic book"
+        case .noteworthy: return "Handwritten"
+        }
+    }
+
+    var fontName: String? {
+        switch self {
+        case .systemRounded: return nil
+        case .avenirRounded: return "Avenir Next Rounded"
+        case .markerFelt: return "Marker Felt"
+        case .chalkboard: return "Chalkboard SE"
+        case .comicSans: return "Comic Sans MS"
+        case .noteworthy: return "Noteworthy"
+        }
+    }
+
+    static var fallback: OpenClickyResponseCaptionFont { .systemRounded }
+
+    static func resolved(_ rawValue: String) -> OpenClickyResponseCaptionFont {
+        OpenClickyResponseCaptionFont(rawValue: rawValue) ?? .fallback
+    }
+
+    func swiftUIFont(size: CGFloat, weight: Font.Weight = .semibold) -> Font {
+        if let fontName {
+            return .custom(fontName, size: size).weight(weight)
+        }
+        return .system(size: size, weight: weight, design: .rounded)
+    }
+}
+
 enum BuddyNavigationMode {
     /// Default — buddy follows the mouse cursor with spring animation
     case followingCursor
@@ -323,6 +381,7 @@ struct BlueCursorView: View {
     @ObservedObject var cursorState: CursorOverlayState
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
     @AppStorage(ClickyCursorAvatarSizePreference.userDefaultsKey) private var cursorAvatarSizeScale = ClickyCursorAvatarSizePreference.defaultScale
+    @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionFontDefaultsKey) private var voiceResponseCaptionFontRawValue = OpenClickyResponseCaptionFont.fallback.rawValue
 
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
@@ -445,6 +504,10 @@ struct BlueCursorView: View {
         (ClickyAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor
     }
 
+    private var captionBubbleBackgroundColor: Color { .white }
+    private var captionBubbleTextColor: Color { .black }
+    private var captionBubbleShadowColor: Color { Color.black.opacity(0.22) }
+
     private let navigationPointerPhrases = [
         "right here!",
         "this one!",
@@ -463,13 +526,13 @@ struct BlueCursorView: View {
             if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
                 Text(welcomeText)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white)
+                    .foregroundColor(captionBubbleTextColor)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(overlayCursorColor)
-                            .shadow(color: overlayCursorColor.opacity(0.5), radius: 6, x: 0, y: 0)
+                            .fill(captionBubbleBackgroundColor)
+                            .shadow(color: captionBubbleShadowColor, radius: 6, x: 0, y: 2)
                     )
                     .fixedSize()
                     .overlay(
@@ -493,16 +556,16 @@ struct BlueCursorView: View {
             if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
                 Text(navigationBubbleText)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white)
+                    .foregroundColor(captionBubbleTextColor)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(overlayCursorColor)
+                            .fill(captionBubbleBackgroundColor)
                             .shadow(
-                                color: overlayCursorColor.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
-                                radius: 6 + (1.0 - navigationBubbleScale) * 16,
-                                x: 0, y: 0
+                                color: captionBubbleShadowColor.opacity(0.8 + (1.0 - navigationBubbleScale) * 0.2),
+                                radius: 6 + (1.0 - navigationBubbleScale) * 10,
+                                x: 0, y: 2
                             )
                     )
                     .fixedSize()
@@ -549,15 +612,15 @@ struct BlueCursorView: View {
 
                 Text(agentTaskBubbleText)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white)
+                    .foregroundColor(captionBubbleTextColor)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 5)
                     .background(
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(overlayCursorColor.opacity(0.94))
-                            .shadow(color: overlayCursorColor.opacity(0.48), radius: 8, x: 0, y: 0)
+                            .fill(captionBubbleBackgroundColor)
+                            .shadow(color: captionBubbleShadowColor, radius: 8, x: 0, y: 2)
                     )
                     .frame(maxWidth: 260, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
@@ -778,16 +841,16 @@ struct BlueCursorView: View {
         )
 
         Text(caption)
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.white)
+            .font(OpenClickyResponseCaptionFont.resolved(voiceResponseCaptionFontRawValue).swiftUIFont(size: 11, weight: .semibold))
+            .foregroundColor(captionBubbleTextColor)
             .lineLimit(3)
             .multilineTextAlignment(.leading)
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(color.opacity(0.95))
-                    .shadow(color: color.opacity(0.48), radius: 8, x: 0, y: 0)
+                    .fill(captionBubbleBackgroundColor)
+                    .shadow(color: captionBubbleShadowColor, radius: 8, x: 0, y: 2)
             )
             .frame(maxWidth: 280, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -1030,9 +1093,15 @@ struct BlueCursorView: View {
         let deltaY = endPosition.y - startPosition.y
         let distance = hypot(deltaX, deltaY)
 
-        // Flight duration scales with distance: short hops are quick, long
-        // flights are more dramatic. Clamped to 0.6s–1.4s.
-        let flightDurationSeconds = min(max(distance / 800.0, 0.6), 1.4)
+        // Flight duration scales with distance. Normal pointing flights stay
+        // a little theatrical; agent-start corner handoffs should feel like a
+        // quick tag of the dock corner and come straight back.
+        let flightDurationSeconds: Double
+        if cursorState.detectedElementReturnsImmediately {
+            flightDurationSeconds = min(max(distance / 2200.0, 0.22), 0.42)
+        } else {
+            flightDurationSeconds = min(max(distance / 800.0, 0.6), 1.4)
+        }
         let frameInterval: Double = 1.0 / 60.0
         let totalFrames = Int(flightDurationSeconds / frameInterval)
         var currentFrame = 0
@@ -1093,7 +1162,9 @@ struct BlueCursorView: View {
     }
 
     /// Transitions to pointing mode — shows a speech bubble with a bouncy
-    /// scale-in entrance and variable-speed character streaming.
+    /// scale-in entrance and variable-speed character streaming. Agent-start
+    /// handoffs skip the bubble and return immediately so OpenClicky only
+    /// touches the corner before coming straight back to the cursor.
     private func startPointingAtElement() {
         buddyNavigationMode = .pointingAtTarget
 
@@ -1105,6 +1176,16 @@ struct BlueCursorView: View {
         navigationBubbleOpacity = 1.0
         navigationBubbleSize = .zero
         navigationBubbleScale = 0.5
+
+        if cursorState.detectedElementReturnsImmediately {
+            navigationBubbleOpacity = 0.0
+            navigationBubbleScale = 1.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+                guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                self.startFlyingBackToCursor()
+            }
+            return
+        }
 
         // Use custom bubble text from the companion manager (e.g. onboarding demo)
         // if available, otherwise fall back to a random pointer phrase
@@ -1359,7 +1440,7 @@ private struct ClickyAgentDockStackView: View {
                             stop: { companionManager.stopAgentDockItem(item.id) },
                             dismiss: { companionManager.dismissAgentDockItem(item.id) },
                             runSuggestedAction: { actionTitle in
-                                companionManager.runSuggestedNextAction(actionTitle)
+                                companionManager.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
                             }
                         )
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
@@ -1651,7 +1732,7 @@ private struct ClickyAgentDockItemView: View {
         case .done:
             return "Agent task is done"
         case .failed:
-            return "Agent task needs attention"
+            return "Agent task stopped"
         }
     }
 }
@@ -1736,7 +1817,7 @@ private struct ClickyAgentDockConversationPreview: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(item.accentTheme.cursorColor)
             case .failed:
-                Text("Needs attention.")
+                Text("Stopped.")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textPrimary)
             }

@@ -26,6 +26,7 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
     case mint
     case amber
     case rose
+    case white
 
     static let userDefaultsKey = "clickyAccentTheme"
 
@@ -41,6 +42,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return "Amber"
         case .rose:
             return "Rose"
+        case .white:
+            return "White"
         }
     }
 
@@ -54,6 +57,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return "Amber"
         case .rose:
             return "Red"
+        case .white:
+            return "White"
         }
     }
 
@@ -67,6 +72,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return Color(hex: "#D97706")
         case .rose:
             return Color(hex: "#E11D48")
+        case .white:
+            return Color(hex: "#F8FAFC")
         }
     }
 
@@ -80,6 +87,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return Color(hex: "#B45309")
         case .rose:
             return Color(hex: "#BE123C")
+        case .white:
+            return Color(hex: "#E5E7EB")
         }
     }
 
@@ -93,6 +102,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return Color(hex: "#FBBF24")
         case .rose:
             return Color(hex: "#FB7185")
+        case .white:
+            return Color(hex: "#F8FAFC")
         }
     }
 
@@ -106,6 +117,8 @@ enum ClickyAccentTheme: String, CaseIterable, Identifiable {
             return Color(hex: "#FACC15")
         case .rose:
             return Color(hex: "#FF4F5E")
+        case .white:
+            return Color(hex: "#F8FAFC")
         }
     }
 

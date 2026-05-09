@@ -199,7 +199,7 @@ private struct CodexHUDView: View {
                         companionManager.dismissAgentDockItem(item.id)
                     },
                     runSuggestedAction: { actionTitle in
-                        companionManager.runSuggestedNextAction(actionTitle)
+                        companionManager.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
                     }
                 )
                 .frame(maxWidth: .infinity, alignment: .center)

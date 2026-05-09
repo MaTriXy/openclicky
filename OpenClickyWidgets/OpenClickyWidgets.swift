@@ -66,7 +66,7 @@ struct OpenClickyNeedsAttentionWidget: Widget {
 
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: OpenClickyWidgetProvider()) { entry in
-            OpenClickyWidgetContainer(title: "Needs Attention", deepLink: OpenClickyWidgetDeepLink.logs) {
+            OpenClickyWidgetContainer(title: "Review Items", deepLink: OpenClickyWidgetDeepLink.logs) {
                 OpenClickyNeedsAttentionWidgetView(snapshot: entry.snapshot)
             }
         }
@@ -165,7 +165,7 @@ private struct OpenClickyActiveAgentsWidgetView: View {
         switch status {
         case "Done":
             return .green
-        case "Needs attention":
+        case "Needs review":
             return .red
         case "Running":
             return .cyan
@@ -225,7 +225,7 @@ private struct OpenClickyNeedsAttentionWidgetView: View {
 
     var body: some View {
         if snapshot.needsAttention.isEmpty {
-            EmptyWidgetMessage(text: "Nothing needs attention")
+            EmptyWidgetMessage(text: "Nothing to review")
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(Array(snapshot.needsAttention.prefix(maxRows))) { item in

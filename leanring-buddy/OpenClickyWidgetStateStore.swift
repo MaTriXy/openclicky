@@ -159,7 +159,7 @@ final class OpenClickyWidgetStateStore {
             if case .failed = session.status {
                 items.append(OpenClickyWidgetAttentionItem(
                     kind: .failedAgent,
-                    title: privacy.includesAgentTaskNames ? "\(session.title) needs attention" : "Agent needs attention",
+                    title: privacy.includesAgentTaskNames ? "\(session.title) stopped" : "Agent stopped",
                     detail: privacy.includesAgentTaskNames ? sanitizedSnippet(session.lastErrorMessage, maxLength: 140) : nil,
                     deepLink: OpenClickyWidgetDeepLink.agent(session.id)
                 ))
@@ -228,7 +228,7 @@ final class OpenClickyWidgetStateStore {
         case .done:
             return "Done"
         case .failed:
-            return "Needs attention"
+            return "Needs review"
         }
     }
 
@@ -241,7 +241,7 @@ final class OpenClickyWidgetStateStore {
         case .done:
             return "Agent done"
         case .failed:
-            return "Agent needs attention"
+            return "Agent stopped"
         }
     }
 

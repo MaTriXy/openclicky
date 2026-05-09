@@ -92,13 +92,17 @@ struct OpenClickySettingsView: View {
     @ObservedObject private var session: CodexAgentSession
     @ObservedObject private var nativeComputerUseController: OpenClickyNativeComputerUseController
     @ObservedObject private var backgroundComputerUseController: OpenClickyBackgroundComputerUseController
+    @ObservedObject private var petLibrary = ClickyBuddyPetLibrary.shared
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
+    @AppStorage(ClickyCursorAvatarStyle.userDefaultsKey) private var avatarStyleRawValue = ClickyCursorAvatarStyle.default.storageValue
     @AppStorage(AppBundleConfiguration.userAnthropicAPIKeyDefaultsKey) private var userAnthropicAPIKey = ""
     @AppStorage(AppBundleConfiguration.userElevenLabsAPIKeyDefaultsKey) private var userElevenLabsAPIKey = ""
     @AppStorage(AppBundleConfiguration.userElevenLabsVoiceIDDefaultsKey) private var userElevenLabsVoiceID = ""
     @AppStorage(AppBundleConfiguration.userCartesiaAPIKeyDefaultsKey) private var userCartesiaAPIKey = ""
     @AppStorage(AppBundleConfiguration.userCartesiaVoiceIDDefaultsKey) private var userCartesiaVoiceID = ""
     @AppStorage(AppBundleConfiguration.userDeepgramTTSVoiceDefaultsKey) private var userDeepgramTTSVoice = "aura-2-thalia-en"
+    @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionsEnabledDefaultsKey) private var voiceResponseCaptionsEnabled = false
+    @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionFontDefaultsKey) private var voiceResponseCaptionFontRawValue = OpenClickyResponseCaptionFont.fallback.rawValue
     @AppStorage(AppBundleConfiguration.userCodexAgentAPIKeyDefaultsKey) private var userCodexAgentAPIKey = ""
     @AppStorage(AppBundleConfiguration.userAssemblyAIAPIKeyDefaultsKey) private var userAssemblyAIAPIKey = ""
     @AppStorage(AppBundleConfiguration.userDeepgramAPIKeyDefaultsKey) private var userDeepgramAPIKey = ""
@@ -269,10 +273,31 @@ struct OpenClickySettingsView: View {
                 )
             }
 
-            settingsGroup("Cursor color") {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
-                    ForEach([ClickyAccentTheme.rose, .blue, .amber, .mint]) { accentTheme in
-                        cursorColorButton(accentTheme)
+            settingsGroup("Cursor appearance") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Pick OpenClicky’s cursor buddy and accent color. Pets ignore the color tint, but the accent still drives glows, buttons, and task badges.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
+                        cursorAvatarButton(.triangleFilled, label: "Triangle")
+                        cursorAvatarButton(.triangleOutline, label: "Outline")
+                        ForEach(petLibrary.pets) { pet in
+                            cursorPetButton(pet)
+                        }
+                        if petLibrary.pets.isEmpty {
+                            emptyPetLibraryTile
+                        }
+                    }
+
+                    Divider()
+                        .opacity(0.45)
+
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
+                        ForEach([ClickyAccentTheme.rose, .blue, .amber, .mint, .white]) { accentTheme in
+                            cursorColorButton(accentTheme)
+                        }
                     }
                 }
             }
@@ -336,6 +361,41 @@ struct OpenClickySettingsView: View {
                         set: { userDeepgramAPIKey = $0; companionManager.setDeepgramAPIKey($0) }
                     )
                 )
+            }
+
+            settingsGroup("Response captions") {
+                toggleRow(
+                    title: "Caption every spoken response",
+                    subtitle: "Shows OpenClicky's spoken reply beside the cursor while voice playback runs.",
+                    systemImageName: "captions.bubble",
+                    isOn: $voiceResponseCaptionsEnabled
+                )
+
+                Picker("Caption font", selection: $voiceResponseCaptionFontRawValue) {
+                    ForEach(OpenClickyResponseCaptionFont.allCases) { captionFont in
+                        Text(captionFont.label).tag(captionFont.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                    ForEach(OpenClickyResponseCaptionFont.allCases) { captionFont in
+                        optionButton(
+                            title: captionFont.label,
+                            subtitle: captionFont.subtitle,
+                            isSelected: voiceResponseCaptionFontRawValue == captionFont.rawValue,
+                            action: { voiceResponseCaptionFontRawValue = captionFont.rawValue }
+                        )
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 11)
+
+                actionRow(title: "Test caption playback", systemImageName: "play.circle") {
+                    companionManager.testVoiceResponseCaptionPlayback()
+                }
             }
 
             settingsGroup("Speculative pre-fire") {
@@ -1120,6 +1180,11 @@ struct OpenClickySettingsView: View {
         .buttonStyle(.plain)
     }
 
+
+    private var currentCursorAvatarStyle: ClickyCursorAvatarStyle {
+        ClickyCursorAvatarStyle(storageValue: avatarStyleRawValue)
+    }
+
     private func cursorColorButton(_ accentTheme: ClickyAccentTheme) -> some View {
         let isSelected = selectedAccentThemeID == accentTheme.rawValue
         return Button {
@@ -1151,6 +1216,113 @@ struct OpenClickySettingsView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+
+    private func cursorAvatarButton(_ style: ClickyCursorAvatarStyle, label: String) -> some View {
+        let isSelected = currentCursorAvatarStyle == style
+        let accent = (ClickyAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor
+
+        return Button {
+            avatarStyleRawValue = style.storageValue
+        } label: {
+            VStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(isSelected ? accent.opacity(0.16) : Color.primary.opacity(0.045))
+                        .frame(width: 46, height: 46)
+
+                    switch style {
+                    case .triangleFilled:
+                        Triangle()
+                            .fill(accent)
+                            .frame(width: 19, height: 19)
+                            .rotationEffect(.degrees(-25))
+                            .shadow(color: accent.opacity(0.55), radius: 7)
+                    case .triangleOutline:
+                        Triangle()
+                            .stroke(accent, lineWidth: 2.2)
+                            .frame(width: 19, height: 19)
+                            .rotationEffect(.degrees(-25))
+                    case .pet:
+                        EmptyView()
+                    }
+                }
+
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isSelected ? accent.opacity(0.12) : Color(nsColor: .windowBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(isSelected ? accent.opacity(0.8) : Color.primary.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func cursorPetButton(_ pet: ClickyBuddyPet) -> some View {
+        let style = ClickyCursorAvatarStyle.pet(id: pet.id)
+        let isSelected = currentCursorAvatarStyle == style
+        let accent = (ClickyAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor
+
+        return Button {
+            avatarStyleRawValue = style.storageValue
+        } label: {
+            VStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(isSelected ? accent.opacity(0.16) : Color.primary.opacity(0.045))
+                        .frame(width: 46, height: 46)
+                    ClickyPetThumbnailView(pet: pet)
+                        .frame(width: 34, height: 36)
+                }
+
+                Text(pet.displayName)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isSelected ? accent.opacity(0.12) : Color(nsColor: .windowBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(isSelected ? accent.opacity(0.8) : Color.primary.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(pet.petDescription)
+    }
+
+    private var emptyPetLibraryTile: some View {
+        VStack(spacing: 7) {
+            Image(systemName: "pawprint")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.secondary)
+            Text("No pets")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+        )
     }
 
     private func rowIcon(_ systemImageName: String) -> some View {

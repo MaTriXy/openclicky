@@ -200,7 +200,7 @@ struct ClickyAgentDockHoverCard: View {
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(item.accentTheme.cursorColor)
                 case .failed:
-                    Text("Needs attention.")
+                    Text("Stopped.")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundColor(DS.Colors.textPrimary)
                 }

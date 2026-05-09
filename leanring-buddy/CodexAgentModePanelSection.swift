@@ -355,7 +355,7 @@ struct CodexAgentModePanelSection: View {
 
     private var summaryText: String {
         if visibleInlineErrorMessage != nil {
-            return "Agent needs attention. Open chat for details."
+            return "Agent stopped. Open chat for details."
         }
         return "Ask for coding, research, writing, or app tasks."
     }

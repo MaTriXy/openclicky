@@ -1213,7 +1213,7 @@ struct CompanionPanelView: View {
     }
 
     private var cursorColorThemeOrder: [ClickyAccentTheme] {
-        [.rose, .blue, .amber, .mint]
+        [.rose, .blue, .amber, .mint, .white]
     }
 
     private func cursorColorButton(_ accentTheme: ClickyAccentTheme) -> some View {

@@ -447,7 +447,8 @@ final class ElevenLabsTTSClient {
     fileprivate static func scheduleSamples(
         _ samples: [Int16],
         on player: AVAudioPlayerNode,
-        format: AVAudioFormat
+        format: AVAudioFormat,
+        startPlaybackIfNeeded: Bool = true
     ) -> AVAudioFramePosition {
         guard !samples.isEmpty,
               let buffer = AVAudioPCMBuffer(
@@ -477,7 +478,7 @@ final class ElevenLabsTTSClient {
         // for the full response; if it stopped, the response is over.
         guard engine.isRunning else { return 0 }
         player.scheduleBuffer(buffer, completionHandler: nil)
-        if !player.isPlaying {
+        if startPlaybackIfNeeded && !player.isPlaying {
             player.play()
         }
         return AVAudioFramePosition(buffer.frameLength)
@@ -588,6 +589,13 @@ final class StreamingTTSSession {
     private var scheduledFrameCount: AVAudioFramePosition = 0
     private(set) var isCancelled = false
     private var sentenceCount = 0
+    /// Sentence-by-sentence TTS fetches can complete just-in-time. If
+    /// the first buffer starts immediately, a later sentence that takes
+    /// a few hundred ms longer to synthesize creates an audible gap that
+    /// feels like stutter. Hold a small amount of queued PCM before
+    /// starting normal streamed speech; explicit pre-baked fillers still
+    /// play immediately because they exist to cover latency.
+    private static let minimumBufferedSecondsBeforePlayback: Double = 0.9
     /// Words required before we'll cut on a punctuation+space. Prevents
     /// "Mr." / "Dr." / "U.S." mid-name splits in normal prose.
     private static let minimumWordsPerSentence = 4
@@ -639,6 +647,7 @@ final class StreamingTTSSession {
         }
 
         if let playerNode {
+            maybeStartBufferedPlaybackIfReady(force: true)
             await ElevenLabsTTSClient.waitForPlaybackToDrain(
                 playerNode,
                 scheduledFrameCount: scheduledFrameCount,
@@ -918,18 +927,41 @@ final class StreamingTTSSession {
                 // in flight, in which case scheduling onto a detached
                 // player would crash with `_engine != nil`.
                 guard !self.isCancelled, player.engine != nil else { return }
-                let frames = ElevenLabsTTSClient.scheduleSamples(samples, on: player, format: streamFormat)
+                let frames = ElevenLabsTTSClient.scheduleSamples(
+                    samples,
+                    on: player,
+                    format: streamFormat,
+                    startPlaybackIfNeeded: false
+                )
                 if frames > 0 {
                     self.scheduledFrameCount += frames
                 }
-                if frames > 0 && !self.didFireStartCallback {
-                    self.didFireStartCallback = true
-                    self.onPlaybackStarted()
-                }
+                self.maybeStartBufferedPlaybackIfReady()
             }
             // Do NOT sleep here. AVAudioPlayerNode plays scheduled
             // buffers in the order they were appended, contiguously.
             // The chain is already serialized on `predecessor.value`.
+        }
+    }
+
+    private func maybeStartBufferedPlaybackIfReady(force: Bool = false) {
+        guard let playerNode,
+              !isCancelled,
+              scheduledFrameCount > 0,
+              playerNode.engine?.isRunning == true,
+              !playerNode.isPlaying else {
+            return
+        }
+
+        let bufferedSeconds = Double(scheduledFrameCount) / sampleRate
+        guard force || bufferedSeconds >= Self.minimumBufferedSecondsBeforePlayback else {
+            return
+        }
+
+        playerNode.play()
+        if !didFireStartCallback {
+            didFireStartCallback = true
+            onPlaybackStarted()
         }
     }
 }

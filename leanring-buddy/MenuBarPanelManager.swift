@@ -519,13 +519,13 @@ final class AgentMenuBarStatusManager: NSObject {
             item: item,
             canOpenDashboard: companionManager.isAdvancedModeEnabled,
             chat: { [weak companionManager] in
-                companionManager?.prepareVoiceFollowUpForAgentDockItem(item.id)
+                companionManager?.openAgentDockItem(item.id)
             },
             text: { [weak companionManager] in
                 companionManager?.showTextFollowUpForAgentDockItem(item.id)
             },
             voice: { [weak companionManager] in
-                companionManager?.openAgentDockItem(item.id)
+                companionManager?.prepareVoiceFollowUpForAgentDockItem(item.id)
             },
             close: { [weak popover] in
                 popover?.performClose(nil)
@@ -544,7 +544,7 @@ final class AgentMenuBarStatusManager: NSObject {
             },
             runSuggestedAction: { [weak companionManager, weak popover] actionTitle in
                 popover?.performClose(nil)
-                companionManager?.runSuggestedNextAction(actionTitle)
+                companionManager?.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
             }
         )
         let controller = NSHostingController(rootView: rootView)
@@ -561,7 +561,7 @@ final class AgentMenuBarStatusManager: NSObject {
         case .starting: status = "Starting"
         case .running: status = "Working"
         case .done: status = "Done"
-        case .failed: status = "Needs attention"
+        case .failed: status = "Stopped"
         }
         let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
         return title.isEmpty ? "Agent: \(status)" : "Agent: \(status) — \(title)"
@@ -626,6 +626,7 @@ final class AgentMenuBarStatusManager: NSObject {
         case .mint: return NSColor(calibratedRed: 0.21, green: 0.83, blue: 0.60, alpha: 1)
         case .amber: return NSColor(calibratedRed: 0.98, green: 0.80, blue: 0.08, alpha: 1)
         case .rose: return NSColor(calibratedRed: 1.00, green: 0.31, blue: 0.37, alpha: 1)
+        case .white: return NSColor(calibratedWhite: 0.97, alpha: 1)
         }
     }
 }

@@ -14,6 +14,7 @@ actor OpenClickyAgentFileLeaseCoordinator {
     struct LeaseSummary {
         let claimedPaths: [String]
         let conflicts: [LeaseConflict]
+        let activeClaims: [String]
     }
 
     private struct LeaseRecord {
@@ -27,7 +28,7 @@ actor OpenClickyAgentFileLeaseCoordinator {
 
     func claimPaths(_ paths: [String], for sessionID: UUID, title: String) -> LeaseSummary {
         releaseLeases(for: sessionID)
-        let uniquePaths = Array(Set(paths)).sorted()
+        let uniquePaths = Array(Set(paths.map(Self.normalizedPath))).sorted()
         var claimedPaths: [String] = []
         var conflicts: [LeaseConflict] = []
 
@@ -42,7 +43,11 @@ actor OpenClickyAgentFileLeaseCoordinator {
             claimedPaths.append(path)
         }
 
-        return LeaseSummary(claimedPaths: claimedPaths, conflicts: conflicts)
+        return LeaseSummary(claimedPaths: claimedPaths, conflicts: conflicts, activeClaims: activeClaimLines(excluding: sessionID))
+    }
+
+    func coordinationSnapshot(excluding sessionID: UUID? = nil) -> [String] {
+        activeClaimLines(excluding: sessionID)
     }
 
     func releaseLeases(for sessionID: UUID) {
@@ -52,6 +57,27 @@ actor OpenClickyAgentFileLeaseCoordinator {
                 leasesByPath.removeValue(forKey: path)
             }
         }
+    }
+
+    private func activeClaimLines(excluding sessionID: UUID? = nil) -> [String] {
+        leasesByPath
+            .filter { _, lease in lease.sessionID != sessionID }
+            .map { path, lease in "- \(path) (owned by \(lease.sessionTitle))" }
+            .sorted()
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        let expanded: String
+        if path == "~" {
+            expanded = FileManager.default.homeDirectoryForCurrentUser.path
+        } else if path.hasPrefix("~/") {
+            expanded = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(path.dropFirst(2)))
+                .path
+        } else {
+            expanded = path
+        }
+        return (expanded as NSString).standardizingPath
     }
 }
 
@@ -132,7 +158,7 @@ enum CodexAgentSessionStatus: Equatable {
         case .starting: return "Starting"
         case .ready: return "Ready"
         case .running: return "Running"
-        case .failed: return "Needs attention"
+        case .failed: return "Stopped"
         }
     }
 }
@@ -154,7 +180,7 @@ enum CodexAgentProgressStage: Equatable {
         case .executing: return "Executing"
         case .composing: return "Composing reply"
         case .completed: return "Completed"
-        case .failed: return "Needs attention"
+        case .failed: return "Stopped"
         }
     }
 }
@@ -210,9 +236,9 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         case .failed:
             let errorText = lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let errorText, !errorText.isEmpty {
-                return "\(agentName) needs attention: \(Self.spokenSnippet(from: errorText, maxLength: 110))"
+                return "\(agentName) stopped: \(Self.spokenSnippet(from: errorText, maxLength: 110))"
             }
-            return "\(agentName) needs attention."
+            return "\(agentName) stopped."
         }
     }
 
@@ -678,7 +704,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             status = .failed(text)
             progressStage = .failed
             entries.append(CodexTranscriptEntry(role: .system, text: text))
-            appendActivityStatusLine("Needs attention: \(Self.spokenSnippet(from: text, maxLength: 100))")
+            appendActivityStatusLine("Stopped: \(Self.spokenSnippet(from: text, maxLength: 100))")
         case "account/login/completed":
             if CodexJSON.bool(params["success"]) == true {
                 entries.append(CodexTranscriptEntry(role: .system, text: "Codex ChatGPT sign-in completed. Start the Agent task again."))
@@ -870,36 +896,57 @@ final class CodexAgentSession: ObservableObject, Identifiable {
 
     private func buildAgentCoordinationNote(for prompt: String) async -> String? {
         let mentionedPaths = Self.extractLikelyFilePaths(from: prompt)
-        guard !mentionedPaths.isEmpty else {
+        let leaseSummary: OpenClickyAgentFileLeaseCoordinator.LeaseSummary?
+
+        if mentionedPaths.isEmpty {
             currentLeasePaths = []
             await OpenClickyAgentFileLeaseCoordinator.shared.releaseLeases(for: id)
-            return nil
+            leaseSummary = nil
+        } else {
+            let claimed = await OpenClickyAgentFileLeaseCoordinator.shared.claimPaths(mentionedPaths, for: id, title: title)
+            currentLeasePaths = claimed.claimedPaths
+            leaseSummary = claimed
         }
 
-        let leaseSummary = await OpenClickyAgentFileLeaseCoordinator.shared.claimPaths(mentionedPaths, for: id, title: title)
-        currentLeasePaths = leaseSummary.claimedPaths
+        let activeClaims: [String]
+        if let leaseSummary {
+            activeClaims = leaseSummary.activeClaims
+        } else {
+            activeClaims = await OpenClickyAgentFileLeaseCoordinator.shared.coordinationSnapshot(excluding: id)
+        }
+        let activeClaimsSection = activeClaims.isEmpty
+            ? "  - No explicit file leases are currently registered by other OpenClicky agents."
+            : "  - Files currently claimed by other OpenClicky agents:\n" + activeClaims.joined(separator: "\n")
 
-        let claimedList = leaseSummary.claimedPaths.map { "- \($0)" }.joined(separator: "\n")
-        let conflictList = leaseSummary.conflicts.map { conflict in
-            "- \(conflict.path) (currently held by \(conflict.ownerTitle))"
-        }.joined(separator: "\n")
+        let claimedSection: String
+        if let leaseSummary, !leaseSummary.claimedPaths.isEmpty {
+            claimedSection = "  - Claimed file ownership for this run:\n"
+                + leaseSummary.claimedPaths.map { "- \($0)" }.joined(separator: "\n")
+        } else {
+            claimedSection = "  - This prompt did not name exact files, so no file lease was claimed yet."
+        }
 
-        if leaseSummary.conflicts.isEmpty {
-            return """
-            - Agent file coordination:
-              - Claimed file ownership for this run:
-            \(claimedList)
-              - If scope changes, avoid editing files owned by other running agents.
-            """
+        let conflictSection: String
+        if let leaseSummary, !leaseSummary.conflicts.isEmpty {
+            let conflicts = leaseSummary.conflicts.map { conflict in
+                "- \(conflict.path) (currently held by \(conflict.ownerTitle))"
+            }.joined(separator: "\n")
+            conflictSection = "  - Potential ownership conflicts detected:\n"
+                + conflicts
+                + "\n  - Do not edit conflicting files in this run; choose non-overlapping files or return blocked."
+        } else {
+            conflictSection = "  - If scope changes or exact files become clear, avoid editing files owned by another running agent."
         }
 
         return """
-        - Agent file coordination:
-          - Claimed file ownership for this run:
-        \(claimedList)
-          - Potential ownership conflicts detected:
-        \(conflictList)
-          - Do not edit conflicting files in this run; choose non-overlapping files or return blocked.
+        - OpenClicky agent coordination:
+          - Multiple OpenClicky agents may share the same working directory even though each has its own Codex runtime, process, and thread.
+          - Before editing, run `git status --short` and inspect target files so you preserve uncommitted work from other agents.
+          - Re-read a file immediately before patching it, and never replace whole files or reset changes unless the user explicitly asked for that destructive action.
+          - Prefer small patches that merge with existing edits; if another agent owns or is clearly editing the same file, stop and report the conflict.
+        \(activeClaimsSection)
+        \(claimedSection)
+        \(conflictSection)
         """
     }
 
@@ -1600,6 +1647,15 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             .joined(separator: " ")
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
+        let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:proper|better|concise|short|compact)\s+(?:task\s+)?titles?\b"#, "Task Title Cleanup"),
+            (#"(?i)\btask\s+titles?\b.*\b(?:read(?:ing)?\s+out|raw|asked\s+for|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup")
+        ]
+        for rule in directTitleRules where title.range(of: rule.pattern, options: .regularExpression) != nil {
+            return rule.title
+        }
+
         let fillerPatterns = [
             #"(?i)^hey\s+(?:clicky\s+)?agent[,\s]+"#,
             #"(?i)^clicky\s+agent[,\s]+"#,
@@ -1634,7 +1690,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             options: .regularExpression
         )
         title = title.replacingOccurrences(
-            of: #"(?i)\b(?:the|a|an|this|that|it|them|you|your|then|also|with|from|into|and|or|but|for|of|to|in|on|as|is|are|be)\b"#,
+            of: #"(?i)\b(?:the|a|an|this|that|it|them|you|your|then|also|with|from|into|and|or|but|for|of|to|in|on|as|is|are|be|have|has|had|asked)\b"#,
             with: " ",
             options: .regularExpression
         )

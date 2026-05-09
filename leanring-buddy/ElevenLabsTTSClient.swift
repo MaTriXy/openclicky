@@ -1503,22 +1503,473 @@ extension OpenClickyTTSClient {
     }
 }
 
+// MARK: - OpenAIRealtimeSpeechClient
+
+/// Speaks text through OpenAI's Realtime model over WebSocket. This is
+/// deliberately treated as a playback engine, not as a TTS provider:
+/// when selected, OpenClicky should not also route the same response
+/// through ElevenLabs, Cartesia, or Deepgram.
+@MainActor
+final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
+    nonisolated static let streamSampleRate: Double = 24_000
+    private static let defaultVoiceID = "marin"
+
+    private var apiKey: String?
+    private(set) var voiceID: String
+    var model: String
+    private let session: URLSession
+
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var streamingTask: Task<Void, Error>?
+
+    init(apiKey: String?, model: String, voiceID: String = defaultVoiceID) {
+        self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.model = model
+        self.voiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? Self.defaultVoiceID
+            : voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.session = URLSession(configuration: .default)
+    }
+
+    var isPlaying: Bool {
+        playerNode?.isPlaying == true
+    }
+
+    func updateConfiguration(apiKey: String?, voiceID: String) {
+        self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedVoice = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedVoice.isEmpty {
+            self.voiceID = trimmedVoice
+        }
+    }
+
+    func warmUpConnection() {
+        guard let url = URL(string: "https://api.openai.com/v1/realtime") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        session.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    func speakText(
+        _ text: String,
+        waitUntilFinished: Bool = true,
+        onPlaybackStarted: (() -> Void)? = nil
+    ) async throws {
+        stopPlaybackInternal()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else { return }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        try engine.start()
+        audioEngine = engine
+        playerNode = player
+
+        let task = Task { [weak self, weak player] in
+            guard let self, let player else { throw CancellationError() }
+            let samples = try await self.fetchSentenceSamples(trimmed)
+            try Task.checkCancellation()
+            let scheduledFrameCount = await MainActor.run {
+                ElevenLabsTTSClient.scheduleSamples(samples, on: player, format: streamFormat)
+            }
+            await MainActor.run { onPlaybackStarted?() }
+            await ElevenLabsTTSClient.waitForPlaybackToDrain(
+                player,
+                scheduledFrameCount: scheduledFrameCount,
+                sampleRate: Self.streamSampleRate
+            )
+        }
+        streamingTask = task
+
+        if waitUntilFinished {
+            do { try await task.value }
+            catch {
+                stopPlaybackInternal()
+                throw error
+            }
+            stopPlaybackInternal()
+        }
+    }
+
+    func beginStreamingResponse(onPlaybackStarted: @escaping @MainActor () -> Void) -> StreamingTTSSession {
+        stopPlaybackInternal()
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        do { try engine.start() } catch {
+            print("⚠️ AVAudioEngine failed to start OpenAI Realtime speech session: \(error)")
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        audioEngine = engine
+        playerNode = player
+        return StreamingTTSSession(
+            fetchSamples: { [weak self] text in
+                guard let self else { throw CancellationError() }
+                return try await self.fetchSentenceSamples(text)
+            },
+            playerNode: player,
+            format: streamFormat,
+            sampleRate: Self.streamSampleRate,
+            onPlaybackStarted: onPlaybackStarted
+        )
+    }
+
+
+    func speakResponse(
+        systemPrompt: String,
+        conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
+        userPrompt: String,
+        onTextChunk: @MainActor @Sendable @escaping (String) -> Void,
+        onPlaybackStarted: @escaping @MainActor () -> Void
+    ) async throws -> String {
+        stopPlaybackInternal()
+        guard let apiKey, !apiKey.isEmpty else {
+            throw NSError(
+                domain: "OpenAIRealtimeSpeechClient",
+                code: -1000,
+                userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime response needs a Codex/OpenAI API key in Settings or OPENAI_API_KEY in the launch environment."]
+            )
+        }
+        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
+            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
+        }
+        components.queryItems = [URLQueryItem(name: "model", value: model)]
+        guard let url = components.url else {
+            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
+        }
+
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -3, userInfo: [NSLocalizedDescriptionKey: "Could not build OpenAI Realtime PCM stream format."])
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        try engine.start()
+        audioEngine = engine
+        playerNode = player
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        let webSocket = session.webSocketTask(with: request)
+        webSocket.resume()
+        defer {
+            webSocket.cancel(with: .normalClosure, reason: nil)
+            Task { @MainActor in self.stopPlaybackInternal() }
+        }
+
+        try await waitForRealtimeConnection(on: webSocket)
+        try await sendJSON([
+            "type": "session.update",
+            "session": [
+                "type": "realtime",
+                "model": model,
+                "output_modalities": ["audio"],
+                "audio": [
+                    "output": [
+                        "voice": voiceID,
+                        "format": [
+                            "type": "audio/pcm",
+                            "rate": Int(Self.streamSampleRate)
+                        ]
+                    ]
+                ]
+            ]
+        ], to: webSocket)
+
+        let historyText = conversationHistory.suffix(8).map { entry in
+            "User: \(entry.userPlaceholder)\nOpenClicky: \(entry.assistantResponse)"
+        }.joined(separator: "\n\n")
+        let instructions = [
+            systemPrompt,
+            historyText.isEmpty ? nil : "Recent conversation:\n\(historyText)",
+            "Current user request:\n\(userPrompt)",
+            "Reply out loud as OpenClicky in one concise spoken answer. Do not include markdown. Do not include [POINT:] tags."
+        ].compactMap { $0 }.joined(separator: "\n\n")
+
+        try await sendJSON([
+            "type": "response.create",
+            "response": [
+                "output_modalities": ["audio"],
+                "instructions": instructions
+            ]
+        ], to: webSocket)
+
+        var transcript = ""
+        var scheduledFrameCount: AVAudioFramePosition = 0
+        var didStartPlayback = false
+
+        while true {
+            try Task.checkCancellation()
+            let event = try await receiveRealtimeEvent(from: webSocket)
+            let type = event["type"] as? String ?? ""
+            if (type == "response.output_audio.delta" || type == "response.audio.delta"),
+               let delta = event["delta"] as? String,
+               let chunk = Data(base64Encoded: delta) {
+                let samples = Self.int16Samples(fromLittleEndianPCM: chunk)
+                let frames = await MainActor.run {
+                    ElevenLabsTTSClient.scheduleSamples(samples, on: player, format: streamFormat)
+                }
+                scheduledFrameCount += frames
+                if frames > 0, !didStartPlayback {
+                    didStartPlayback = true
+                    await MainActor.run { onPlaybackStarted() }
+                }
+            } else if (type == "response.output_audio_transcript.delta" || type == "response.audio_transcript.delta"),
+                      let delta = event["delta"] as? String {
+                transcript += delta
+                let snapshot = transcript
+                await MainActor.run { onTextChunk(snapshot) }
+            } else if type == "response.output_audio_transcript.done" || type == "response.audio_transcript.done" {
+                if let doneTranscript = event["transcript"] as? String, !doneTranscript.isEmpty {
+                    transcript = doneTranscript
+                    let snapshot = transcript
+                    await MainActor.run { onTextChunk(snapshot) }
+                }
+            } else if type == "response.done" {
+                if transcript.isEmpty, let extracted = Self.firstTranscriptString(in: event), !extracted.isEmpty {
+                    transcript = extracted
+                    let snapshot = transcript
+                    await MainActor.run { onTextChunk(snapshot) }
+                }
+                break
+            } else if type == "error" {
+                throw realtimeError(from: event)
+            }
+        }
+
+        if scheduledFrameCount > 0 {
+            await ElevenLabsTTSClient.waitForPlaybackToDrain(
+                player,
+                scheduledFrameCount: scheduledFrameCount,
+                sampleRate: Self.streamSampleRate
+            )
+        }
+        return transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func fetchSentenceSamples(_ text: String) async throws -> [Int16] {
+        guard let apiKey, !apiKey.isEmpty else {
+            throw NSError(
+                domain: "OpenAIRealtimeSpeechClient",
+                code: -1000,
+                userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime playback needs a Codex/OpenAI API key in Settings or OPENAI_API_KEY in the launch environment."]
+            )
+        }
+
+        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
+            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
+        }
+        components.queryItems = [URLQueryItem(name: "model", value: model)]
+        guard let url = components.url else {
+            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // GPT Realtime 2 is GA-only. The old beta header makes the server reject
+        // gpt-realtime-2 with "only available on the GA API", so keep this
+        // connection on the GA Realtime WebSocket interface.
+
+        let webSocket = session.webSocketTask(with: request)
+        webSocket.resume()
+        defer { webSocket.cancel(with: .normalClosure, reason: nil) }
+
+        try await waitForRealtimeConnection(on: webSocket)
+
+        try await sendJSON([
+            "type": "session.update",
+            "session": [
+                "type": "realtime",
+                "model": model,
+                "output_modalities": ["audio"],
+                "audio": [
+                    "output": [
+                        "voice": voiceID,
+                        "format": [
+                            "type": "audio/pcm",
+                            "rate": Int(Self.streamSampleRate)
+                        ]
+                    ]
+                ]
+            ]
+        ], to: webSocket)
+
+        try await sendJSON([
+            "type": "response.create",
+            "response": [
+                "conversation": "none",
+                "output_modalities": ["audio"],
+                "instructions": "Speak exactly this text in a natural OpenClicky voice. Do not add, remove, summarize, or preface anything: \(text)"
+            ]
+        ], to: webSocket)
+
+        var bytes = Data()
+        while true {
+            try Task.checkCancellation()
+            let event = try await receiveRealtimeEvent(from: webSocket)
+            let type = event["type"] as? String ?? ""
+            if (type == "response.output_audio.delta" || type == "response.audio.delta"),
+               let delta = event["delta"] as? String,
+               let chunk = Data(base64Encoded: delta) {
+                bytes.append(chunk)
+            } else if type == "response.done" || type == "response.output_audio.done" || type == "response.audio.done" {
+                break
+            } else if type == "error" {
+                throw realtimeError(from: event)
+            }
+        }
+
+        return Self.int16Samples(fromLittleEndianPCM: bytes)
+    }
+
+
+    private static func firstTranscriptString(in value: Any) -> String? {
+        if let string = value as? String { return string }
+        if let dictionary = value as? [String: Any] {
+            for key in ["transcript", "text"] {
+                if let string = dictionary[key] as? String, !string.isEmpty { return string }
+            }
+            for nested in dictionary.values {
+                if let string = firstTranscriptString(in: nested), !string.isEmpty { return string }
+            }
+        }
+        if let array = value as? [Any] {
+            for nested in array {
+                if let string = firstTranscriptString(in: nested), !string.isEmpty { return string }
+            }
+        }
+        return nil
+    }
+
+    func stopPlayback() {
+        stopPlaybackInternal()
+    }
+
+    private func stopPlaybackInternal() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        playerNode?.stop()
+        playerNode = nil
+        audioEngine?.stop()
+        audioEngine = nil
+    }
+
+    private static func makeStreamFormat() -> AVAudioFormat? {
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: streamSampleRate,
+            channels: 1,
+            interleaved: false
+        )
+    }
+
+    private func waitForRealtimeConnection(on webSocket: URLSessionWebSocketTask) async throws {
+        while true {
+            try Task.checkCancellation()
+            let event = try await receiveRealtimeEvent(from: webSocket)
+            let type = event["type"] as? String ?? ""
+            if type == "session.created" || type == "session.updated" {
+                return
+            }
+            if type == "error" {
+                throw realtimeError(from: event)
+            }
+        }
+    }
+
+    private func receiveRealtimeEvent(from webSocket: URLSessionWebSocketTask) async throws -> [String: Any] {
+        while true {
+            let message = try await webSocket.receive()
+            let data: Data
+            switch message {
+            case .data(let messageData):
+                data = messageData
+            case .string(let string):
+                data = Data(string.utf8)
+            @unknown default:
+                continue
+            }
+            if let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return event
+            }
+        }
+    }
+
+    private func sendJSON(_ payload: [String: Any], to webSocket: URLSessionWebSocketTask) async throws {
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        guard let string = String(data: data, encoding: .utf8) else { return }
+        try await webSocket.send(.string(string))
+    }
+
+    private func realtimeError(from event: [String: Any]) -> NSError {
+        let errorPayload = event["error"] as? [String: Any]
+        let message = errorPayload?["message"] as? String ?? "OpenAI Realtime playback failed."
+        return NSError(domain: "OpenAIRealtimeSpeechClient", code: -2, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private static func int16Samples(fromLittleEndianPCM data: Data) -> [Int16] {
+        var samples: [Int16] = []
+        samples.reserveCapacity(data.count / 2)
+        var index = data.startIndex
+        while index + 1 < data.endIndex {
+            let low = UInt16(data[index])
+            let high = UInt16(data[index + 1]) << 8
+            samples.append(Int16(bitPattern: high | low))
+            index += 2
+        }
+        return samples
+    }
+}
+
 // MARK: - OpenClickyTTSProvider
 
 nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
+    case openAIRealtime = "openai_realtime"
     case elevenLabs = "elevenlabs"
     case cartesia = "cartesia"
     case deepgram = "deepgram"
     var id: String { rawValue }
     var displayName: String {
         switch self {
+        case .openAIRealtime: return "GPT Realtime"
         case .elevenLabs: return "ElevenLabs"
         case .cartesia: return "Cartesia"
         case .deepgram: return "Deepgram Aura"
         }
     }
     static func resolve(_ raw: String?) -> OpenClickyTTSProvider {
-        guard let raw, let parsed = OpenClickyTTSProvider(rawValue: raw) else { return .elevenLabs }
+        guard let raw, let parsed = OpenClickyTTSProvider(rawValue: raw) else { return .openAIRealtime }
         return parsed
     }
 }

@@ -28,7 +28,7 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
         case .deepgram:
             return "Deepgram"
         case .openAI:
-            return "OpenAI"
+            return "Whisper"
         }
     }
 
@@ -43,7 +43,7 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
         case .deepgram:
             return "Streaming"
         case .openAI:
-            return "Upload"
+            return "OpenAI listening"
         }
     }
 }

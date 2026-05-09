@@ -324,10 +324,36 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
-    /// Currently selected TTS provider. Persisted to UserDefaults under
-    /// `openClickyTTSProvider`. Default ElevenLabs.
-    @Published var selectedTTSProvider: OpenClickyTTSProvider =
-        OpenClickyTTSProvider.resolve(AppBundleConfiguration.ttsProviderRaw())
+    private lazy var openAIRealtimeSpeechClient: OpenAIRealtimeSpeechClient = {
+        return OpenAIRealtimeSpeechClient(
+            apiKey: AppBundleConfiguration.openAIAPIKey(),
+            model: selectedSpeechModel,
+            voiceID: AppBundleConfiguration.openAIRealtimeVoiceID()
+        )
+    }()
+
+    /// Currently selected playback engine. Persisted to UserDefaults under
+    /// `openClickyTTSProvider` for compatibility with earlier builds.
+    @Published var selectedTTSProvider: OpenClickyTTSProvider = {
+        let migrationKey = "openClickyRealtimeSpeechPlaybackMigrationV1"
+        let explicitSpeechModel = UserDefaults.standard.string(forKey: "openClickySpeechModel")
+        let rawPlaybackEngine = UserDefaults.standard.string(forKey: AppBundleConfiguration.userTTSProviderDefaultsKey)
+        if explicitSpeechModel != nil,
+           rawPlaybackEngine != OpenClickyTTSProvider.openAIRealtime.rawValue,
+           !UserDefaults.standard.bool(forKey: migrationKey) {
+            UserDefaults.standard.set(OpenClickyTTSProvider.openAIRealtime.rawValue, forKey: AppBundleConfiguration.userTTSProviderDefaultsKey)
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            return .openAIRealtime
+        }
+        return OpenClickyTTSProvider.resolve(AppBundleConfiguration.ttsProviderRaw())
+    }()
+
+    /// Realtime speech/audio model selection. This is deliberately separate
+    /// from `selectedModel`, which chooses the text reasoning model for
+    /// OpenClicky's spoken replies.
+    @Published var selectedSpeechModel: String = OpenClickyModelCatalog.speechModel(
+        withID: UserDefaults.standard.string(forKey: "openClickySpeechModel")
+    ).id
 
     /// Active TTS client for the current provider. All voice playback
     /// paths route through this — voice response, completion narration,
@@ -335,6 +361,7 @@ final class CompanionManager: ObservableObject {
     /// Settings takes effect on the next utterance.
     var voiceTTSClient: any OpenClickyTTSClient {
         switch selectedTTSProvider {
+        case .openAIRealtime: return openAIRealtimeSpeechClient
         case .elevenLabs: return elevenLabsTTSClient
         case .cartesia:   return cartesiaTTSClient
         case .deepgram:   return deepgramTTSClient
@@ -346,6 +373,7 @@ final class CompanionManager: ObservableObject {
     /// that actually handled the audio (not a hardcoded "ElevenLabs").
     private var activeTTSControllerName: String {
         switch selectedTTSProvider {
+        case .openAIRealtime: return "OpenAIRealtimeSpeechClient"
         case .elevenLabs: return "ElevenLabsTTSClient"
         case .cartesia:   return "CartesiaTTSClient"
         case .deepgram:   return "DeepgramTTSClient"
@@ -354,6 +382,7 @@ final class CompanionManager: ObservableObject {
 
     private var activeTTSExecutionMethodSpeakText: String {
         switch selectedTTSProvider {
+        case .openAIRealtime: return "OpenAIRealtimeSpeechClient.speakText"
         case .elevenLabs: return "ElevenLabsTTSClient.speakText"
         case .cartesia:   return "CartesiaTTSClient.speakText"
         case .deepgram:   return "DeepgramTTSClient.speakText"
@@ -362,6 +391,7 @@ final class CompanionManager: ObservableObject {
 
     private var activeTTSExecutionMethodBeginStreaming: String {
         switch selectedTTSProvider {
+        case .openAIRealtime: return "OpenAIRealtimeSpeechClient.beginStreamingResponse"
         case .elevenLabs: return "ElevenLabsTTSClient.beginStreamingResponse"
         case .cartesia:   return "CartesiaTTSClient.beginStreamingResponse"
         case .deepgram:   return "DeepgramTTSClient.beginStreamingResponse"
@@ -397,6 +427,34 @@ final class CompanionManager: ObservableObject {
             UserDefaults.standard.set(provider.rawValue, forKey: AppBundleConfiguration.userTTSProviderDefaultsKey)
             self.voiceTTSClient.warmUpConnection()
             FillerPhraseLibrary.shared.prepare(client: self.voiceTTSClient)
+        }
+    }
+
+    func setSelectedSpeechModel(_ model: String) {
+        let resolvedModel = OpenClickyModelCatalog.speechModel(withID: model).id
+        guard selectedSpeechModel != resolvedModel else {
+            setTTSProvider(.openAIRealtime)
+            return
+        }
+        selectedSpeechModel = resolvedModel
+        openAIRealtimeSpeechClient.model = resolvedModel
+        UserDefaults.standard.set(resolvedModel, forKey: "openClickySpeechModel")
+        setTTSProvider(.openAIRealtime)
+    }
+
+    func setOpenAIRealtimeVoiceID(_ voiceID: String) {
+        let trimmed = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: AppBundleConfiguration.userOpenAIRealtimeVoiceIDDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: AppBundleConfiguration.userOpenAIRealtimeVoiceIDDefaultsKey)
+        }
+        openAIRealtimeSpeechClient.updateConfiguration(
+            apiKey: AppBundleConfiguration.openAIAPIKey(),
+            voiceID: AppBundleConfiguration.openAIRealtimeVoiceID()
+        )
+        if selectedTTSProvider == .openAIRealtime {
+            FillerPhraseLibrary.shared.prepare(client: openAIRealtimeSpeechClient)
         }
     }
 
@@ -691,6 +749,20 @@ final class CompanionManager: ObservableObject {
         let resolvedModel = selectedVoiceResponseModel.id
         selectedModel = resolvedModel
         UserDefaults.standard.set(resolvedModel, forKey: "selectedVoiceResponseModel")
+
+        if OpenClickyModelCatalog.isSpeechModelID(resolvedModel) {
+            selectedSpeechModel = resolvedModel
+            openAIRealtimeSpeechClient.model = resolvedModel
+            UserDefaults.standard.set(resolvedModel, forKey: "openClickySpeechModel")
+            setTTSProvider(.openAIRealtime)
+            openAIRealtimeSpeechClient.warmUpConnection()
+            return
+        }
+
+        if selectedTTSProvider == .openAIRealtime {
+            setTTSProvider(.cartesia)
+        }
+
         applyVoiceResponseModelSettings(selectedVoiceResponseModel)
         switch selectedVoiceResponseModel.provider {
         case .anthropic:
@@ -948,6 +1020,10 @@ final class CompanionManager: ObservableObject {
     func setCodexAgentAPIKey(_ apiKey: String) {
         persistOptionalSecret(apiKey, defaultsKey: AppBundleConfiguration.userCodexAgentAPIKeyDefaultsKey)
         openAIAPI.setAPIKey(AppBundleConfiguration.openAIAPIKey())
+        openAIRealtimeSpeechClient.updateConfiguration(
+            apiKey: AppBundleConfiguration.openAIAPIKey(),
+            voiceID: openAIRealtimeSpeechClient.voiceID
+        )
         codexAgentSessions.forEach { $0.stop(reason: "api_key_reconfigured") }
     }
 
@@ -1051,6 +1127,13 @@ final class CompanionManager: ObservableObject {
             if AppBundleConfiguration.anthropicAPIKey() != nil {
                 _ = claudeAPI
             }
+        case .openAI where OpenClickyModelCatalog.isSpeechModelID(selectedVoiceResponseModel.id):
+            selectedSpeechModel = selectedVoiceResponseModel.id
+            openAIRealtimeSpeechClient.model = selectedVoiceResponseModel.id
+            selectedTTSProvider = .openAIRealtime
+            UserDefaults.standard.set(OpenClickyTTSProvider.openAIRealtime.rawValue, forKey: AppBundleConfiguration.userTTSProviderDefaultsKey)
+            UserDefaults.standard.set(selectedVoiceResponseModel.id, forKey: "openClickySpeechModel")
+            openAIRealtimeSpeechClient.warmUpConnection()
         case .openAI, .codex:
             codexVoiceSession.model = selectedVoiceResponseModel.id
             if selectedVoiceResponseModel.provider == .codex || AppBundleConfiguration.openAIAPIKey() == nil {
@@ -2031,7 +2114,11 @@ final class CompanionManager: ObservableObject {
             "executor": "voice_response",
             "model": selectedVoiceResponseModel.id,
             "modelProvider": selectedVoiceResponseModel.provider.rawValue,
-            "maxOutputTokens": selectedVoiceResponseModel.maxOutputTokens
+            "maxOutputTokens": selectedVoiceResponseModel.maxOutputTokens,
+            "playbackEngine": selectedTTSProvider.rawValue,
+            "playbackController": activeTTSControllerName,
+            "speechModel": selectedSpeechModel,
+            "speechVoice": openAIRealtimeSpeechClient.voiceID
         ]
 
         switch selectedVoiceResponseModel.provider {
@@ -2055,7 +2142,14 @@ final class CompanionManager: ObservableObject {
                 fields["streamingMethod"] = "claude_agent_sdk_query"
             }
         case .openAI:
-            if AppBundleConfiguration.openAIAPIKey() != nil {
+            if OpenClickyModelCatalog.isSpeechModelID(selectedVoiceResponseModel.id) {
+                fields["executionMethod"] = "OpenAIRealtimeSpeechClient.speakResponse"
+                fields["authMode"] = "openai_api_key_primary"
+                fields["transport"] = "realtime_websocket"
+                fields["streamingMethod"] = "response.output_audio.delta"
+                fields["playbackEngine"] = OpenClickyTTSProvider.openAIRealtime.rawValue
+                fields["speechModel"] = selectedVoiceResponseModel.id
+            } else if AppBundleConfiguration.openAIAPIKey() != nil {
                 fields["executionMethod"] = "OpenAIAPI.analyzeImageStreaming"
                 fields["authMode"] = "openai_api_key_primary"
                 fields["transport"] = "responses_api_sse"
@@ -8679,6 +8773,89 @@ final class CompanionManager: ObservableObject {
                     userPromptForClaude = "\(transcript)\n\nNo screenshot is available. Answer from the transcript only and use [POINT:none]."
                 } else {
                     userPromptForClaude = transcript
+                }
+
+                if OpenClickyModelCatalog.isSpeechModelID(self.selectedModel) {
+                    let realtimeStartedAt = Date()
+                    var didMarkRealtimeAudioStarted = false
+                    let realtimeText = try await self.openAIRealtimeSpeechClient.speakResponse(
+                        systemPrompt: currentVoiceResponseSystemPrompt(),
+                        conversationHistory: historyForAPI,
+                        userPrompt: userPromptForClaude,
+                        onTextChunk: { accumulatedText in
+                            let trimmed = accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            self.latestVoiceResponseCard = ClickyResponseCard(
+                                source: .voice,
+                                rawText: trimmed,
+                                contextTitle: transcript
+                            )
+                            self.updateVoiceResponseCaption(trimmed)
+                        },
+                        onPlaybackStarted: {
+                            guard !didMarkRealtimeAudioStarted else { return }
+                            didMarkRealtimeAudioStarted = true
+                            self.voiceState = .responding
+                            self.markRequestStageCompleted(
+                                route: "voice.response",
+                                stage: "tts_audio_started",
+                                stageStartedAt: realtimeStartedAt,
+                                timing: timing,
+                                extra: [
+                                    "executor": "realtime_voice",
+                                    "executionMethod": "OpenAIRealtimeSpeechClient.speakResponse",
+                                    "controller": "OpenAIRealtimeSpeechClient",
+                                    "speechModel": self.selectedModel,
+                                    "speechVoice": self.openAIRealtimeSpeechClient.voiceID
+                                ]
+                            )
+                        }
+                    )
+                    let spokenText = realtimeText.isEmpty ? "Done." : realtimeText
+                    self.markRequestStageCompleted(
+                        route: "voice.response",
+                        stage: "model_response",
+                        stageStartedAt: realtimeStartedAt,
+                        timing: timing,
+                        extra: {
+                            var fields = self.voiceResponseExecutionFields()
+                            fields["responseLength"] = spokenText.count
+                            fields["imageCount"] = labeledImages.count
+                            fields["realtimeResponseModelOverride"] = true
+                            return fields
+                        }()
+                    )
+
+                    self.conversationHistory.append((
+                        userTranscript: transcript,
+                        assistantResponse: spokenText
+                    ))
+                    if self.conversationHistory.count > 10 {
+                        self.conversationHistory.removeFirst(self.conversationHistory.count - 10)
+                    }
+                    do {
+                        try codexHomeManager.appendPersistentMemoryEvent(
+                            userRequest: transcript,
+                            agentResponse: spokenText
+                        )
+                    } catch {
+                        print("⚠️ OpenClicky memory update failed: \(error)")
+                    }
+                    ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                    self.latestVoiceResponseCard = ClickyResponseCard(
+                        source: .voice,
+                        rawText: spokenText,
+                        contextTitle: transcript
+                    )
+                    self.updateVoiceResponseCaption(spokenText)
+                    self.scheduleWidgetSnapshotPublish()
+                    self.pendingAgentOfferInstruction = nil
+                    self.pendingAgentOfferAt = nil
+                    await completeRequest(extra: [
+                        "audioPlaybackState": "finished",
+                        "realtimeResponseModelOverride": true
+                    ])
+                    return
                 }
 
                 // Only use a pre-response filler when it is buying real

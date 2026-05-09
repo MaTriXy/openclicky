@@ -503,8 +503,8 @@ struct CodexAgentModeSettingsSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     settingsSection(
-                        title: "Voice response model",
-                        subtitle: "Used for spoken OpenClicky replies. Claude can use local Claude Code sign-in when no Anthropic key is set."
+                        title: "Response reasoning model",
+                        subtitle: "Chooses the text model behind OpenClicky's spoken replies. Realtime speech models live in Voice settings."
                     ) {
                         modelOptionGrid(
                             options: OpenClickyModelCatalog.voiceResponseModels,

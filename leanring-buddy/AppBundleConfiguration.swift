@@ -13,6 +13,7 @@ nonisolated enum AppBundleConfiguration {
     static let userElevenLabsVoiceIDDefaultsKey = "openClickyElevenLabsVoiceID"
     static let userCartesiaAPIKeyDefaultsKey = "openClickyCartesiaAPIKey"
     static let userCartesiaVoiceIDDefaultsKey = "openClickyCartesiaVoiceID"
+    static let userOpenAIRealtimeVoiceIDDefaultsKey = "openClickyOpenAIRealtimeVoiceID"
     /// Deepgram TTS reuses the existing Deepgram STT API key
     /// (`userDeepgramAPIKeyDefaultsKey`). Only the voice/model is
     /// TTS-specific.
@@ -126,9 +127,20 @@ nonisolated enum AppBundleConfiguration {
         ?? "a0e99841-438c-4a64-b679-ae501e7d6091"
     }
 
-    /// Selected TTS provider — "elevenlabs" (default), "cartesia", or "deepgram".
+    /// OpenAI Realtime output voice. Realtime supports the built-in voice
+    /// names directly; Settings stores the selected name here.
+    static func openAIRealtimeVoiceID() -> String {
+        userDefaultsValue(forKey: userOpenAIRealtimeVoiceIDDefaultsKey) ?? stringValue(
+            forKey: "OpenAIRealtimeVoiceID",
+            environmentKeys: ["OPENAI_REALTIME_VOICE_ID"]
+        ) ?? localDevelopmentEnvironmentValue(forKey: "OPENAI_REALTIME_VOICE_ID")
+        ?? "marin"
+    }
+
+    /// Selected playback engine — "openai_realtime" (default), "elevenlabs",
+    /// "cartesia", or "deepgram".
     static func ttsProviderRaw() -> String {
-        userDefaultsValue(forKey: userTTSProviderDefaultsKey) ?? "elevenlabs"
+        userDefaultsValue(forKey: userTTSProviderDefaultsKey) ?? "openai_realtime"
     }
 
     /// Deepgram TTS voice/model identifier. Defaults to Aura 2 Thalia

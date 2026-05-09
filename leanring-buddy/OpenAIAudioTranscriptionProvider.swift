@@ -19,9 +19,9 @@ struct OpenAIAudioTranscriptionProviderError: LocalizedError {
 final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
     private let apiKey = AppBundleConfiguration.openAIAPIKey()
     private let modelName = AppBundleConfiguration.stringValue(forKey: "OpenAITranscriptionModel")
-        ?? "gpt-4o-transcribe"
+        ?? "whisper-1"
 
-    let displayName = "OpenAI"
+    let displayName = "Whisper"
     let requiresSpeechRecognitionPermission = false
 
     var isConfigured: Bool {
@@ -30,7 +30,7 @@ final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
 
     var unavailableExplanation: String? {
         guard !isConfigured else { return nil }
-        return "OpenAI transcription is not configured. Add a Codex/OpenAI key."
+        return "Whisper transcription is not configured. Add a Codex/OpenAI key."
     }
 
     func startStreamingSession(
@@ -41,7 +41,7 @@ final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
     ) async throws -> any BuddyStreamingTranscriptionSession {
         guard let apiKey else {
             throw OpenAIAudioTranscriptionProviderError(
-                message: unavailableExplanation ?? "OpenAI transcription is not configured."
+                message: unavailableExplanation ?? "Whisper transcription is not configured."
             )
         }
 
@@ -191,14 +191,14 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OpenAIAudioTranscriptionProviderError(
-                message: "OpenAI transcription returned an invalid response."
+                message: "Whisper transcription returned an invalid response."
             )
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let responseText = String(data: responseData, encoding: .utf8) ?? "Unknown error"
             throw OpenAIAudioTranscriptionProviderError(
-                message: "OpenAI transcription failed: \(responseText)"
+                message: "Whisper transcription failed: \(responseText)"
             )
         }
 
@@ -217,7 +217,7 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
         }
 
         throw OpenAIAudioTranscriptionProviderError(
-            message: "OpenAI transcription returned an empty transcript."
+            message: "Whisper transcription returned an empty transcript."
         )
     }
 

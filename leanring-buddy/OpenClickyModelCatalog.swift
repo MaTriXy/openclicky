@@ -31,6 +31,7 @@ nonisolated enum OpenClickyModelCatalog {
     /// hears you, decides whether to delegate, narrates progress.
     /// Haiku 4.5 has ~150-250ms TTFT vs ~400-600ms for Sonnet.
     static let defaultVoiceResponseModelID = "claude-haiku-4-5"
+    static let defaultSpeechModelID = "gpt-realtime-2"
     /// Heavier model used when the voice responder delegates a coding/agent task.
     /// Coding work goes here; the voice path stays on the fast model.
     static let defaultDelegationModelID = "claude-sonnet-4-6"
@@ -59,6 +60,17 @@ nonisolated enum OpenClickyModelCatalog {
         OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 1_200)
     ]
 
+    static let speechModels: [OpenClickyModelOption] = [
+        // Realtime models are speech-to-speech response models. When one
+        // is selected as the response voice model, it owns both the spoken
+        // reply generation and the audio playback path instead of chaining
+        // a separate text model into TTS.
+        OpenClickyModelOption(id: "gpt-realtime-2", label: "GPT Realtime 2", provider: .openAI, maxOutputTokens: 1_200),
+        OpenClickyModelOption(id: "gpt-realtime-1.5", label: "GPT Realtime 1.5", provider: .openAI, maxOutputTokens: 1_200)
+    ]
+
+    static let responseVoiceModels: [OpenClickyModelOption] = speechModels + voiceResponseModels
+
     static let computerUseModels: [OpenClickyModelOption] = [
         OpenClickyModelOption(id: "claude-sonnet-4-6", label: "Claude Sonnet", provider: .anthropic, maxOutputTokens: 64_000),
         OpenClickyModelOption(id: "claude-opus-4-6", label: "Claude Opus", provider: .anthropic, maxOutputTokens: 128_000),
@@ -78,7 +90,18 @@ nonisolated enum OpenClickyModelCatalog {
     ]
 
     static func voiceResponseModel(withID modelID: String) -> OpenClickyModelOption {
-        voiceResponseModels.first { $0.id == modelID } ?? voiceResponseModels[0]
+        responseVoiceModels.first { $0.id == modelID } ?? voiceResponseModels[0]
+    }
+
+    static func isSpeechModelID(_ modelID: String) -> Bool {
+        speechModels.contains { $0.id == modelID }
+    }
+
+    static func speechModel(withID modelID: String?) -> OpenClickyModelOption {
+        if let modelID, let match = speechModels.first(where: { $0.id == modelID }) {
+            return match
+        }
+        return speechModels.first { $0.id == defaultSpeechModelID } ?? speechModels[0]
     }
 
     static func computerUseModel(withID modelID: String) -> OpenClickyModelOption {

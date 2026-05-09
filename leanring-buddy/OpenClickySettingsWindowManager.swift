@@ -100,6 +100,7 @@ struct OpenClickySettingsView: View {
     @AppStorage(AppBundleConfiguration.userElevenLabsVoiceIDDefaultsKey) private var userElevenLabsVoiceID = ""
     @AppStorage(AppBundleConfiguration.userCartesiaAPIKeyDefaultsKey) private var userCartesiaAPIKey = ""
     @AppStorage(AppBundleConfiguration.userCartesiaVoiceIDDefaultsKey) private var userCartesiaVoiceID = ""
+    @AppStorage(AppBundleConfiguration.userOpenAIRealtimeVoiceIDDefaultsKey) private var userOpenAIRealtimeVoiceID = "marin"
     @AppStorage(AppBundleConfiguration.userDeepgramTTSVoiceDefaultsKey) private var userDeepgramTTSVoice = "aura-2-thalia-en"
     @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionsEnabledDefaultsKey) private var voiceResponseCaptionsEnabled = false
     @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionFontDefaultsKey) private var voiceResponseCaptionFontRawValue = OpenClickyResponseCaptionFont.fallback.rawValue
@@ -113,6 +114,10 @@ struct OpenClickySettingsView: View {
     @State private var selectedSection: OpenClickySettingsSection = .general
     @State private var gogCLIStatus = OpenClickyGogCLIStatus.unknown
     @State private var isRefreshingGogCLIStatus = false
+    private static let openAIRealtimeVoiceIDs = [
+        "marin", "cedar", "alloy", "ash", "ballad",
+        "coral", "echo", "sage", "shimmer", "verse"
+    ]
 
     init(companionManager: CompanionManager) {
         self.companionManager = companionManager
@@ -306,15 +311,52 @@ struct OpenClickySettingsView: View {
 
     private var voicePanel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsGroup("Voice response model") {
+            settingsGroup("Response voice model") {
+                Text("Pick GPT Realtime for the live voice path, or a normal text model when OpenClicky should generate text first and speak it with a separate playback engine.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 modelOptionGrid(
-                    options: OpenClickyModelCatalog.voiceResponseModels,
+                    options: OpenClickyModelCatalog.responseVoiceModels,
                     selectedModelID: companionManager.selectedModel,
                     select: { companionManager.setSelectedModel($0) }
                 )
+
+                if OpenClickyModelCatalog.isSpeechModelID(companionManager.selectedModel) {
+                    Picker("Realtime voice", selection: Binding(
+                        get: {
+                            userOpenAIRealtimeVoiceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? "marin"
+                                : userOpenAIRealtimeVoiceID
+                        },
+                        set: {
+                            userOpenAIRealtimeVoiceID = $0
+                            companionManager.setOpenAIRealtimeVoiceID($0)
+                        }
+                    )) {
+                        ForEach(Self.openAIRealtimeVoiceIDs, id: \.self) { voiceID in
+                            Text(voiceID.capitalized).tag(voiceID)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+
+                    secureFieldRow(
+                        title: "Codex/OpenAI API key",
+                        subtitle: "Used by the selected GPT Realtime response voice model.",
+                        systemImageName: "key",
+                        placeholder: "OpenAI key",
+                        text: Binding(
+                            get: { userCodexAgentAPIKey },
+                            set: { userCodexAgentAPIKey = $0; companionManager.setCodexAgentAPIKey($0) }
+                        )
+                    )
+                }
             }
 
-            settingsGroup("Transcription") {
+            settingsGroup("Listening / transcription") {
                 valueRow(
                     title: "Current provider",
                     subtitle: companionManager.buddyDictationManager.transcriptionProviderDisplayName,
@@ -341,7 +383,7 @@ struct OpenClickySettingsView: View {
                 }
 
                 secureFieldRow(
-                    title: "AssemblyAI API key",
+                    title: "AssemblyAI listening key",
                     subtitle: "Used by the AssemblyAI streaming transcription provider.",
                     systemImageName: "key",
                     placeholder: "AssemblyAI key",
@@ -352,7 +394,7 @@ struct OpenClickySettingsView: View {
                 )
 
                 secureFieldRow(
-                    title: "Deepgram API key",
+                    title: "Deepgram listening key",
                     subtitle: "Used by the Deepgram streaming transcription provider.",
                     systemImageName: "key",
                     placeholder: "Deepgram key",
@@ -411,18 +453,29 @@ struct OpenClickySettingsView: View {
             }
 
             settingsGroup("Playback") {
-                Picker("TTS provider", selection: Binding(
-                    get: { companionManager.selectedTTSProvider },
-                    set: { companionManager.setTTSProvider($0) }
-                )) {
-                    ForEach(OpenClickyTTSProvider.allCases) { provider in
-                        Text(provider.displayName).tag(provider)
+                Text(OpenClickyModelCatalog.isSpeechModelID(companionManager.selectedModel)
+                    ? "GPT Realtime is selected as the response voice model, so it owns playback for voice replies."
+                    : "Choose the separate TTS provider used when a normal text model generates OpenClicky's reply.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !OpenClickyModelCatalog.isSpeechModelID(companionManager.selectedModel) {
+                    Picker("Playback engine", selection: Binding(
+                        get: { companionManager.selectedTTSProvider },
+                        set: { companionManager.setTTSProvider($0) }
+                    )) {
+                        ForEach(OpenClickyTTSProvider.allCases.filter { $0 != .openAIRealtime }) { provider in
+                            Text(provider.displayName).tag(provider)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 4)
                 }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 4)
 
                 switch companionManager.selectedTTSProvider {
+                case .openAIRealtime:
+                    EmptyView()
                 case .elevenLabs:
                     secureFieldRow(
                         title: "ElevenLabs API key",

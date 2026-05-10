@@ -330,6 +330,12 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
+    private lazy var microsoftEdgeTTSClient: MicrosoftEdgeTTSClient = {
+        return MicrosoftEdgeTTSClient(
+            voiceID: AppBundleConfiguration.microsoftEdgeVoiceID()
+        )
+    }()
+
     private lazy var openAIRealtimeSpeechClient: OpenAIRealtimeSpeechClient = {
         return OpenAIRealtimeSpeechClient(
             apiKey: AppBundleConfiguration.openAIAPIKey(),
@@ -371,6 +377,7 @@ final class CompanionManager: ObservableObject {
         case .elevenLabs: return elevenLabsTTSClient
         case .cartesia:   return cartesiaTTSClient
         case .deepgram:   return deepgramTTSClient
+        case .microsoftEdge: return microsoftEdgeTTSClient
         }
     }
 
@@ -383,6 +390,7 @@ final class CompanionManager: ObservableObject {
         case .elevenLabs: return "ElevenLabsTTSClient"
         case .cartesia:   return "CartesiaTTSClient"
         case .deepgram:   return "DeepgramTTSClient"
+        case .microsoftEdge: return "MicrosoftEdgeTTSClient"
         }
     }
 
@@ -392,6 +400,7 @@ final class CompanionManager: ObservableObject {
         case .elevenLabs: return "ElevenLabsTTSClient.speakText"
         case .cartesia:   return "CartesiaTTSClient.speakText"
         case .deepgram:   return "DeepgramTTSClient.speakText"
+        case .microsoftEdge: return "MicrosoftEdgeTTSClient.speakText"
         }
     }
 
@@ -401,6 +410,7 @@ final class CompanionManager: ObservableObject {
         case .elevenLabs: return "ElevenLabsTTSClient.beginStreamingResponse"
         case .cartesia:   return "CartesiaTTSClient.beginStreamingResponse"
         case .deepgram:   return "DeepgramTTSClient.beginStreamingResponse"
+        case .microsoftEdge: return "MicrosoftEdgeTTSClient.beginStreamingResponse"
         }
     }
 
@@ -417,6 +427,22 @@ final class CompanionManager: ObservableObject {
         )
         if selectedTTSProvider == .deepgram {
             FillerPhraseLibrary.shared.prepare(client: deepgramTTSClient)
+        }
+    }
+
+    func setMicrosoftEdgeVoiceID(_ voiceID: String) {
+        let trimmed = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: AppBundleConfiguration.userMicrosoftEdgeVoiceIDDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: AppBundleConfiguration.userMicrosoftEdgeVoiceIDDefaultsKey)
+        }
+        microsoftEdgeTTSClient.updateConfiguration(
+            apiKey: nil,
+            voiceID: AppBundleConfiguration.microsoftEdgeVoiceID()
+        )
+        if selectedTTSProvider == .microsoftEdge {
+            FillerPhraseLibrary.shared.prepare(client: microsoftEdgeTTSClient)
         }
     }
 
@@ -500,6 +526,98 @@ final class CompanionManager: ObservableObject {
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
+    private var compactedVoiceConversationArchive: String?
+    private static let activeVoiceConversationHistoryLimit = 8
+    private static let compactedVoiceConversationArchiveCharacterLimit = 2_400
+
+    private func rememberVoiceExchange(userTranscript: String, assistantResponse: String, reason: String) {
+        let trimmedUserTranscript = userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAssistantResponse = assistantResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUserTranscript.isEmpty, !trimmedAssistantResponse.isEmpty else { return }
+
+        conversationHistory.append((
+            userTranscript: trimmedUserTranscript,
+            assistantResponse: trimmedAssistantResponse
+        ))
+        compactVoiceConversationHistoryIfNeeded(reason: reason)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "voice.conversation_history.updated",
+            fields: [
+                "reason": reason,
+                "historyCount": conversationHistory.count,
+                "archiveSummaryLength": compactedVoiceConversationArchive?.count ?? 0,
+                "userTranscriptLength": trimmedUserTranscript.count,
+                "assistantResponseLength": trimmedAssistantResponse.count
+            ]
+        )
+    }
+
+    private func voiceConversationHistoryForAPI() -> [(userPlaceholder: String, assistantResponse: String)] {
+        var history: [(userPlaceholder: String, assistantResponse: String)] = []
+        if let compactedVoiceConversationArchive,
+           !compactedVoiceConversationArchive.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            history.append((
+                userPlaceholder: "[earlier OpenClicky voice context]",
+                assistantResponse: compactedVoiceConversationArchive
+            ))
+        }
+        history.append(contentsOf: conversationHistory.map { entry in
+            (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+        })
+        return history
+    }
+
+    private func compactVoiceConversationHistoryIfNeeded(reason: String) {
+        let activeLimit = Self.activeVoiceConversationHistoryLimit
+        guard conversationHistory.count > activeLimit else { return }
+
+        let archiveCount = conversationHistory.count - activeLimit
+        let archivedEntries = Array(conversationHistory.prefix(archiveCount))
+        conversationHistory.removeFirst(archiveCount)
+
+        let archiveChunk = archivedEntries.map { entry in
+            "User: \(Self.voiceArchiveSnippet(entry.userTranscript))\nOpenClicky: \(Self.voiceArchiveSnippet(entry.assistantResponse))"
+        }.joined(separator: "\n")
+
+        let mergedArchive: String
+        if let existing = compactedVoiceConversationArchive,
+           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            mergedArchive = existing + "\n" + archiveChunk
+        } else {
+            mergedArchive = archiveChunk
+        }
+        compactedVoiceConversationArchive = Self.trailingCharacters(
+            of: mergedArchive,
+            limit: Self.compactedVoiceConversationArchiveCharacterLimit
+        )
+
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "voice.conversation_history.compacted",
+            fields: [
+                "reason": reason,
+                "archivedExchangeCount": archivedEntries.count,
+                "activeHistoryCount": conversationHistory.count,
+                "archiveSummaryLength": compactedVoiceConversationArchive?.count ?? 0
+            ]
+        )
+    }
+
+    private static func voiceArchiveSnippet(_ text: String, limit: Int = 220) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    private static func trailingCharacters(of text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return "…\n" + String(text.suffix(limit))
+    }
 
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
@@ -512,6 +630,7 @@ final class CompanionManager: ObservableObject {
     // the response card and logs.
     private var pendingAgentVoiceFollowUpSessionID: UUID?
     private var pendingAgentVoiceFollowUpCreatedAt: Date?
+    private var pendingAgentVoiceFollowUpSource: String?
     /// Set when Haiku's last response offered to spin up an agent
     /// ("want me to spin up an agent to X?"). On the next transcript,
     /// a confirmation ("yes", "okay then", "sure") spawns an agent with
@@ -524,6 +643,7 @@ final class CompanionManager: ObservableObject {
     /// Most recent voice transcript that fell through to the voice
     /// responder. Used as the candidate task when Haiku offers an agent.
     private var lastVoiceUserTranscript: String?
+    private static let pendingAgentVoiceFollowUpTTL: TimeInterval = 90
     private static let pendingAgentOfferTTL: TimeInterval = 90
     private static let deferredLiveAgentRoutePartialTTL: TimeInterval = 20
 
@@ -575,6 +695,9 @@ final class CompanionManager: ObservableObject {
     private var lastAgentContextSessionID: UUID?
     private var announcedAgentFileURLs: Set<String> = []
     private var pendingSystemAnnouncementTask: Task<Void, Never>?
+    private var pendingSystemAnnouncementSessionID: UUID?
+    private var speakingSystemAnnouncementSessionID: UUID?
+    private var silencedAgentSpeechSessionIDs: Set<UUID> = []
     private var liveHandledComputerUseFingerprints: Set<String> = []
     private var lastAgentProgressNarrationAt: Date?
     /// The phrase last spoken for each running agent session, keyed by
@@ -714,6 +837,11 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(position.rawValue, forKey: AgentParkingPosition.userDefaultsKey)
         // Re-park the dock immediately if it's already on screen so the
         // user sees the change without having to spawn a new agent.
+        showAgentDockWindowNearCurrentScreenIfShowing()
+    }
+
+    func setAgentParkingCalibrationOffset(_ offset: CGSize, for position: AgentParkingPosition) {
+        AgentParkingPosition.setCalibrationOffset(offset, for: position)
         showAgentDockWindowNearCurrentScreenIfShowing()
     }
 
@@ -1930,6 +2058,7 @@ final class CompanionManager: ObservableObject {
         if pendingAgentVoiceFollowUpSessionID == sessionID {
             pendingAgentVoiceFollowUpSessionID = nil
             pendingAgentVoiceFollowUpCreatedAt = nil
+            pendingAgentVoiceFollowUpSource = nil
         }
         if lastAgentContextSessionID == sessionID {
             lastAgentContextSessionID = nil
@@ -2289,9 +2418,7 @@ final class CompanionManager: ObservableObject {
         latestVoiceResponseCard = nil
 
         let startedAt = Date()
-        let historyForAPI = conversationHistory.map { entry in
-            (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-        }
+        let historyForAPI = voiceConversationHistoryForAPI()
         OpenClickyMessageLogStore.shared.append(
             lane: "voice",
             direction: "internal",
@@ -2301,7 +2428,8 @@ final class CompanionManager: ObservableObject {
                 "speechModel": selectedModel,
                 "speechVoice": openAIRealtimeSpeechClient.voiceID,
                 "inputPath": "realtime_input_audio_buffer",
-                "bypassesWhisper": true
+                "bypassesWhisper": true,
+                "historyCount": historyForAPI.count
             ]
         )
 
@@ -2367,23 +2495,28 @@ final class CompanionManager: ObservableObject {
         realtimeBidirectionalVoiceTask = Task { [weak self] in
             do {
                 guard let self else { return }
-                let result = try await self.openAIRealtimeSpeechClient.finishBidirectionalVoiceTurn()
-                let routedByApp = false
+                let result = try await self.openAIRealtimeSpeechClient.finishBidirectionalVoiceTurn(
+                    routeUserTranscriptBeforeAssistantResponse: { [weak self] transcript in
+                        guard let self else { return false }
+                        return self.routeCompletedRealtimeVoiceTranscriptIfNeeded(transcript)
+                    }
+                )
                 let assistantText = result.assistantTranscript.isEmpty
                     ? (result.didCreateAssistantResponse ? "Done." : "Routed to OpenClicky.")
                     : result.assistantTranscript
                 let userTranscript = result.userTranscript.isEmpty ? "Realtime voice input" : result.userTranscript
+                var wasRoutedByApp = result.wasRoutedByClient
 
                 await MainActor.run {
                     self.lastTranscript = userTranscript
+                    let routedByApp = wasRoutedByApp || self.routeCompletedRealtimeVoiceTranscriptIfNeeded(userTranscript)
+                    wasRoutedByApp = routedByApp
                     if !routedByApp {
-                        self.conversationHistory.append((
+                        self.rememberVoiceExchange(
                             userTranscript: userTranscript,
-                            assistantResponse: assistantText
-                        ))
-                        if self.conversationHistory.count > 10 {
-                            self.conversationHistory.removeFirst(self.conversationHistory.count - 10)
-                        }
+                            assistantResponse: assistantText,
+                            reason: "realtime_bidirectional"
+                        )
                         self.latestVoiceResponseCard = ClickyResponseCard(
                             source: .voice,
                             rawText: assistantText,
@@ -2405,6 +2538,7 @@ final class CompanionManager: ObservableObject {
                             "inputPath": "realtime_input_audio_buffer",
                             "bypassesWhisper": true,
                             "routedByApp": routedByApp,
+                            "appRouteChecked": true,
                             "createdRealtimeAssistantResponse": result.didCreateAssistantResponse,
                             "userTranscriptLength": result.userTranscript.count,
                             "assistantTranscriptLength": result.assistantTranscript.count,
@@ -2414,7 +2548,7 @@ final class CompanionManager: ObservableObject {
                     )
                 }
 
-                if result.didCreateAssistantResponse {
+                if result.didCreateAssistantResponse && !result.userTranscript.isEmpty && !wasRoutedByApp {
                     do {
                         try self.codexHomeManager.appendPersistentMemoryEvent(
                             userRequest: userTranscript,
@@ -2433,6 +2567,60 @@ final class CompanionManager: ObservableObject {
         }
         realtimeBidirectionalVoiceCaptureStartedAt = nil
         return true
+    }
+
+    private func routeCompletedRealtimeVoiceTranscriptIfNeeded(_ transcript: String) -> Bool {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty,
+              trimmedTranscript != "Realtime voice input" else {
+            return false
+        }
+
+        let requestTiming = beginRequestTiming(source: "realtime_voice_final_transcript", text: trimmedTranscript)
+        activeRequestTiming = requestTiming
+        defer {
+            activeRequestTiming = nil
+            clearDeferredLiveAgentRoutePartial()
+        }
+
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "incoming",
+            event: "voice.transcript",
+            fields: [
+                "text": trimmedTranscript,
+                "inputPath": "realtime_input_audio_buffer",
+                "requestID": requestTiming.requestID
+            ]
+        )
+
+        if routeFinalVoiceTranscriptActionIfNeeded(
+            trimmedTranscript,
+            source: "realtime_voice",
+            selectionSource: "realtime_voice_final_transcript",
+            directComputerUseSource: "realtime_final_transcript",
+            includeQuickLocalResponses: true
+        ) {
+            return true
+        }
+
+        if Self.shouldAttachScreenContext(to: trimmedTranscript) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice",
+                direction: "internal",
+                event: "voice.realtime_bidirectional.visual_route_recovered",
+                fields: [
+                    "transcript": trimmedTranscript,
+                    "executor": "voice_response",
+                    "route": "voice.response",
+                    "requestID": requestTiming.requestID
+                ]
+            )
+            sendTranscriptToClaudeWithScreenshot(transcript: trimmedTranscript)
+            return true
+        }
+
+        return false
     }
 
     private func handleBidirectionalRealtimeVoiceFailure(_ error: Error, source: String, stage: String) {
@@ -4116,6 +4304,10 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    func showQuickTextInputFromMenuBar() {
+        showTextModeInputAtCursor()
+    }
+
     private func showTextModeInputAtCursor() {
         guard allPermissionsGranted else { return }
         guard !buddyDictationManager.isKeyboardShortcutSessionActiveOrFinalizing else { return }
@@ -4186,12 +4378,49 @@ final class CompanionManager: ObservableObject {
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty else { return false }
         guard let sessionID = pendingAgentVoiceFollowUpSessionID else { return false }
-        // The user explicitly pressed a dock/HUD Voice follow-up button, so
-        // the next utterance belongs to that agent even if it sounds like a
-        // normal local OpenClicky command such as “open Clicky.” Keep this
-        // ahead of new-task, direct computer-use, and quick local routing.
+        let pendingSource = pendingAgentVoiceFollowUpSource ?? "pending_voice_followup"
+        if let createdAt = pendingAgentVoiceFollowUpCreatedAt,
+           Date().timeIntervalSince(createdAt) > Self.pendingAgentVoiceFollowUpTTL {
+            pendingAgentVoiceFollowUpSessionID = nil
+            pendingAgentVoiceFollowUpCreatedAt = nil
+            pendingAgentVoiceFollowUpSource = nil
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "internal",
+                event: "openclicky.agent_followup.voice_target_expired",
+                fields: [
+                    "source": pendingSource,
+                    "sessionID": sessionID.uuidString,
+                    "ageMs": Int(Date().timeIntervalSince(createdAt) * 1000)
+                ]
+            )
+            return false
+        }
+        if Self.isProbablyIncompleteAgentVoiceFollowUp(trimmedTranscript) {
+            let timing = activeRequestTiming
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "outgoing",
+                event: "openclicky.agent_followup.deferred_incomplete_voice",
+                fields: [
+                    "source": pendingSource,
+                    "sessionID": sessionID.uuidString,
+                    "requestID": timing?.requestID ?? "",
+                    "instructionLength": trimmedTranscript.count,
+                    "instructionPreview": String(trimmedTranscript.prefix(120))
+                ]
+            )
+            speakShortSystemResponse("i only caught part of that. try the agent follow-up again.")
+            return true
+        }
+        // The user explicitly targeted an agent from the dock/HUD — either by
+        // opening its overlay or pressing Voice — so the next utterance belongs
+        // to that agent even if it sounds like a normal local OpenClicky
+        // command such as “open Clicky.” Keep this ahead of new-task, direct
+        // computer-use, and quick local routing.
         pendingAgentVoiceFollowUpSessionID = nil
         pendingAgentVoiceFollowUpCreatedAt = nil
+        pendingAgentVoiceFollowUpSource = nil
         let timing = activeRequestTiming
         let executionStartedAt = markRequestExecutionStarted(
             route: "agent.followup",
@@ -4200,7 +4429,7 @@ final class CompanionManager: ObservableObject {
                 "executor": "agent_mode",
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
-                "source": "pending_voice_followup",
+                "source": pendingSource,
                 "sessionID": sessionID.uuidString,
                 "instructionLength": trimmedTranscript.count
             ]
@@ -4217,7 +4446,7 @@ final class CompanionManager: ObservableObject {
                     "executor": "agent_mode",
                     "executionMethod": "CodexAgentSession.lookup",
                     "controller": "CompanionManager",
-                    "source": "pending_voice_followup",
+                    "source": pendingSource,
                     "sessionID": sessionID.uuidString,
                     "error": "Missing agent session"
                 ]
@@ -4236,7 +4465,7 @@ final class CompanionManager: ObservableObject {
                 "executor": "agent_mode",
                 "executionMethod": "CodexAgentSession.submitPromptFromUI",
                 "controller": "CodexAgentSession",
-                "source": "pending_voice_followup",
+                "source": pendingSource,
                 "sessionID": sessionID.uuidString,
                 "title": session.title,
                 "model": session.model
@@ -4244,6 +4473,83 @@ final class CompanionManager: ObservableObject {
         )
         speakShortSystemResponse("sent that to \(session.spokenAgentName).")
         return true
+    }
+
+    private static func isProbablyIncompleteAgentVoiceFollowUp(_ transcript: String) -> Bool {
+        let normalized = transcript
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?- "))
+
+        guard !normalized.isEmpty else { return true }
+
+        let danglingSuffixes = [
+            "where the agent",
+            "where the agents",
+            "when the agent",
+            "when the agents",
+            "that the agent",
+            "that the agents",
+            "because the agent",
+            "because the agents",
+            "where it",
+            "when it",
+            "because it",
+            "so it",
+            "and it",
+            "but it",
+            "where",
+            "when",
+            "because",
+            "that",
+            "so",
+            "and",
+            "but"
+        ]
+        if danglingSuffixes.contains(where: { normalized.hasSuffix($0) }) {
+            return true
+        }
+
+        let trailingFunctionWords: Set<String> = [
+            "the", "a", "an", "to", "for", "with", "of", "in", "on", "at", "from",
+            "by", "as", "into", "about", "around", "through", "over", "under"
+        ]
+        if let lastWord = normalized.split(separator: " ").last,
+           trailingFunctionWords.contains(String(lastWord)) {
+            return true
+        }
+
+        if isMostlySpokenTimestampOrLogNoise(normalized) {
+            return true
+        }
+
+        return false
+    }
+
+    private static func isMostlySpokenTimestampOrLogNoise(_ normalizedTranscript: String) -> Bool {
+        let words = normalizedTranscript.split(separator: " ").map(String.init)
+        guard words.count >= 5 else { return false }
+
+        let timestampTokens: Set<String> = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "oh", "o", "t", "z", "am", "pm"
+        ]
+        let timestampTokenCount = words.filter { timestampTokens.contains($0) }.count
+        let timestampTokenRatio = Double(timestampTokenCount) / Double(words.count)
+
+        let hasSpokenDateShape = normalizedTranscript.contains("zero five one zero")
+            || normalizedTranscript.contains("zero two six")
+            || normalizedTranscript.contains("two zero two six")
+            || normalizedTranscript.contains("t one four")
+            || normalizedTranscript.contains("t fourteen")
+
+        let usefulWorkPattern = #"\b(?:fix|change|update|add|remove|make|create|build|open|show|find|review|test|run|check|look|inspect|capture|move|point|write|send)\b"#
+        let hasUsefulWorkVerb = normalizedTranscript.range(of: usefulWorkPattern, options: .regularExpression) != nil
+
+        return hasSpokenDateShape
+            && timestampTokenRatio >= 0.35
+            && !hasUsefulWorkVerb
     }
 
     private func submitContextualAgentFollowUp(_ transcript: String, source: String) -> Bool {
@@ -4511,7 +4817,10 @@ final class CompanionManager: ObservableObject {
             "sure thing", "go", "go ahead", "go for it", "do it",
             "do that", "let's do it", "lets do it", "let's go",
             "spin it up", "spin one up", "fire it up", "fine", "please do",
-            "please", "absolutely", "definitely"
+            "please", "absolutely", "definitely",
+            "can you do that", "could you do that", "would you do that",
+            "can you do it", "could you do it", "would you do it",
+            "please do that", "please do it"
         ]
         return affirmatives.contains(normalized)
     }
@@ -4680,9 +4989,7 @@ final class CompanionManager: ObservableObject {
             }
 
             let history = await MainActor.run {
-                self.conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
+                self.voiceConversationHistoryForAPI()
             }
 
             let voiceSystemPrompt = await MainActor.run { self.currentVoiceResponseSystemPrompt() }
@@ -4918,13 +5225,11 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                self.conversationHistory.append((
+                self.rememberVoiceExchange(
                     userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-                if self.conversationHistory.count > 10 {
-                    self.conversationHistory.removeFirst(self.conversationHistory.count - 10)
-                }
+                    assistantResponse: spokenText,
+                    reason: "speculative_commit"
+                )
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
                 self.latestVoiceResponseCard = ClickyResponseCard(
@@ -5084,6 +5389,7 @@ final class CompanionManager: ObservableObject {
 
         pendingAgentVoiceFollowUpSessionID = nil
         pendingAgentVoiceFollowUpCreatedAt = nil
+        pendingAgentVoiceFollowUpSource = nil
         lastAgentContextSessionID = nil
 
         OpenClickyMessageLogStore.shared.append(
@@ -5201,6 +5507,7 @@ final class CompanionManager: ObservableObject {
         if pendingAgentVoiceFollowUpSessionID == sessionID {
             pendingAgentVoiceFollowUpSessionID = nil
             pendingAgentVoiceFollowUpCreatedAt = nil
+            pendingAgentVoiceFollowUpSource = nil
         }
         if lastAgentContextSessionID == sessionID {
             lastAgentContextSessionID = nil
@@ -5274,7 +5581,26 @@ final class CompanionManager: ObservableObject {
             return true
         }
 
-        let instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
+        var instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
+        if Self.isReferentialAgentInstruction(instruction),
+           let pendingInstruction = pendingAgentOfferInstruction,
+           let offeredAt = pendingAgentOfferAt,
+           Date().timeIntervalSince(offeredAt) <= Self.pendingAgentOfferTTL {
+            instruction = pendingInstruction
+            pendingAgentOfferInstruction = nil
+            pendingAgentOfferAt = nil
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "incoming",
+                event: "openclicky.agent_task.referential_instruction_resolved",
+                fields: [
+                    "transcript": transcript,
+                    "explicitInstruction": explicitInstruction,
+                    "resolvedInstruction": instruction,
+                    "requestID": activeRequestTiming?.requestID ?? "none"
+                ]
+            )
+        }
         if let typeRequest = Self.nativeTypeRequest(from: instruction) {
             typeTextUsingSelectedComputerUse(typeRequest)
             return true
@@ -6046,6 +6372,26 @@ final class CompanionManager: ObservableObject {
             .trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
     }
 
+    private static func isReferentialAgentInstruction(_ instruction: String) -> Bool {
+        let normalized = normalizedSpokenCommandText(instruction)
+        guard !normalized.isEmpty else { return false }
+
+        let referentialInstructions: Set<String> = [
+            "that",
+            "it",
+            "this",
+            "do that",
+            "do it",
+            "do this",
+            "that one",
+            "the thing",
+            "the task",
+            "the previous thing",
+            "the previous task"
+        ]
+        return referentialInstructions.contains(normalized)
+    }
+
     static func agentTaskCreationInstruction(from transcript: String) -> String? {
         let candidate = normalizedCommandCandidate(from: transcript)
         guard !candidate.isEmpty else { return nil }
@@ -6348,7 +6694,7 @@ final class CompanionManager: ObservableObject {
     private static func localAppOpenRequest(from transcript: String) -> OpenClickyAppOpenRequest? {
         let trimmedTranscript = normalizedCommandCandidate(from: transcript)
         guard !trimmedTranscript.isEmpty else { return nil }
-        guard !isAgentRoutingCandidate(trimmedTranscript) else { return nil }
+        guard !isExplicitAgentRoutingCandidate(trimmedTranscript) else { return nil }
 
         let pattern = #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:(?:ask|tell)\s+(?:an?\s+|the\s+)?agent\s+to\s+)?(?:open|launch|start|switch\s+to)\s+(?:up\s+)?(.+?)(?:\s+for\s+me)?[\.\!\?]*\s*$"#
         if let regex = try? NSRegularExpression(pattern: pattern),
@@ -6384,7 +6730,7 @@ final class CompanionManager: ObservableObject {
     private static func bareLocalAppOpenRequest(fromNormalizedCandidate candidate: String) -> OpenClickyAppOpenRequest? {
         let rawTarget = candidate.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t.,:;!?-"))
         guard !rawTarget.isEmpty,
-              !isAgentRoutingCandidate(rawTarget),
+              !isExplicitAgentRoutingCandidate(rawTarget),
               !isReservedAgentOpenTarget(rawTarget),
               !isLikelyFileOrFolderOpenTarget(rawTarget),
               !isLikelyWebOpenTarget(rawTarget) else {
@@ -6804,6 +7150,11 @@ final class CompanionManager: ObservableObject {
     }
 
     private static func isAgentRoutingCandidate(_ transcript: String) -> Bool {
+        isExplicitAgentRoutingCandidate(transcript)
+            || implicitAgentTaskInstruction(from: transcript) != nil
+    }
+
+    private static func isExplicitAgentRoutingCandidate(_ transcript: String) -> Bool {
         explicitNewTaskInstruction(from: transcript) != nil
             || isIncompleteExplicitNewTaskRequest(from: transcript)
             || agentTaskCreationInstruction(from: transcript) != nil
@@ -6811,7 +7162,6 @@ final class CompanionManager: ObservableObject {
             || clickyAgentInstruction(from: transcript) != nil
             || permissiveAgentInstruction(from: transcript) != nil
             || isReferentialAgentWorkFollowUp(transcript)
-            || implicitAgentTaskInstruction(from: transcript) != nil
     }
 
     private static func implicitAgentTaskInstruction(from transcript: String) -> String? {
@@ -7505,6 +7855,11 @@ final class CompanionManager: ObservableObject {
             rawText: acknowledgement,
             contextTitle: "OpenClicky Agent"
         )
+        rememberVoiceExchange(
+            userTranscript: instruction,
+            assistantResponse: acknowledgement,
+            reason: "agent_start"
+        )
 
         // Spawn the dock representation while the live OpenClicky buddy makes
         // a short handoff flight to the corner and then returns to the user's
@@ -7708,9 +8063,18 @@ final class CompanionManager: ObservableObject {
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
         let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:whole|full)\s+(?:task\s+)?names?\b"#, "Task Status Wording"),
+            (#"(?i)\bshort\s+(?:version|task\s+name|name)\b"#, "Task Status Wording"),
+            (#"(?i)\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b.*\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b.*\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:short|compact)\s+(?:version|label|title|name)\b"#, "Task Title Cleanup"),
             (#"(?i)\b(?:proper|better|concise|short|compact)\s+(?:task\s+)?titles?\b"#, "Task Title Cleanup"),
             (#"(?i)\btask\s+titles?\b.*\b(?:read(?:ing)?\s+out|raw|asked\s+for|request)\b"#, "Task Title Cleanup"),
-            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup")
+            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:titles?|task\s+titles?)\b.*\b(?:out\s+of\s+order|wrong\s+order|scrambl(?:ed|ing)|jumbled)\b"#, "Task Title Ordering"),
+            (#"(?i)\b(?:out\s+of\s+order|wrong\s+order|scrambl(?:ed|ing)|jumbled)\b.*\b(?:titles?|task\s+titles?)\b"#, "Task Title Ordering"),
+            (#"(?i)\b(?:titles?|task\s+titles?)\b.*\b(?:mix(?:ed|ing)?|backwards?|forwards?|flip(?:ping)?|jump(?:ing)?|changing)\b"#, "Task Title Stability"),
+            (#"(?i)\b(?:mix(?:ed|ing)?|backwards?|forwards?|flip(?:ping)?|jump(?:ing)?|changing)\b.*\b(?:titles?|task\s+titles?)\b"#, "Task Title Stability")
         ]
         for rule in directTitleRules where title.range(of: rule.pattern, options: .regularExpression) != nil {
             return rule.title
@@ -7755,7 +8119,7 @@ final class CompanionManager: ObservableObject {
             options: .regularExpression
         )
         title = title.replacingOccurrences(
-            of: #"(?i)\b(?:words?|thing|stuff|phrases?|responses?)\b"#,
+            of: #"(?i)\b(?:find|out|why|when|sure|use|uses?|using|start|starts|started|starting|speak|speaks|speaking|say|says|saying|read|reads|reading|whole|full|long|name|version|words?|thing|stuff|phrases?|responses?)\b"#,
             with: " ",
             options: .regularExpression
         )
@@ -7815,11 +8179,13 @@ final class CompanionManager: ObservableObject {
         guard let itemIndex = agentDockItems.lastIndex(where: { $0.sessionID == sessionID }) else { return }
         let session = codexAgentSessions.first(where: { $0.id == sessionID })
         let activitySummary = session?.latestActivitySummary
+        let activityDisplaySummary = session?.latestActivityDisplaySummary ?? activitySummary
         let completionSpeechSummary = Self.completionSpeechSummary(for: session, fallback: activitySummary)
         let stageLabel = session?.progressStage.label ?? (status == .starting ? "Starting" : "Working")
         let suggestedNextActions = session?.latestResponseCard?.suggestedNextActions ?? []
         let activityStatusLines = Self.agentDockActivityStatusLines(for: session, fallback: activitySummary)
-        let displayActivity = activityStatusLines.last ?? activitySummary
+        let responseDisplaySummary = Self.agentDockResponseDisplaySummary(for: session)
+        let displayActivity = responseDisplaySummary ?? activityDisplaySummary ?? activityStatusLines.last ?? activitySummary
         let trimmedActivitySummary = displayActivity?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasActivitySummary = trimmedActivitySummary?.isEmpty == false
 
@@ -7837,40 +8203,43 @@ final class CompanionManager: ObservableObject {
             // generic "An agent is getting ready." placeholder. When neither
             // is present, leave caption nil so the view can render its own
             // streaming "thinking" affordance.
-            if let activitySummary, hasActivitySummary {
-                agentDockItems[itemIndex].caption = activitySummary
+            if let displayActivity, hasActivitySummary {
+                agentDockItems[itemIndex].caption = displayActivity
             }
         case .running:
             agentDockItems[itemIndex].status = .running
             // Same rationale as .starting — never replace the caption with
             // "An agent is working on this." Leave nil to surface the
             // animated thinking indicator until real tokens stream in.
-            if let activitySummary, hasActivitySummary {
-                agentDockItems[itemIndex].caption = activitySummary
+            if let displayActivity, hasActivitySummary {
+                agentDockItems[itemIndex].caption = displayActivity
             }
         case .ready:
             // Codex briefly reports `.ready` after thread startup and before
             // the actual turn starts. Do not turn that preflight ready state
             // into "done"; it caused "the red agent is done" followed by
             // "working" while the task had not begun yet.
-            guard let activitySummary, !activitySummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let isCompletedTurn = session?.progressStage == .completed || responseDisplaySummary != nil
+            guard isCompletedTurn || (activitySummary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) else {
                 // Preflight ready with nothing to report: leave caption alone
                 // so the acknowledgement / streaming affordance stays visible.
                 return
             }
-            if agentDockItems[itemIndex].status == .running || agentDockItems[itemIndex].status == .starting {
+            if agentDockItems[itemIndex].status == .running
+                || agentDockItems[itemIndex].status == .starting
+                || (agentDockItems[itemIndex].status == .failed && isCompletedTurn) {
                 agentDockItems[itemIndex].status = .done
-                agentDockItems[itemIndex].caption = "The agent has completed the task — \(activitySummary)"
+                agentDockItems[itemIndex].caption = "The agent has completed the task — \(displayActivity ?? activitySummary ?? "open the agent for details")"
                 agentDockItems[itemIndex].progressStageLabel = "Completed"
-                agentDockItems[itemIndex].progressStepText = activitySummary
+                agentDockItems[itemIndex].progressStepText = displayActivity ?? activitySummary
             }
             completeAgentRequestTimingIfNeeded(sessionID: sessionID, status: "success")
             announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "success", summary: completionSpeechSummary)
         case .failed:
             agentDockItems[itemIndex].status = .failed
-            agentDockItems[itemIndex].caption = activitySummary ?? "The agent stopped. Open the agent for details."
+            agentDockItems[itemIndex].caption = activityDisplaySummary ?? "The agent stopped. Open the agent for details."
             agentDockItems[itemIndex].progressStageLabel = "Stopped"
-            agentDockItems[itemIndex].progressStepText = activitySummary
+            agentDockItems[itemIndex].progressStepText = activityDisplaySummary ?? activitySummary
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
                 status: "failed",
@@ -7883,11 +8252,19 @@ final class CompanionManager: ObservableObject {
             if session?.status != .stopped {
                 break
             }
+            let stopReason = session?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasExplicitStopReason = stopReason?.isEmpty == false
             if agentDockItems[itemIndex].status == .starting,
-               session?.hasVisibleActivity == false {
+               !hasExplicitStopReason {
+                // New sessions publish their initial `.stopped` value once
+                // the Combine observer is attached. That delivery can arrive
+                // after the prompt has been queued, so `hasVisibleActivity`
+                // is already true even though the agent has not actually
+                // stopped. Do not convert that preflight value into an
+                // immediate cancellation; wait for `.starting` / `.running`,
+                // or for an explicit stop reason from a real stop action.
                 break
             }
-            let stopReason = session?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines)
             let normalizedStopReason = stopReason?.isEmpty == false ? (stopReason ?? "") : "session_stopped"
             agentDockItems[itemIndex].status = .failed
             if let summary = activitySummary,
@@ -7935,6 +8312,21 @@ final class CompanionManager: ObservableObject {
             }
         }
         return Array(lines.suffix(8))
+    }
+
+    private static func agentDockResponseDisplaySummary(for session: CodexAgentSession?) -> String? {
+        guard let raw = session?.latestResponseCard?.rawText else { return nil }
+        let displayText = ClickyResponseCard.sanitizedDisplayText(from: raw, maximumCharacters: 1_200)
+            .replacingOccurrences(
+                of: #"(?im)^\s*TASK_TITLE\s*:\s*.*$"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayText.isEmpty ? nil : displayText
     }
 
     private func refreshCursorAgentTaskLabel() {
@@ -8032,7 +8424,8 @@ final class CompanionManager: ObservableObject {
         if lastNarratedAgentOutcomeBySessionID[sessionID] == outcome { return }
         lastNarratedAgentOutcomeBySessionID[sessionID] = outcome
 
-        guard codexAgentSessions.contains(where: { $0.id == sessionID }) else { return }
+        guard let session = codexAgentSessions.first(where: { $0.id == sessionID }) else { return }
+        let taskTitle = Self.agentCompletionSpokenTaskTitle(for: session)
 
         // Skip narration if the user is mid-conversation with the voice
         // responder — the dock item still updates visually, and we don't
@@ -8053,16 +8446,16 @@ final class CompanionManager: ObservableObject {
         switch outcome {
         case "cancelled":
             line = trimmedSummary.isEmpty
-                ? "the agent was cancelled"
-                : "the agent was cancelled \(Self.briefCompletionSummary(trimmedSummary))"
+                ? "\(taskTitle) was cancelled"
+                : "\(taskTitle) was cancelled \(Self.briefCompletionSummary(trimmedSummary))"
         case "failed":
             line = trimmedSummary.isEmpty
-                ? "the agent stopped"
-                : "the agent stopped \(Self.briefCompletionSummary(trimmedSummary))"
+                ? "\(taskTitle) stopped"
+                : "\(taskTitle) stopped \(Self.briefCompletionSummary(trimmedSummary))"
         default:
             line = trimmedSummary.isEmpty
-                ? "the agent has completed the task"
-                : "the agent has completed the task \(Self.briefCompletionSummary(trimmedSummary))"
+                ? "\(taskTitle) is done"
+                : "\(taskTitle) is done \(Self.briefCompletionSummary(trimmedSummary))"
         }
 
         // Sequence behind any in-flight TTS instead of cutting it.
@@ -8074,7 +8467,15 @@ final class CompanionManager: ObservableObject {
         // only), then speak the announcement — so the success line is
         // always heard, never elided, and never overlaps prior audio.
         let playChime = (outcome == "success")
-        speakSystemAnnouncementAfterCurrentTTS(line, withChime: playChime)
+        speakSystemAnnouncementAfterCurrentTTS(line, for: sessionID, withChime: playChime)
+    }
+
+    private static func agentCompletionSpokenTaskTitle(for session: CodexAgentSession) -> String {
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title != "Agent" else {
+            return "the agent task"
+        }
+        return title
     }
 
     /// Queue a system announcement to play *after* any currently-playing
@@ -8091,25 +8492,65 @@ final class CompanionManager: ObservableObject {
     /// chime never overlaps speech and never gets cut by speech.
     private func speakSystemAnnouncementAfterCurrentTTS(
         _ line: String,
+        for sessionID: UUID?,
         withChime: Bool = false
     ) {
         let previousTask = pendingSystemAnnouncementTask
+        pendingSystemAnnouncementSessionID = sessionID
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             if let previousTask {
                 _ = await previousTask.result
             }
+            if let sessionID, self.silencedAgentSpeechSessionIDs.contains(sessionID) { return }
+            if Task.isCancelled { return }
             await self.waitForVoicePlaybackToIdle()
+            if let sessionID, self.silencedAgentSpeechSessionIDs.contains(sessionID) { return }
             if withChime {
                 let chimeDuration = self.playAgentDoneChime()
                 let settleSeconds = max(0.12, chimeDuration + 0.08)
                 try? await Task.sleep(nanoseconds: UInt64(settleSeconds * 1_000_000_000))
                 if Task.isCancelled { return }
+                if let sessionID, self.silencedAgentSpeechSessionIDs.contains(sessionID) { return }
             }
+            self.speakingSystemAnnouncementSessionID = sessionID
             self.speakShortSystemResponse(line, interruptExisting: false)
             await self.waitForVoicePlaybackToIdle()
+            if self.speakingSystemAnnouncementSessionID == sessionID {
+                self.speakingSystemAnnouncementSessionID = nil
+            }
+            if self.pendingSystemAnnouncementSessionID == sessionID {
+                self.pendingSystemAnnouncementTask = nil
+                self.pendingSystemAnnouncementSessionID = nil
+            }
         }
         pendingSystemAnnouncementTask = task
+    }
+
+    private func silenceAgentSpeech(for sessionID: UUID, reason: String) {
+        var didSilenceSpeech = false
+        silencedAgentSpeechSessionIDs.insert(sessionID)
+        if pendingSystemAnnouncementSessionID == sessionID {
+            pendingSystemAnnouncementTask?.cancel()
+            pendingSystemAnnouncementTask = nil
+            pendingSystemAnnouncementSessionID = nil
+            didSilenceSpeech = true
+        }
+        if speakingSystemAnnouncementSessionID == sessionID {
+            interruptCurrentVoiceResponse()
+            speakingSystemAnnouncementSessionID = nil
+            didSilenceSpeech = true
+        }
+        guard didSilenceSpeech else { return }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_task.speech_silenced",
+            fields: [
+                "sessionID": sessionID.uuidString,
+                "reason": reason
+            ]
+        )
     }
 
     @MainActor
@@ -8200,9 +8641,8 @@ final class CompanionManager: ObservableObject {
         cleanedNaturalSpeech(summary, maxLength: 120)
     }
 
-    /// For completion TTS, prefer the full final response body instead of
-    /// the dock/activity snippet so spoken output does not stop at the same
-    /// truncation point used by compact overlay UI.
+    /// For completion TTS, use a short cleaned final-response summary after
+    /// the compact task title. Do not read the whole task or result aloud.
     private static func completionSpeechSummary(
         for session: CodexAgentSession?,
         fallback: String?
@@ -8219,12 +8659,37 @@ final class CompanionManager: ObservableObject {
                 .joined(separator: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
-                let cleaned = cleanedNaturalSpeech(text, maxLength: 220)
+                let maxSpokenLength = 180
+                let cleaned = cleanedNaturalSpeech(text, maxLength: maxSpokenLength)
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "agent",
+                    direction: "outgoing",
+                    event: "openclicky.agent_completion.speech_budget",
+                    fields: [
+                        "rawLength": raw.count,
+                        "sanitizedLength": text.count,
+                        "spokenLength": cleaned.count,
+                        "maxLength": maxSpokenLength
+                    ]
+                )
                 return cleaned.isEmpty ? nil : cleaned
             }
         }
         if let fallback {
-            let cleaned = cleanedNaturalSpeech(fallback, maxLength: 220)
+            let maxSpokenLength = 180
+            let cleaned = cleanedNaturalSpeech(fallback, maxLength: maxSpokenLength)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "outgoing",
+                event: "openclicky.agent_completion.speech_budget",
+                fields: [
+                    "rawLength": fallback.count,
+                    "sanitizedLength": fallback.count,
+                    "spokenLength": cleaned.count,
+                    "maxLength": maxSpokenLength,
+                    "source": "fallback"
+                ]
+            )
             return cleaned.isEmpty ? nil : cleaned
         }
         return nil
@@ -8261,7 +8726,7 @@ final class CompanionManager: ObservableObject {
             return
         }
         if let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID {
-            selectCodexAgentSession(sessionID)
+            armVoiceFollowUpTarget(sessionID, source: "agent_overlay_open")
         }
         showCodexHUD()
     }
@@ -8275,6 +8740,7 @@ final class CompanionManager: ObservableObject {
         // underlying Codex task; explicit Stop handles that after confirm.
         if let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID {
             cancelPendingAgentDockItemRemoval(for: sessionID)
+            silenceAgentSpeech(for: sessionID, reason: "agent_dock_item_archived")
         }
         agentDockItems.removeAll { $0.id == itemID }
         if agentDockItems.isEmpty {
@@ -8302,10 +8768,25 @@ final class CompanionManager: ObservableObject {
             prepareForVoiceFollowUp()
             return
         }
+        armVoiceFollowUpTarget(sessionID, source: "agent_overlay_voice_button")
+        prepareForVoiceFollowUp()
+    }
+
+    private func armVoiceFollowUpTarget(_ sessionID: UUID, source: String) {
         pendingAgentVoiceFollowUpSessionID = sessionID
         pendingAgentVoiceFollowUpCreatedAt = Date()
+        pendingAgentVoiceFollowUpSource = source
         selectCodexAgentSession(sessionID)
-        prepareForVoiceFollowUp()
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "internal",
+            event: "openclicky.agent_followup.voice_target_armed",
+            fields: [
+                "source": source,
+                "sessionID": sessionID.uuidString,
+                "ttlSeconds": Int(Self.pendingAgentVoiceFollowUpTTL)
+            ]
+        )
     }
 
     func showTextFollowUpForAgentDockItem(_ itemID: UUID) {
@@ -8384,6 +8865,92 @@ final class CompanionManager: ObservableObject {
         if isAdvancedModeEnabled {
             showCodexHUD()
         }
+    }
+
+    func attachDroppedAgentFiles(_ urls: [URL], toAgentDockItem itemID: UUID, source: String) {
+        let standardizedURLs = urls
+            .map(\.standardizedFileURL)
+            .filter(\.isFileURL)
+        guard !standardizedURLs.isEmpty else { return }
+        guard let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID,
+              let session = codexAgentSessions.first(where: { $0.id == sessionID }) else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "error",
+                event: "openclicky.agent_attachment_drop.missing_session",
+                fields: [
+                    "source": source,
+                    "itemID": itemID.uuidString,
+                    "attachmentCount": standardizedURLs.count
+                ]
+            )
+            return
+        }
+
+        let prompt = Self.agentAttachmentPrompt(for: standardizedURLs)
+        let timing = beginRequestTiming(source: source, text: prompt)
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "agent.followup",
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": source,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "attachmentCount": standardizedURLs.count
+            ]
+        )
+
+        selectCodexAgentSession(session.id)
+        submitAgentPrompt(prompt, to: session)
+        lastAgentContextSessionID = session.id
+
+        markRequestCompleted(
+            route: "agent.followup",
+            executionStartedAt: executionStartedAt,
+            timing: timing,
+            extra: [
+                "executor": "agent_mode",
+                "executionMethod": "CodexAgentSession.submitPromptFromUI",
+                "controller": "CodexAgentSession",
+                "source": source,
+                "sessionID": session.id.uuidString,
+                "title": session.title,
+                "model": session.model,
+                "attachmentCount": standardizedURLs.count
+            ]
+        )
+
+        OpenClickyMessageLogStore.shared.append(
+            lane: "agent",
+            direction: "incoming",
+            event: "openclicky.agent_attachment_drop.received",
+            fields: [
+                "source": source,
+                "sessionID": session.id.uuidString,
+                "attachmentCount": standardizedURLs.count
+            ]
+        )
+    }
+
+    private static func agentAttachmentPrompt(for urls: [URL]) -> String {
+        let attachmentLines = urls.enumerated().map { index, url in
+            "\(index + 1). \(agentAttachmentKindLabel(for: url)): \(url.path)"
+        }.joined(separator: "\n")
+
+        return """
+        Please review the attached file(s).
+
+        OpenClicky dropped attachments:
+        \(attachmentLines)
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func agentAttachmentKindLabel(for url: URL) -> String {
+        let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "tiff", "bmp"]
+        return imageExtensions.contains(url.pathExtension.lowercased()) ? "Image" : "Document"
     }
 
     func submitAgentPromptFromUI(_ prompt: String) {
@@ -8509,6 +9076,7 @@ final class CompanionManager: ObservableObject {
         lastAgentContextSessionID = session.id
         activeCodexAgentSessionID = session.id
         let baselinePasteboardChangeCount = NSPasteboard.general.changeCount
+        OpenClickyApplicationUsageLogStore.shared.recordFrontmostApplication(source: "agent_prompt")
         Task {
             let screenContext = includeScreenContext ? await prepareAgentScreenContextForNextTurn(minimumPasteboardChangeCount: baselinePasteboardChangeCount) : nil
             if !includeScreenContext {
@@ -8593,7 +9161,7 @@ final class CompanionManager: ObservableObject {
                 }
             }
 
-            let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            let captures = try await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG()
             return try writeCapturedScreenContext(captures, minimumPasteboardChangeCount: minimumPasteboardChangeCount)
         } catch {
             print("OpenClicky Agent Mode: current screen context unavailable: \(error)")
@@ -8635,6 +9203,11 @@ final class CompanionManager: ObservableObject {
     }
 
     private func writeNativeComputerUseScreenContext(_ capture: OpenClickyComputerUseWindowCapture, minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
+        OpenClickyApplicationUsageLogStore.shared.recordApplication(
+            name: capture.window.owner,
+            bundleIdentifier: capture.window.bundleIdentifier,
+            source: "native_cua_agent_context"
+        )
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let fileURL = directory.appendingPathComponent("\(batchID)-cua-swift-window.jpg", isDirectory: false)
@@ -8655,6 +9228,11 @@ final class CompanionManager: ObservableObject {
     }
 
     private func writeBackgroundComputerUseScreenContext(_ capture: OpenClickyBackgroundComputerUseWindowCapture, minimumPasteboardChangeCount: Int) throws -> CodexAgentScreenContext {
+        OpenClickyApplicationUsageLogStore.shared.recordApplication(
+            name: capture.appName,
+            bundleIdentifier: capture.bundleID,
+            source: "background_computer_use_agent_context"
+        )
         let directory = try createAgentScreenContextDirectory()
         let batchID = Self.agentContextBatchID()
         let fileURL = directory.appendingPathComponent("\(batchID)-background-computer-use-window.jpg", isDirectory: false)
@@ -8681,6 +9259,11 @@ final class CompanionManager: ObservableObject {
             let suffix = capture.isCursorScreen ? "primary" : "secondary-\(index + 1)"
             let fileURL = directory.appendingPathComponent("\(batchID)-\(suffix).jpg", isDirectory: false)
             try capture.imageData.write(to: fileURL, options: .atomic)
+            OpenClickyApplicationUsageLogStore.shared.recordApplication(
+                name: capture.appName,
+                bundleIdentifier: capture.bundleIdentifier,
+                source: "agent_screen_context"
+            )
 
             let note = "Image dimensions \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels; display frame x:\(Int(capture.displayFrame.minX)) y:\(Int(capture.displayFrame.minY)) width:\(capture.displayWidthInPoints) height:\(capture.displayHeightInPoints)."
 
@@ -9148,6 +9731,7 @@ final class CompanionManager: ObservableObject {
             }
 
             do {
+                OpenClickyApplicationUsageLogStore.shared.recordFrontmostApplication(source: "voice_question")
                 // Only attach screenshots when the utterance actually needs
                 // visual context. Text-only turns should not pay the capture,
                 // base64, upload, and vision-processing latency tax.
@@ -9191,9 +9775,7 @@ final class CompanionManager: ObservableObject {
                 }
 
                 // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = self.conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
+                let historyForAPI = self.voiceConversationHistoryForAPI()
 
                 let userPromptForClaude: String
                 if labeledImages.isEmpty {
@@ -9262,13 +9844,11 @@ final class CompanionManager: ObservableObject {
                         }()
                     )
 
-                    self.conversationHistory.append((
+                    self.rememberVoiceExchange(
                         userTranscript: transcript,
-                        assistantResponse: spokenText
-                    ))
-                    if self.conversationHistory.count > 10 {
-                        self.conversationHistory.removeFirst(self.conversationHistory.count - 10)
-                    }
+                        assistantResponse: spokenText,
+                        reason: "realtime_response"
+                    )
                     do {
                         try codexHomeManager.appendPersistentMemoryEvent(
                             userRequest: transcript,
@@ -9569,17 +10149,13 @@ final class CompanionManager: ObservableObject {
 
                 // Save this exchange to conversation history (with the point tag
                 // stripped so it doesn't confuse future context)
-                self.conversationHistory.append((
+                self.rememberVoiceExchange(
                     userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
+                    assistantResponse: spokenText,
+                    reason: "voice_response"
+                )
 
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if self.conversationHistory.count > 10 {
-                    self.conversationHistory.removeFirst(self.conversationHistory.count - 10)
-                }
-
-                print("🧠 Conversation history: \(self.conversationHistory.count) exchanges")
+                print("🧠 Conversation history: \(self.conversationHistory.count) active exchanges")
                 do {
                     try codexHomeManager.appendPersistentMemoryEvent(
                         userRequest: transcript,
@@ -9797,9 +10373,7 @@ final class CompanionManager: ObservableObject {
                 let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                 return (data: capture.imageData, label: capture.label + dimensionInfo)
             }
-            let historyForAPI = conversationHistory.map { entry in
-                (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-            }
+            let historyForAPI = voiceConversationHistoryForAPI()
 
             let fullResponseText = try await analyzeVoiceResponse(
                 images: labeledImages,
@@ -9826,13 +10400,11 @@ final class CompanionManager: ObservableObject {
                 print("Tutor pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y)))")
             }
 
-            conversationHistory.append((
+            rememberVoiceExchange(
                 userTranscript: "[tutor observation]",
-                assistantResponse: spokenText
-            ))
-            if conversationHistory.count > 10 {
-                conversationHistory.removeFirst(conversationHistory.count - 10)
-            }
+                assistantResponse: spokenText,
+                reason: "tutor_observation"
+            )
 
             if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 try await voiceTTSClient.speakText(spokenText) {
@@ -10696,8 +11268,7 @@ final class CompanionManager: ObservableObject {
             },
             prepareVoiceFollowUp: { [weak self] in
                 guard let self else { return }
-                self.pendingAgentVoiceFollowUpSessionID = self.activeCodexAgentSessionID
-                self.pendingAgentVoiceFollowUpCreatedAt = Date()
+                self.armVoiceFollowUpTarget(self.activeCodexAgentSessionID, source: "agent_hud_voice_button")
                 self.prepareForVoiceFollowUp()
             }
         )
@@ -10913,7 +11484,7 @@ final class CompanionManager: ObservableObject {
     func debugCaptureAgentScreenContext() {
         Task {
             do {
-                let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                let captures = try await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG()
                 let context = try writeCapturedScreenContext(captures, minimumPasteboardChangeCount: NSPasteboard.general.changeCount)
                 let fileSummary = context.attachments
                     .map { $0.fileURL.lastPathComponent }
@@ -10957,11 +11528,12 @@ private final class ClickyTextModePanel: NSPanel {
 @MainActor
 final class ClickyTextModeWindowManager {
     private var panel: NSPanel?
-    private let panelSize = NSSize(width: 340, height: 54)
+    private let panelSize = NSSize(width: 520, height: 54)
 
     func show(at cursorLocation: CGPoint, accentTheme: ClickyAccentTheme? = nil, submitText: @escaping (String) -> Void) {
         preparePanel(accentTheme: accentTheme, submitText: submitText)
         positionPanel(near: cursorLocation)
+        NSApp.activate(ignoringOtherApps: true)
         panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
     }
@@ -10969,6 +11541,7 @@ final class ClickyTextModeWindowManager {
     func show(origin: CGPoint, accentTheme: ClickyAccentTheme? = nil, submitText: @escaping (String) -> Void) {
         preparePanel(accentTheme: accentTheme, submitText: submitText)
         positionPanel(at: origin)
+        NSApp.activate(ignoringOtherApps: true)
         panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
     }
@@ -11062,14 +11635,22 @@ private struct ClickyTextModeInputView: View {
                 .font(.system(size: 16, weight: .medium))
                 .foregroundColor(controlColor)
 
-            TextField("", text: $text, prompt: Text(placeholderText)
-                .foregroundColor(placeholderColor)
-            )
-                .textFieldStyle(.plain)
-                .font(.system(size: 16, weight: .regular))
-                .foregroundColor(textColor)
-                .focused($isFocused)
-                .onSubmit(submit)
+            ZStack(alignment: .leading) {
+                if text.isEmpty {
+                    Text(placeholderText)
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundColor(placeholderColor)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
+                }
+
+                TextField("", text: $text)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundColor(textColor)
+                    .focused($isFocused)
+                    .onSubmit(submit)
+            }
 
             Button(action: submit) {
                 Image(systemName: "arrow.up.circle.fill")
@@ -11089,7 +11670,7 @@ private struct ClickyTextModeInputView: View {
             .pointerCursor()
         }
         .padding(.horizontal, 14)
-        .frame(width: 340, height: 54)
+        .frame(width: 520, height: 54)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(backgroundColor)
@@ -11101,9 +11682,16 @@ private struct ClickyTextModeInputView: View {
         .shadow(color: accentTheme.cursorColor.opacity(0.32), radius: 18, x: 0, y: 0)
         .shadow(color: Color.black.opacity(0.28), radius: 14, x: 0, y: 8)
         .onAppear {
-            DispatchQueue.main.async {
-                isFocused = true
+            focusTextField()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                focusTextField()
             }
+        }
+    }
+
+    private func focusTextField() {
+        DispatchQueue.main.async {
+            isFocused = true
         }
     }
 

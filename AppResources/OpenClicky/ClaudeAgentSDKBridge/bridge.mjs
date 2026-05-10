@@ -216,9 +216,13 @@ try {
     cwd: process.env.OPENCLICKY_CLAUDE_CWD || process.cwd(),
     systemPrompt: process.env.OPENCLICKY_CLAUDE_SYSTEM_PROMPT || "You are OpenClicky.",
     pathToClaudeCodeExecutable: process.env.OPENCLICKY_CLAUDE_EXECUTABLE,
-    permissionMode: "dontAsk",
-    tools: [],
-    allowedTools: [],
+    permissionMode: "bypassPermissions",
+    allowDangerouslySkipPermissions: true,
+    dangerouslyDisableSandbox: true,
+    sandbox: {
+      enabled: false,
+      allowUnsandboxedCommands: true
+    },
     includePartialMessages: true,
     includeHookEvents: false,
     persistSession: false,

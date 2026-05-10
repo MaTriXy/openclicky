@@ -14,6 +14,7 @@ nonisolated enum AppBundleConfiguration {
     static let userCartesiaAPIKeyDefaultsKey = "openClickyCartesiaAPIKey"
     static let userCartesiaVoiceIDDefaultsKey = "openClickyCartesiaVoiceID"
     static let userOpenAIRealtimeVoiceIDDefaultsKey = "openClickyOpenAIRealtimeVoiceID"
+    static let userMicrosoftEdgeVoiceIDDefaultsKey = "openClickyMicrosoftEdgeVoiceID"
     /// Deepgram TTS reuses the existing Deepgram STT API key
     /// (`userDeepgramAPIKeyDefaultsKey`). Only the voice/model is
     /// TTS-specific.
@@ -138,7 +139,7 @@ nonisolated enum AppBundleConfiguration {
     }
 
     /// Selected playback engine — "openai_realtime" (default), "elevenlabs",
-    /// "cartesia", or "deepgram".
+    /// "cartesia", "deepgram", or "microsoft_edge".
     static func ttsProviderRaw() -> String {
         userDefaultsValue(forKey: userTTSProviderDefaultsKey) ?? "openai_realtime"
     }
@@ -154,6 +155,17 @@ nonisolated enum AppBundleConfiguration {
             environmentKeys: ["DEEPGRAM_TTS_VOICE"]
         ) ?? localDevelopmentEnvironmentValue(forKey: "DEEPGRAM_TTS_VOICE")
         ?? "aura-2-thalia-en"
+    }
+
+    /// Microsoft Edge Read Aloud voice identifier. These are the free
+    /// Edge online voices, not Azure Speech API keys.
+    static func microsoftEdgeVoiceID() -> String {
+        userDefaultsValue(forKey: userMicrosoftEdgeVoiceIDDefaultsKey) ?? stringValue(
+            forKey: "MicrosoftEdgeVoiceID",
+            environmentKeys: ["MICROSOFT_EDGE_VOICE_ID", "EDGE_TTS_VOICE"]
+        ) ?? localDevelopmentEnvironmentValue(forKey: "MICROSOFT_EDGE_VOICE_ID")
+            ?? localDevelopmentEnvironmentValue(forKey: "EDGE_TTS_VOICE")
+        ?? "en-US-EmmaMultilingualNeural"
     }
 
     private static func userDefaultsValue(forKey key: String) -> String? {

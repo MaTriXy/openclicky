@@ -310,7 +310,7 @@ struct ClickyResponseCard: Identifiable, Equatable {
         case handoff
     }
 
-    static let maximumDisplayCharacters = 220
+    static let maximumDisplayCharacters = 1_200
 
     let id: String
     var source: Source

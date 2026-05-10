@@ -281,13 +281,17 @@ struct ClickyResponseCardCompactView: View {
             }
 
             if let displayText = sanitizedDisplayText(card.displayText) {
-                Text(displayText)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundColor(DS.Colors.textPrimary)
-                    .lineSpacing(4)
-                    .lineLimit(4)
-                    .minimumScaleFactor(0.82)
-                    .fixedSize(horizontal: false, vertical: true)
+                ScrollView(.vertical, showsIndicators: false) {
+                    Text(displayText)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineSpacing(4)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220, alignment: .top)
+                .mask(ClickyResponseCardScrollFadeMask())
             }
 
             if !card.suggestedNextActions.isEmpty {
@@ -387,6 +391,21 @@ struct ClickyResponseCardCompactView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+}
+
+private struct ClickyResponseCardScrollFadeMask: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: .black, location: 0.045),
+                .init(color: .black, location: 0.955),
+                .init(color: .clear, location: 1.0)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
     }
 }
 

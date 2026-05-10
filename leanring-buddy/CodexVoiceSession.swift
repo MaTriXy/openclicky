@@ -212,10 +212,15 @@ final class CodexVoiceSession {
                 "input": input,
                 "cwd": workingDirectory.path,
                 "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
                 "model": model,
                 // Voice responses should prioritize first-token latency;
                 // Agent Mode keeps the user-selected reasoning effort.
-                "effort": "low"
+                "effort": "low",
+                "config": [
+                    "approval_policy": "never",
+                    "sandbox_mode": "danger-full-access"
+                ]
             ])
 
             guard let turn = CodexJSON.dictionary(turnStart["turn"]),
@@ -281,8 +286,11 @@ final class CodexVoiceSession {
             "modelProvider": homeManager.modelProviderID,
             "cwd": workingDirectory.path,
             "approvalPolicy": "never",
-            "sandbox": "read-only",
-            "config": [:],
+            "sandbox": "danger-full-access",
+            "config": [
+                "approval_policy": "never",
+                "sandbox_mode": "danger-full-access"
+            ],
             "serviceName": "OpenClicky Voice",
             "baseInstructions": baseInstructions,
             "developerInstructions": developerInstructions,

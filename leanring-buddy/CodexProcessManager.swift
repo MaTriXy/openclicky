@@ -27,7 +27,12 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
         let errorPipe = Pipe()
 
         process.executableURL = executableURL
-        process.arguments = ["app-server", "--listen", "stdio://"]
+        process.arguments = [
+            "app-server",
+            "--listen", "stdio://",
+            "-c", "approval_policy=\"never\"",
+            "-c", "sandbox_mode=\"danger-full-access\""
+        ]
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
@@ -245,7 +250,9 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
     private static func isBenignStderrLine(_ line: String) -> Bool {
         let benignMarkers = [
             "http://127.0.0.1:7778/mcp",
-            "mcpServer/startupStatus/updated"
+            "mcpServer/startupStatus/updated",
+            "failed to load skill",
+            "invalid description: exceeds maximum length"
         ]
         let lower = line.lowercased()
         return benignMarkers.contains { lower.contains($0.lowercased()) }

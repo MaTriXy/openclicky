@@ -1,6 +1,9 @@
 import AppKit
 import Combine
 import Foundation
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 actor OpenClickyAgentFileLeaseCoordinator {
     static let shared = OpenClickyAgentFileLeaseCoordinator()
@@ -214,36 +217,48 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         "The agent"
     }
 
+    private var spokenTaskTitle: String {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty, trimmedTitle != "Agent" else {
+            return "the agent task"
+        }
+        return trimmedTitle
+    }
+
     var statusSummaryLine: String {
-        let agentName = spokenAgentSentenceName
+        let taskTitle = spokenTaskTitle
         let latestActivity = latestActivitySummary
 
         switch status {
         case .stopped:
-            return "\(agentName) is offline."
+            return "\(taskTitle) is offline."
         case .starting:
-            return "An agent is starting."
+            return "\(taskTitle) is starting."
         case .running:
             if let latestActivity {
-                return "An agent is working. Latest: \(latestActivity)"
+                return "\(taskTitle) is running. Latest: \(latestActivity)"
             }
-            return "An agent is working."
+            return "\(taskTitle) is running."
         case .ready:
             if let latestActivity {
-                return "The agent has completed the task. Latest: \(latestActivity)"
+                return "\(taskTitle) is done. Latest: \(latestActivity)"
             }
-            return "The agent is ready."
+            return "\(taskTitle) is ready."
         case .failed:
             let errorText = lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let errorText, !errorText.isEmpty {
-                return "\(agentName) stopped: \(Self.spokenSnippet(from: errorText, maxLength: 110))"
+                return "\(taskTitle) stopped: \(Self.spokenSnippet(from: errorText, maxLength: 110))"
             }
-            return "\(agentName) stopped."
+            return "\(taskTitle) stopped."
         }
     }
 
     var latestActivitySummary: String? {
         Self.latestActivitySummary(from: entries)
+    }
+
+    var latestActivityDisplaySummary: String? {
+        Self.latestActivityDisplaySummary(from: entries)
     }
 
     var hasVisibleActivity: Bool {
@@ -353,7 +368,17 @@ final class CodexAgentSession: ObservableObject, Identifiable {
 
     private func startPromptTurn(_ prompt: String, screenContext: CodexAgentScreenContext? = nil) {
         if entries.isEmpty {
-            title = Self.shortTitle(from: prompt)
+            let fallbackTitle = Self.shortTitle(from: prompt)
+            title = fallbackTitle
+            if !Self.shouldKeepInitialTaskTitle(fallbackTitle) {
+                Task { [weak self] in
+                    guard let generatedTitle = await Self.fastFriendlyTitle(from: prompt, fallbackTitle: fallbackTitle) else { return }
+                    guard let self else { return }
+                    if self.entries.first?.text == prompt, self.title == fallbackTitle {
+                        self.title = generatedTitle
+                    }
+                }
+            }
         }
 
         lastSubmittedPrompt = prompt
@@ -419,8 +444,13 @@ final class CodexAgentSession: ObservableObject, Identifiable {
                 ]],
                 "cwd": workingDirectoryPath,
                 "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
                 "model": model,
-                "effort": homeManager.reasoningEffort
+                "effort": homeManager.reasoningEffort,
+                "config": [
+                    "approval_policy": "never",
+                    "sandbox_mode": "danger-full-access"
+                ]
             ])
         } catch {
             let text = Self.userFacingErrorMessage(from: error.localizedDescription)
@@ -668,12 +698,8 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             let commandText = CodexJSON.string(params["command"])
                 ?? CodexJSON.string(CodexJSON.dictionary(params["item"])?["command"])
                 ?? ""
-            let outputDelta = CodexJSON.string(params["delta"])
-                ?? CodexJSON.string(params["outputDelta"])
-                ?? CodexJSON.string(CodexJSON.dictionary(params["item"])?["outputDelta"])
-                ?? ""
             progressStage = .executing
-            let summary = Self.liveCommandProgressSummary(command: commandText, outputDelta: outputDelta)
+            let summary = Self.liveCommandProgressSummary(command: commandText)
             appendActivityStatusLine(summary)
             upsertEntryIfChanged(
                 id: itemID,
@@ -1049,9 +1075,19 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
 
-        return normalized.contains("responses_websocket")
+        if normalized.contains("responses_websocket")
             && normalized.contains("failed to connect to websocket")
-            && normalized.contains("bad gateway")
+            && normalized.contains("bad gateway") {
+            return true
+        }
+
+        if normalized.contains("failed to load skill")
+            && normalized.contains("invalid description")
+            && normalized.contains("exceeds maximum length") {
+            return true
+        }
+
+        return false
     }
 
     // Note: the agent-done chime is no longer played from this class.
@@ -1496,20 +1532,17 @@ final class CodexAgentSession: ObservableObject, Identifiable {
 
     private static func plainEnglishCommandSummary(command: String, output: String, exitCode: Int?) -> String {
         let cleanedCommand = compactSingleLine(command)
-        let cleanedOutput = compactSingleLine(strippingANSI(output))
+        _ = output
 
         if let exitCode, exitCode != 0 {
-            if !cleanedOutput.isEmpty {
-                return "Command failed (\(exitCode)): \(snippet(cleanedOutput, maxLength: 180))"
-            }
             return "Command failed (\(exitCode)): \(snippet(cleanedCommand, maxLength: 180))"
         }
 
-        if !cleanedOutput.isEmpty {
-            return snippet(cleanedOutput, maxLength: 180)
+        if !cleanedCommand.isEmpty {
+            return "Command finished: \(snippet(cleanedCommand, maxLength: 160))"
         }
 
-        return "Ran: \(snippet(cleanedCommand, maxLength: 160))"
+        return "Command finished"
     }
 
     private static func compactSingleLine(_ text: String) -> String {
@@ -1636,6 +1669,224 @@ final class CodexAgentSession: ObservableObject, Identifiable {
         nounBasedTaskTitle(from: prompt, maximumCharacters: 44, maximumWords: 5)
     }
 
+    private static func shouldKeepInitialTaskTitle(_ title: String) -> Bool {
+        let stableTitles: Set<String> = [
+            "Task Title Cleanup",
+            "Task Title Stability",
+            "Task Title Ordering",
+            "Task Status Wording"
+        ]
+        return stableTitles.contains(title)
+    }
+
+    private static func fastFriendlyTitle(from prompt: String, fallbackTitle: String) async -> String? {
+        let systemPrompt = """
+        You create compact, friendly titles for OpenClicky background agent tasks.
+        Return only the title, with no quotes or punctuation.
+        Rules:
+        - 2 to 5 words.
+        - Noun-based action label.
+        - Remove filler like can you, please, just, maybe, help me, deal with it.
+        - Preserve the real requested work.
+        - Examples: Voice Response Naturalization, Task Subject Cleanup, Inbox Triage, Settings Permissions Move.
+        """
+        let userPrompt = """
+        Create a friendly task title for this OpenClicky agent request:
+        \(prompt)
+        """
+
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            if let title = await localFoundationFriendlyTitle(
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                fallbackTitle: fallbackTitle
+            ) {
+                return title
+            }
+        }
+        #endif
+
+        if let anthropicAPIKey = AppBundleConfiguration.anthropicAPIKey() {
+            do {
+                let api = ClaudeAPI(
+                    apiKey: anthropicAPIKey,
+                    model: OpenClickyModelCatalog.defaultVoiceResponseModelID,
+                    maxOutputTokens: 64
+                )
+                let (text, duration) = try await api.analyzeImage(
+                    images: [],
+                    systemPrompt: systemPrompt,
+                    userPrompt: userPrompt
+                )
+                if let title = cleanedFastFriendlyTitle(text, fallbackTitle: fallbackTitle) {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "agent",
+                        direction: "incoming",
+                        event: "openclicky.agent_task.title_generated",
+                        fields: [
+                            "provider": "anthropic",
+                            "model": OpenClickyModelCatalog.defaultVoiceResponseModelID,
+                            "durationMs": Int((duration * 1000).rounded()),
+                            "title": title
+                        ]
+                    )
+                    return title
+                }
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "agent",
+                    direction: "incoming",
+                    event: "openclicky.agent_task.title_generation_failed",
+                    fields: [
+                        "provider": "anthropic",
+                        "model": OpenClickyModelCatalog.defaultVoiceResponseModelID,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+
+        if let openAIAPIKey = AppBundleConfiguration.openAIAPIKey() {
+            let fastOpenAIModel = "gpt-5.4-mini"
+            do {
+                let api = OpenAIAPI(
+                    apiKey: openAIAPIKey,
+                    model: fastOpenAIModel,
+                    maxOutputTokens: 64
+                )
+                let (text, duration) = try await api.analyzeImage(
+                    images: [],
+                    systemPrompt: systemPrompt,
+                    userPrompt: userPrompt
+                )
+                if let title = cleanedFastFriendlyTitle(text, fallbackTitle: fallbackTitle) {
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "agent",
+                        direction: "incoming",
+                        event: "openclicky.agent_task.title_generated",
+                        fields: [
+                            "provider": "openai",
+                            "model": fastOpenAIModel,
+                            "durationMs": Int((duration * 1000).rounded()),
+                            "title": title
+                        ]
+                    )
+                    return title
+                }
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "agent",
+                    direction: "incoming",
+                    event: "openclicky.agent_task.title_generation_failed",
+                    fields: [
+                        "provider": "openai",
+                        "model": fastOpenAIModel,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+
+        return nil
+    }
+
+    #if canImport(FoundationModels)
+    @available(macOS 26.0, *)
+    private static func localFoundationFriendlyTitle(
+        systemPrompt: String,
+        userPrompt: String,
+        fallbackTitle: String
+    ) async -> String? {
+        let model = SystemLanguageModel.default
+        guard model.isAvailable else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "incoming",
+                event: "openclicky.agent_task.title_generation_skipped",
+                fields: [
+                    "provider": "apple_foundation_models",
+                    "reason": "unavailable"
+                ]
+            )
+            return nil
+        }
+
+        let startedAt = Date()
+        do {
+            let session = LanguageModelSession(instructions: systemPrompt)
+            let response = try await session.respond(to: userPrompt)
+            if let title = cleanedFastFriendlyTitle(response.content, fallbackTitle: fallbackTitle) {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "agent",
+                    direction: "incoming",
+                    event: "openclicky.agent_task.title_generated",
+                    fields: [
+                        "provider": "apple_foundation_models",
+                        "model": "SystemLanguageModel.default",
+                        "durationMs": Int(Date().timeIntervalSince(startedAt) * 1000),
+                        "title": title
+                    ]
+                )
+                return title
+            }
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "agent",
+                direction: "incoming",
+                event: "openclicky.agent_task.title_generation_failed",
+                fields: [
+                    "provider": "apple_foundation_models",
+                    "model": "SystemLanguageModel.default",
+                    "error": error.localizedDescription
+                ]
+            )
+        }
+
+        return nil
+    }
+    #endif
+
+    private static func cleanedFastFriendlyTitle(_ rawTitle: String, fallbackTitle: String) -> String? {
+        var title = rawTitle
+            .components(separatedBy: .newlines)
+            .first ?? rawTitle
+        title = title.replacingOccurrences(
+            of: #"(?i)^\s*(?:TASK_TITLE|title)\s*:\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        title = title.replacingOccurrences(
+            of: #"(?i)\b(?:task\s+title|friendly\s+title)\b\s*:?"#,
+            with: "",
+            options: .regularExpression
+        )
+        title = title
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \n\t`\"'“”‘’.,:;!?-–—[](){}<>"))
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+        let words = title
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { word in
+                guard !word.isEmpty else { return false }
+                return word.count > 1 || word.rangeOfCharacter(from: .decimalDigits) != nil
+            }
+            .prefix(5)
+
+        let cleaned = words
+            .map { word in word.prefix(1).uppercased() + word.dropFirst().lowercased() }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard cleaned.split(separator: " ").count >= 2 else { return nil }
+        guard cleaned.count <= 44 else {
+            return nounBasedTaskTitle(from: cleaned, maximumCharacters: 44, maximumWords: 5)
+        }
+        guard cleaned.caseInsensitiveCompare(fallbackTitle) != .orderedSame else { return nil }
+        return cleaned
+    }
+
     private static func nounBasedTaskTitle(
         from prompt: String,
         maximumCharacters: Int,
@@ -1648,9 +1899,18 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
         let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:whole|full)\s+(?:task\s+)?names?\b"#, "Task Status Wording"),
+            (#"(?i)\bshort\s+(?:version|task\s+name|name)\b"#, "Task Status Wording"),
+            (#"(?i)\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b.*\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b.*\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:short|compact)\s+(?:version|label|title|name)\b"#, "Task Title Cleanup"),
             (#"(?i)\b(?:proper|better|concise|short|compact)\s+(?:task\s+)?titles?\b"#, "Task Title Cleanup"),
             (#"(?i)\btask\s+titles?\b.*\b(?:read(?:ing)?\s+out|raw|asked\s+for|request)\b"#, "Task Title Cleanup"),
-            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup")
+            (#"(?i)\b(?:read(?:ing)?\s+out|raw)\b.*\b(?:asked\s+for|request)\b"#, "Task Title Cleanup"),
+            (#"(?i)\b(?:titles?|task\s+titles?)\b.*\b(?:out\s+of\s+order|wrong\s+order|scrambl(?:ed|ing)|jumbled)\b"#, "Task Title Ordering"),
+            (#"(?i)\b(?:out\s+of\s+order|wrong\s+order|scrambl(?:ed|ing)|jumbled)\b.*\b(?:titles?|task\s+titles?)\b"#, "Task Title Ordering"),
+            (#"(?i)\b(?:titles?|task\s+titles?)\b.*\b(?:mix(?:ed|ing)?|backwards?|forwards?|flip(?:ping)?|jump(?:ing)?|changing)\b"#, "Task Title Stability"),
+            (#"(?i)\b(?:mix(?:ed|ing)?|backwards?|forwards?|flip(?:ping)?|jump(?:ing)?|changing)\b.*\b(?:titles?|task\s+titles?)\b"#, "Task Title Stability")
         ]
         for rule in directTitleRules where title.range(of: rule.pattern, options: .regularExpression) != nil {
             return rule.title
@@ -1695,7 +1955,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             options: .regularExpression
         )
         title = title.replacingOccurrences(
-            of: #"(?i)\b(?:words?|thing|stuff|phrases?|responses?)\b"#,
+            of: #"(?i)\b(?:find|out|why|when|sure|use|uses?|using|start|starts|started|starting|speak|speaks|speaking|say|says|saying|read|reads|reading|whole|full|long|name|version|words?|thing|stuff|phrases?|responses?)\b"#,
             with: " ",
             options: .regularExpression
         )
@@ -1770,6 +2030,14 @@ final class CodexAgentSession: ObservableObject, Identifiable {
     }
 
     private static func latestActivitySummary(from entries: [CodexTranscriptEntry]) -> String? {
+        latestActivityText(from: entries).map { spokenSnippet(from: $0, maxLength: 120) }
+    }
+
+    private static func latestActivityDisplaySummary(from entries: [CodexTranscriptEntry]) -> String? {
+        latestActivityText(from: entries).map { displaySnippet(from: $0, maxLength: 1_200) }
+    }
+
+    private static func latestActivityText(from entries: [CodexTranscriptEntry]) -> String? {
         guard let latestEntry = entries.reversed().first(where: { entry in
             switch entry.role {
             case .assistant, .plan, .command, .system:
@@ -1781,15 +2049,11 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             return nil
         }
 
-        return spokenSnippet(from: latestEntry.text, maxLength: 120)
+        let text = latestEntry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
-    private static func liveCommandProgressSummary(command: String, outputDelta: String) -> String {
-        let trimmedDelta = outputDelta.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedDelta.isEmpty {
-            return spokenSnippet(from: trimmedDelta, maxLength: 120)
-        }
-
+    private static func liveCommandProgressSummary(command: String) -> String {
         let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedCommand.isEmpty {
             return "Running: \(spokenSnippet(from: trimmedCommand, maxLength: 90))"
@@ -1873,5 +2137,19 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             return "\(prefix[..<lastSpace])..."
         }
         return "\(prefix)..."
+    }
+
+    private static func displaySnippet(from text: String, maxLength: Int) -> String {
+        let flattened = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard flattened.count > maxLength else {
+            return flattened
+        }
+
+        let endIndex = flattened.index(flattened.startIndex, offsetBy: maxLength)
+        return String(flattened[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

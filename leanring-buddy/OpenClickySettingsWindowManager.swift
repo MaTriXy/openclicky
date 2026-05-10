@@ -17,7 +17,22 @@ final class OpenClickySettingsWindowManager {
         guard let settingsWindow = window else { return }
 
         NSApp.activate(ignoringOtherApps: true)
-        settingsWindow.center()
+        bringSettingsWindowToFront(settingsWindow, shouldCenter: true)
+
+        DispatchQueue.main.async { [weak self, weak settingsWindow] in
+            guard let self, let settingsWindow else { return }
+            self.bringSettingsWindowToFront(settingsWindow, shouldCenter: false)
+        }
+    }
+
+    private func bringSettingsWindowToFront(_ settingsWindow: NSWindow, shouldCenter: Bool) {
+        settingsWindow.level = .floating
+        settingsWindow.collectionBehavior.insert(.moveToActiveSpace)
+        settingsWindow.collectionBehavior.insert(.fullScreenAuxiliary)
+        if shouldCenter {
+            settingsWindow.center()
+        }
+        settingsWindow.deminiaturize(nil)
         settingsWindow.orderFrontRegardless()
         settingsWindow.makeKeyAndOrderFront(nil)
         settingsWindow.makeMain()
@@ -36,7 +51,9 @@ final class OpenClickySettingsWindowManager {
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.titlebarAppearsTransparent = true
         settingsWindow.toolbarStyle = .unified
+        settingsWindow.level = .floating
         settingsWindow.collectionBehavior.insert(.moveToActiveSpace)
+        settingsWindow.collectionBehavior.insert(.fullScreenAuxiliary)
         settingsWindow.center()
 
         let hostingView = NSHostingView(rootView: OpenClickySettingsView(companionManager: companionManager))
@@ -51,8 +68,9 @@ final class OpenClickySettingsWindowManager {
 private enum OpenClickySettingsSection: String, CaseIterable, Identifiable {
     case general
     case voice
-    case pointing
-    case computerUse
+    case apiKeys
+    case permissions
+    case tutorMode
     case agentMode
     case googleWorkspace
     case memory
@@ -64,9 +82,10 @@ private enum OpenClickySettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "General"
         case .voice: return "Voice"
-        case .pointing: return "Pointing"
-        case .computerUse: return "Computer Use"
-        case .agentMode: return "Agent Mode"
+        case .apiKeys: return "API Keys"
+        case .permissions: return "Permissions"
+        case .tutorMode: return "Tutor Mode"
+        case .agentMode: return "Agents"
         case .googleWorkspace: return "Google"
         case .memory: return "Memory"
         case .app: return "App"
@@ -77,8 +96,9 @@ private enum OpenClickySettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .voice: return "waveform"
-        case .pointing: return "cursorarrow.rays"
-        case .computerUse: return "macwindow.and.cursorarrow"
+        case .apiKeys: return "key"
+        case .permissions: return "hand.raised"
+        case .tutorMode: return "graduationcap"
         case .agentMode: return "terminal"
         case .googleWorkspace: return "globe.americas.fill"
         case .memory: return "books.vertical"
@@ -101,6 +121,7 @@ struct OpenClickySettingsView: View {
     @AppStorage(AppBundleConfiguration.userCartesiaAPIKeyDefaultsKey) private var userCartesiaAPIKey = ""
     @AppStorage(AppBundleConfiguration.userCartesiaVoiceIDDefaultsKey) private var userCartesiaVoiceID = ""
     @AppStorage(AppBundleConfiguration.userOpenAIRealtimeVoiceIDDefaultsKey) private var userOpenAIRealtimeVoiceID = "marin"
+    @AppStorage(AppBundleConfiguration.userMicrosoftEdgeVoiceIDDefaultsKey) private var userMicrosoftEdgeVoiceID = "en-US-EmmaMultilingualNeural"
     @AppStorage(AppBundleConfiguration.userDeepgramTTSVoiceDefaultsKey) private var userDeepgramTTSVoice = "aura-2-thalia-en"
     @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionsEnabledDefaultsKey) private var voiceResponseCaptionsEnabled = false
     @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionFontDefaultsKey) private var voiceResponseCaptionFontRawValue = OpenClickyResponseCaptionFont.fallback.rawValue
@@ -206,13 +227,15 @@ struct OpenClickySettingsView: View {
         case .general:
             return "Core behavior, cursor appearance, and everyday companion controls."
         case .voice:
-            return "Speech input, spoken response model, playback voice, and provider keys."
-        case .pointing:
-            return "Screen capture permissions and the model used for cursor pointing."
-        case .computerUse:
-            return "Choose the computer-use backend for focused-window context and targeted actions."
+            return "Speech input, spoken response model, playback voice, and captions."
+        case .apiKeys:
+            return "Provider credentials for voice, transcription, pointing, and Agent Mode."
+        case .permissions:
+            return "macOS access needed for voice, screen context, pointing, and app control."
+        case .tutorMode:
+            return "Tutor behavior, pause guidance, and the future skill-powered tutoring surface."
         case .agentMode:
-            return "Background agents, Codex configuration, model, working directory, and chat access."
+            return "Background agents, pointing, computer use, Codex configuration, model, working directory, and chat access."
         case .googleWorkspace:
             return "Local Google Workspace connection through gogcli. No hosted Google login or key sync."
         case .memory:
@@ -229,10 +252,12 @@ struct OpenClickySettingsView: View {
             generalPanel
         case .voice:
             voicePanel
-        case .pointing:
-            pointingPanel
-        case .computerUse:
-            computerUsePanel
+        case .apiKeys:
+            apiKeysPanel
+        case .permissions:
+            permissionsPanel
+        case .tutorMode:
+            tutorModePanel
         case .agentMode:
             agentModePanel
         case .googleWorkspace:
@@ -254,16 +279,6 @@ struct OpenClickySettingsView: View {
                     isOn: Binding(
                         get: { companionManager.isClickyCursorEnabled },
                         set: { companionManager.setClickyCursorEnabled($0) }
-                    )
-                )
-
-                toggleRow(
-                    title: "Tutor mode",
-                    subtitle: "Watches for short pauses and offers small next-step guidance.",
-                    systemImageName: "graduationcap",
-                    isOn: Binding(
-                        get: { companionManager.isTutorModeEnabled },
-                        set: { companionManager.setTutorModeEnabled($0) }
                     )
                 )
 
@@ -309,6 +324,44 @@ struct OpenClickySettingsView: View {
         }
     }
 
+    private var tutorModePanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsGroup("Tutor Mode") {
+                toggleRow(
+                    title: "Tutor mode",
+                    subtitle: "Watches for short pauses and offers small next-step guidance.",
+                    systemImageName: "graduationcap",
+                    isOn: Binding(
+                        get: { companionManager.isTutorModeEnabled },
+                        set: { companionManager.setTutorModeEnabled($0) }
+                    )
+                )
+            }
+
+            settingsGroup("Tutor skills") {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "wand.and.stars")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 24)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Skill-powered tutoring")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("This section is ready for the tutor skills controls that will be wired in next.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+            }
+        }
+    }
+
     private var voicePanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsGroup("Response voice model") {
@@ -342,17 +395,6 @@ struct OpenClickySettingsView: View {
                     .pickerStyle(.menu)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 11)
-
-                    secureFieldRow(
-                        title: "Codex/OpenAI API key",
-                        subtitle: "Used by the selected GPT Realtime response voice model.",
-                        systemImageName: "key",
-                        placeholder: "OpenAI key",
-                        text: Binding(
-                            get: { userCodexAgentAPIKey },
-                            set: { userCodexAgentAPIKey = $0; companionManager.setCodexAgentAPIKey($0) }
-                        )
-                    )
                 }
             }
 
@@ -391,28 +433,6 @@ struct OpenClickySettingsView: View {
                         )
                     }
                 }
-
-                secureFieldRow(
-                    title: "AssemblyAI listening key",
-                    subtitle: "Used by the AssemblyAI streaming transcription provider.",
-                    systemImageName: "key",
-                    placeholder: "AssemblyAI key",
-                    text: Binding(
-                        get: { userAssemblyAIAPIKey },
-                        set: { userAssemblyAIAPIKey = $0; companionManager.setAssemblyAIAPIKey($0) }
-                    )
-                )
-
-                secureFieldRow(
-                    title: "Deepgram listening key",
-                    subtitle: "Used by the Deepgram streaming transcription provider.",
-                    systemImageName: "key",
-                    placeholder: "Deepgram key",
-                    text: Binding(
-                        get: { userDeepgramAPIKey },
-                        set: { userDeepgramAPIKey = $0; companionManager.setDeepgramAPIKey($0) }
-                    )
-                )
             }
 
             settingsGroup("Response captions") {
@@ -487,16 +507,6 @@ struct OpenClickySettingsView: View {
                 case .openAIRealtime:
                     EmptyView()
                 case .elevenLabs:
-                    secureFieldRow(
-                        title: "ElevenLabs API key",
-                        subtitle: "Used for spoken OpenClicky replies.",
-                        systemImageName: "speaker.wave.2",
-                        placeholder: "ElevenLabs key",
-                        text: Binding(
-                            get: { userElevenLabsAPIKey },
-                            set: { userElevenLabsAPIKey = $0; companionManager.setElevenLabsAPIKey($0) }
-                        )
-                    )
                     textFieldRow(
                         title: "ElevenLabs voice ID",
                         subtitle: "Optional custom voice override.",
@@ -508,16 +518,6 @@ struct OpenClickySettingsView: View {
                         )
                     )
                 case .cartesia:
-                    secureFieldRow(
-                        title: "Cartesia API key",
-                        subtitle: "Used for spoken OpenClicky replies.",
-                        systemImageName: "speaker.wave.2",
-                        placeholder: "Cartesia key",
-                        text: Binding(
-                            get: { userCartesiaAPIKey },
-                            set: { userCartesiaAPIKey = $0; companionManager.setCartesiaAPIKey($0) }
-                        )
-                    )
                     textFieldRow(
                         title: "Cartesia voice ID",
                         subtitle: "Optional custom voice override.",
@@ -529,7 +529,7 @@ struct OpenClickySettingsView: View {
                         )
                     )
                 case .deepgram:
-                    Text("Deepgram TTS reuses the Deepgram API key set under Transcription.")
+                    Text("Deepgram TTS reuses the Deepgram API key set under API Keys.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 4)
@@ -541,6 +541,37 @@ struct OpenClickySettingsView: View {
                         text: Binding(
                             get: { userDeepgramTTSVoice },
                             set: { userDeepgramTTSVoice = $0; companionManager.setDeepgramTTSVoice($0) }
+                        )
+                    )
+                case .microsoftEdge:
+                    Text("Microsoft Edge voices are the free online Read Aloud voices and do not need an API key.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+                        ForEach(MicrosoftEdgeVoiceOption.recommended) { voice in
+                            optionButton(
+                                title: voice.label,
+                                subtitle: voice.subtitle,
+                                isSelected: AppBundleConfiguration.microsoftEdgeVoiceID() == voice.id,
+                                action: {
+                                    userMicrosoftEdgeVoiceID = voice.id
+                                    companionManager.setMicrosoftEdgeVoiceID(voice.id)
+                                }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 4)
+
+                    textFieldRow(
+                        title: "Microsoft Edge voice ID",
+                        subtitle: "Optional override for any Edge voice, e.g. en-US-AriaNeural.",
+                        systemImageName: "person.wave.2",
+                        placeholder: "en-US-EmmaMultilingualNeural",
+                        text: Binding(
+                            get: { userMicrosoftEdgeVoiceID },
+                            set: { userMicrosoftEdgeVoiceID = $0; companionManager.setMicrosoftEdgeVoiceID($0) }
                         )
                     )
                 }
@@ -557,8 +588,88 @@ struct OpenClickySettingsView: View {
                     select: { companionManager.setSelectedComputerUseModel($0) }
                 )
             }
+        }
+    }
 
-            settingsGroup("Permissions") {
+    private var apiKeysPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsGroup("OpenAI and Claude") {
+                secureFieldRow(
+                    title: "Codex/OpenAI API key",
+                    subtitle: "Used for Agent Mode overrides and GPT Realtime voice when a key is needed.",
+                    systemImageName: "key",
+                    placeholder: "OpenAI key",
+                    text: Binding(
+                        get: { userCodexAgentAPIKey },
+                        set: { userCodexAgentAPIKey = $0; companionManager.setCodexAgentAPIKey($0) }
+                    )
+                )
+
+                secureFieldRow(
+                    title: "Anthropic API key",
+                    subtitle: "Optional key for Claude voice and pointing providers.",
+                    systemImageName: "key",
+                    placeholder: "Anthropic key",
+                    text: Binding(
+                        get: { userAnthropicAPIKey },
+                        set: { userAnthropicAPIKey = $0; companionManager.setAnthropicAPIKey($0) }
+                    )
+                )
+            }
+
+            settingsGroup("Listening providers") {
+                secureFieldRow(
+                    title: "AssemblyAI listening key",
+                    subtitle: "Used by the AssemblyAI streaming transcription provider.",
+                    systemImageName: "key",
+                    placeholder: "AssemblyAI key",
+                    text: Binding(
+                        get: { userAssemblyAIAPIKey },
+                        set: { userAssemblyAIAPIKey = $0; companionManager.setAssemblyAIAPIKey($0) }
+                    )
+                )
+
+                secureFieldRow(
+                    title: "Deepgram listening key",
+                    subtitle: "Used by the Deepgram streaming transcription provider and Deepgram TTS.",
+                    systemImageName: "key",
+                    placeholder: "Deepgram key",
+                    text: Binding(
+                        get: { userDeepgramAPIKey },
+                        set: { userDeepgramAPIKey = $0; companionManager.setDeepgramAPIKey($0) }
+                    )
+                )
+            }
+
+            settingsGroup("Playback providers") {
+                secureFieldRow(
+                    title: "ElevenLabs API key",
+                    subtitle: "Used for spoken OpenClicky replies when ElevenLabs is selected.",
+                    systemImageName: "key",
+                    placeholder: "ElevenLabs key",
+                    text: Binding(
+                        get: { userElevenLabsAPIKey },
+                        set: { userElevenLabsAPIKey = $0; companionManager.setElevenLabsAPIKey($0) }
+                    )
+                )
+
+                secureFieldRow(
+                    title: "Cartesia API key",
+                    subtitle: "Used for spoken OpenClicky replies when Cartesia is selected.",
+                    systemImageName: "key",
+                    placeholder: "Cartesia key",
+                    text: Binding(
+                        get: { userCartesiaAPIKey },
+                        set: { userCartesiaAPIKey = $0; companionManager.setCartesiaAPIKey($0) }
+                    )
+                )
+            }
+        }
+    }
+
+    private var permissionsPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsGroup("Core permissions") {
                 permissionRow(
                     title: "Accessibility",
                     isGranted: companionManager.hasAccessibilityPermission,
@@ -579,6 +690,29 @@ struct OpenClickySettingsView: View {
                     isGranted: companionManager.hasMicrophonePermission,
                     settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
                 )
+                permissionRow(
+                    title: "Full Disk Access",
+                    isGranted: companionManager.hasFullDiskAccessPermission,
+                    settingsURL: OpenClickyMacPrivacyPermissionProbe.fullDiskAccessSettingsURL
+                )
+            }
+
+            settingsGroup("Actions") {
+                actionRow(title: "Refresh permission status", systemImageName: "checklist") {
+                    companionManager.refreshAllPermissions()
+                }
+                actionRow(title: "Open Accessibility settings", systemImageName: "hand.raised") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                }
+                actionRow(title: "Open Screen Recording settings", systemImageName: "rectangle.on.rectangle") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                }
+                actionRow(title: "Open Microphone settings", systemImageName: "mic") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                }
+                actionRow(title: "Open Full Disk Access settings", systemImageName: "externaldrive.badge.checkmark") {
+                    companionManager.openFullDiskAccessSettings()
+                }
             }
         }
     }
@@ -664,50 +798,11 @@ struct OpenClickySettingsView: View {
                 }
             }
 
-            settingsGroup("Additional macOS access") {
-                permissionRow(
-                    title: "Full Disk Access",
-                    isGranted: companionManager.hasFullDiskAccessPermission,
-                    settingsURL: OpenClickyMacPrivacyPermissionProbe.fullDiskAccessSettingsURL
-                )
+            settingsGroup("Automation access") {
                 valueRow(
                     title: "Automation",
-                    subtitle: "macOS grants Automation per target app. OpenClicky can trigger the prompt for an app the first time it sends an Apple Event.",
+                    subtitle: "macOS grants Automation per target app when OpenClicky first sends an Apple Event.",
                     systemImageName: "terminal"
-                )
-                actionRow(title: "Open Automation settings", systemImageName: "slider.horizontal.3") {
-                    companionManager.openAutomationSettings()
-                }
-                actionRow(title: "Prime Reminders automation prompt", systemImageName: "checklist") {
-                    companionManager.requestRemindersAutomationPermission()
-                }
-            }
-
-            settingsGroup("Agent Mode behavior") {
-                valueRow(
-                    title: "Screen context source",
-                    subtitle: companionManager.selectedComputerUseBackend == .backgroundComputerUse
-                        ? "Agent Mode first asks Background Computer Use for the focused window screenshot, then falls back if unavailable."
-                        : nativeComputerUseController.isEnabled
-                            ? "Agent Mode first captures the focused target window through the native CUA Swift path, then falls back if unavailable."
-                            : "Agent Mode uses the existing all-screen capture path until native computer use is enabled.",
-                    systemImageName: "photo.on.rectangle"
-                )
-                valueRow(
-                    title: "Selected backend",
-                    subtitle: companionManager.selectedComputerUseBackend.label,
-                    systemImageName: "switch.2"
-                )
-                valueRow(
-                    title: "Existing CUA Driver MCP",
-                    subtitle: CuaDriverMCPConfiguration.resolvedCommandPath()
-                        ?? "Not installed locally. OpenClicky will auto-register upstream Cua Driver MCP when /Applications/CuaDriver.app or cua-driver is available.",
-                    systemImageName: "point.3.connected.trianglepath.dotted"
-                )
-                valueRow(
-                    title: "Bundled implementation",
-                    subtitle: "Embedded Swift adapted from CUA Driver's MIT app/window discovery, ScreenCaptureKit, and pid-keyboard patterns — no external MCP server required.",
-                    systemImageName: "shippingbox"
                 )
             }
         }
@@ -716,16 +811,6 @@ struct OpenClickySettingsView: View {
     private var agentModePanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsGroup("Agent Mode") {
-                toggleRow(
-                    title: "Advanced mode",
-                    subtitle: "Keeps chat and agent controls available.",
-                    systemImageName: "slider.horizontal.3",
-                    isOn: Binding(
-                        get: { companionManager.isAdvancedModeEnabled },
-                        set: { companionManager.setAdvancedModeEnabled($0) }
-                    )
-                )
-
                 modelOptionGrid(
                     options: OpenClickyModelCatalog.codexActionsModels,
                     selectedModelID: session.model,
@@ -743,43 +828,27 @@ struct OpenClickySettingsView: View {
                             session.workingDirectoryPath = newValue
                             UserDefaults.standard.set(newValue, forKey: "clickyCodexWorkingDirectory")
                         }
-                    )
+                    ),
+                    openPath: { session.workingDirectoryPath }
                 )
             }
+
+            pointingPanel
+
+            computerUsePanel
 
             settingsGroup("Agent dock position") {
                 AgentParkingPositionPicker(
                     selection: Binding(
                         get: { companionManager.agentParkingPosition },
                         set: { companionManager.setAgentParkingPosition($0) }
-                    )
+                    ),
+                    calibrationChanged: { position, offset in
+                        companionManager.setAgentParkingCalibrationOffset(offset, for: position)
+                    }
                 )
                 .padding(.horizontal, 4)
-                .padding(.vertical, 4)
-            }
-
-            settingsGroup("Agent authentication") {
-                secureFieldRow(
-                    title: "Codex/OpenAI API key",
-                    subtitle: "Optional override. Leave blank to use local Codex ChatGPT sign-in where available.",
-                    systemImageName: "terminal",
-                    placeholder: "OpenAI key",
-                    text: Binding(
-                        get: { userCodexAgentAPIKey },
-                        set: { userCodexAgentAPIKey = $0; companionManager.setCodexAgentAPIKey($0) }
-                    )
-                )
-
-                secureFieldRow(
-                    title: "Anthropic API key",
-                    subtitle: "Optional key for Claude voice and pointing providers.",
-                    systemImageName: "key",
-                    placeholder: "Anthropic key",
-                    text: Binding(
-                        get: { userAnthropicAPIKey },
-                        set: { userAnthropicAPIKey = $0; companionManager.setAnthropicAPIKey($0) }
-                    )
-                )
+                .padding(.vertical, 10)
             }
 
             if companionManager.isAdvancedModeEnabled {
@@ -791,6 +860,23 @@ struct OpenClickySettingsView: View {
                         companionManager.warmUpCodexAgentMode()
                     }
                 }
+
+                #if DEBUG
+                settingsGroup("Developer tools") {
+                    actionRow(title: "Test cursor flight", systemImageName: "arrow.up.right") {
+                        companionManager.debugTestCursorFlight()
+                    }
+                    actionRow(title: "Show response card", systemImageName: "text.bubble") {
+                        companionManager.debugShowResponseCard()
+                    }
+                    actionRow(title: "Capture screen context", systemImageName: "camera") {
+                        companionManager.debugCaptureAgentScreenContext()
+                    }
+                    actionRow(title: "Reset transient UI", systemImageName: "xmark.circle", role: .destructive) {
+                        companionManager.debugResetTransientUI()
+                    }
+                }
+                #endif
             }
         }
     }
@@ -825,7 +911,8 @@ struct OpenClickySettingsView: View {
                 valueRow(
                     title: "Storage",
                     subtitle: gogCLIStatus.configPath ?? "gogcli manages its own local config and keyring.",
-                    systemImageName: "externaldrive.badge.person.crop"
+                    systemImageName: "externaldrive.badge.person.crop",
+                    openPath: gogCLIStatus.configPath
                 )
             }
 
@@ -891,12 +978,14 @@ struct OpenClickySettingsView: View {
                 valueRow(
                     title: "Memory file",
                     subtitle: companionManager.codexHomeManager.persistentMemoryFile.path,
-                    systemImageName: "doc.text"
+                    systemImageName: "doc.text",
+                    openPath: companionManager.codexHomeManager.persistentMemoryFile.path
                 )
                 valueRow(
                     title: "Learned skills",
                     subtitle: companionManager.codexHomeManager.learnedSkillsDirectory.path,
-                    systemImageName: "wand.and.stars"
+                    systemImageName: "wand.and.stars",
+                    openPath: companionManager.codexHomeManager.learnedSkillsDirectory.path
                 )
                 valueRow(
                     title: "Knowledge index",
@@ -934,7 +1023,8 @@ struct OpenClickySettingsView: View {
                 valueRow(
                     title: "Message log",
                     subtitle: OpenClickyMessageLogStore.shared.currentLogFile.path,
-                    systemImageName: "doc.text.magnifyingglass"
+                    systemImageName: "doc.text.magnifyingglass",
+                    openPath: OpenClickyMessageLogStore.shared.currentLogFile.path
                 )
                 actionRow(title: "Open log viewer", systemImageName: "list.bullet.rectangle") {
                     companionManager.showLogViewerWindow()
@@ -1054,6 +1144,44 @@ struct OpenClickySettingsView: View {
         NSWorkspace.shared.open(url)
     }
 
+    private func openSettingsPath(_ rawPath: String) {
+        let path = normalizedSettingsPath(rawPath)
+        guard !path.isEmpty else { return }
+
+        let url = URL(fileURLWithPath: path)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        openSettingsFileInTextEditor(url)
+    }
+
+    private func normalizedSettingsPath(_ rawPath: String) -> String {
+        let path = rawPath
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\ ", with: " ")
+            .replacingOccurrences(of: "file://", with: "")
+
+        return (path as NSString).expandingTildeInPath
+    }
+
+    private func openSettingsFileInTextEditor(_ url: URL) {
+        let textEditURL = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        guard FileManager.default.fileExists(atPath: textEditURL.path) else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([url], withApplicationAt: textEditURL, configuration: configuration) { _, error in
+            if error != nil {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
     private func settingsGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title)
@@ -1089,7 +1217,7 @@ struct OpenClickySettingsView: View {
         .padding(.vertical, 11)
     }
 
-    private func valueRow(title: String, subtitle: String, systemImageName: String) -> some View {
+    private func valueRow(title: String, subtitle: String, systemImageName: String, openPath: String? = nil) -> some View {
         HStack(spacing: 12) {
             rowIcon(systemImageName)
             VStack(alignment: .leading, spacing: 3) {
@@ -1101,6 +1229,9 @@ struct OpenClickySettingsView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            if let openPath, !openPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                settingsPathOpenButton(openPath)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
@@ -1124,11 +1255,23 @@ struct OpenClickySettingsView: View {
         .padding(.vertical, 11)
     }
 
-    private func textFieldRow(title: String, subtitle: String, systemImageName: String, placeholder: String, text: Binding<String>) -> some View {
+    private func textFieldRow(
+        title: String,
+        subtitle: String,
+        systemImageName: String,
+        placeholder: String,
+        text: Binding<String>,
+        openPath: (() -> String)? = nil
+    ) -> some View {
         editableFieldRow(title: title, subtitle: subtitle, systemImageName: systemImageName) {
-            TextField(placeholder, text: text)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12))
+            HStack(spacing: 8) {
+                TextField(placeholder, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                if let openPath {
+                    settingsPathOpenButton(openPath())
+                }
+            }
         }
     }
 
@@ -1174,6 +1317,37 @@ struct OpenClickySettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func settingsPathOpenButton(_ rawPath: String) -> some View {
+        Button {
+            openSettingsPath(rawPath)
+        } label: {
+            Image(systemName: settingsPathOpenIconName(for: rawPath))
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .help(settingsPathOpenHelpText(for: rawPath))
+        .accessibilityLabel(settingsPathOpenHelpText(for: rawPath))
+    }
+
+    private func settingsPathOpenIconName(for rawPath: String) -> String {
+        var isDirectory: ObjCBool = false
+        let path = normalizedSettingsPath(rawPath)
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return "folder"
+        }
+        return "square.and.pencil"
+    }
+
+    private func settingsPathOpenHelpText(for rawPath: String) -> String {
+        var isDirectory: ObjCBool = false
+        let path = normalizedSettingsPath(rawPath)
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return "Open folder"
+        }
+        return "Open in TextEdit"
     }
 
     private func permissionRow(title: String, isGranted: Bool, settingsURL: URL) -> some View {
@@ -1423,18 +1597,22 @@ struct OpenClickySettingsView: View {
 /// any dot selects that parking position and updates the binding.
 struct AgentParkingPositionPicker: View {
     @Binding var selection: AgentParkingPosition
+    var calibrationChanged: (AgentParkingPosition, CGSize) -> Void = { _, _ in }
+    @State private var activeDragPosition: AgentParkingPosition?
+    @State private var dragPreviewOffsets: [AgentParkingPosition: CGSize] = [:]
 
-    private let aspectRatio: CGFloat = 16.0 / 10.0
     private let dotSize: CGFloat = 18
+    private let hitTargetSize: CGFloat = 36
     private let outlineColor = Color.secondary.opacity(0.55)
     private let selectedColor = Color.accentColor
+    private let coordinateSpaceName = "AgentParkingPositionPreview"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Where agents park")
                 .font(.headline)
 
-            Text("Pick the corner of the screen where the agent dock should appear.")
+            Text("Pick where the agent dock parks, or drag a dot to fine-tune the corner.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
@@ -1456,33 +1634,82 @@ struct AgentParkingPositionPicker: View {
                         Button {
                             selection = position
                         } label: {
-                            Circle()
-                                .fill(position == selection ? selectedColor : Color.clear)
-                                .overlay(
-                                    Circle().stroke(
-                                        position == selection ? selectedColor : outlineColor,
-                                        lineWidth: position == selection ? 0 : 1.5
+                            ZStack {
+                                Circle()
+                                    .fill(Color.primary.opacity(0.001))
+                                    .frame(width: hitTargetSize, height: hitTargetSize)
+
+                                Circle()
+                                    .fill(position == selection ? selectedColor : Color.clear)
+                                    .overlay(
+                                        Circle().stroke(
+                                            position == selection ? selectedColor : outlineColor,
+                                            lineWidth: position == selection ? 0 : 1.5
+                                        )
                                     )
-                                )
-                                .frame(width: dotSize, height: dotSize)
+                                    .frame(width: dotSize, height: dotSize)
+
+                                if position == selection || position == activeDragPosition {
+                                    ParkingCornerDragIndicator(
+                                        tint: position == activeDragPosition ? selectedColor : outlineColor.opacity(0.82),
+                                        isActive: position == activeDragPosition
+                                    )
+                                }
+                            }
+                            .frame(width: hitTargetSize, height: hitTargetSize)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .help(position.label)
                         .position(x: dotPosition.x, y: dotPosition.y)
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpaceName))
+                                .onChanged { value in
+                                    let clampedLocation = CGPoint(
+                                        x: min(max(value.location.x, frame.minX), frame.maxX),
+                                        y: min(max(value.location.y, frame.minY), frame.maxY)
+                                    )
+                                    let basePoint = baseAbsolutePoint(for: position, in: frame)
+                                    let previewOffset = CGSize(
+                                        width: clampedLocation.x - basePoint.x,
+                                        height: clampedLocation.y - basePoint.y
+                                    )
+                                    selection = position
+                                    activeDragPosition = position
+                                    dragPreviewOffsets[position] = previewOffset
+                                    calibrationChanged(
+                                        position,
+                                        screenOffset(from: previewOffset, previewFrame: frame)
+                                    )
+                                }
+                                .onEnded { _ in
+                                    activeDragPosition = nil
+                                }
+                        )
                     }
                 }
+                .coordinateSpace(name: coordinateSpaceName)
             }
-            .frame(height: 160)
+            .frame(height: 176)
+            .padding(.vertical, 6)
 
-            Text(selection.label)
+            Text(activeDragPosition == selection ? "\(selection.label) — drag to correct placement" : selection.label)
                 .font(.subheadline)
                 .foregroundStyle(.primary)
         }
     }
 
+    private var mainScreenAspectRatio: CGFloat {
+        guard let frame = NSScreen.main?.frame, frame.width > 0, frame.height > 0 else {
+            return 16.0 / 10.0
+        }
+        return frame.width / frame.height
+    }
+
     private func previewRect(in size: CGSize) -> CGRect {
         let availableHeight = size.height
         let availableWidth = size.width
+        let aspectRatio = mainScreenAspectRatio
         let widthFromHeight = availableHeight * aspectRatio
         let heightFromWidth = availableWidth / aspectRatio
         let width: CGFloat
@@ -1500,10 +1727,70 @@ struct AgentParkingPositionPicker: View {
     }
 
     private func absolutePoint(for position: AgentParkingPosition, in frame: CGRect) -> CGPoint {
+        let basePoint = baseAbsolutePoint(for: position, in: frame)
+        let previewOffset = dragPreviewOffsets[position]
+            ?? previewOffset(from: AgentParkingPosition.calibrationOffset(for: position), previewFrame: frame)
+        return CGPoint(
+            x: min(max(basePoint.x + previewOffset.width, frame.minX), frame.maxX),
+            y: min(max(basePoint.y + previewOffset.height, frame.minY), frame.maxY)
+        )
+    }
+
+    private func baseAbsolutePoint(for position: AgentParkingPosition, in frame: CGRect) -> CGPoint {
         let anchor = position.normalizedAnchor
         return CGPoint(
             x: frame.minX + anchor.x * frame.width,
             y: frame.minY + anchor.y * frame.height
         )
+    }
+
+    private func previewOffset(from screenOffset: CGSize, previewFrame frame: CGRect) -> CGSize {
+        CGSize(
+            width: screenOffset.width * frame.width / max(mainScreenSize.width, 1),
+            height: -screenOffset.height * frame.height / max(mainScreenSize.height, 1)
+        )
+    }
+
+    private func screenOffset(from previewOffset: CGSize, previewFrame frame: CGRect) -> CGSize {
+        CGSize(
+            width: previewOffset.width / max(frame.width, 1) * mainScreenSize.width,
+            height: -previewOffset.height / max(frame.height, 1) * mainScreenSize.height
+        )
+    }
+
+    private var mainScreenSize: CGSize {
+        guard let frame = NSScreen.main?.frame, frame.width > 0, frame.height > 0 else {
+            return CGSize(width: 1600, height: 1000)
+        }
+        return frame.size
+    }
+}
+
+private struct ParkingCornerDragIndicator: View {
+    let tint: Color
+    let isActive: Bool
+
+    var body: some View {
+        ZStack {
+            ForEach(0..<4, id: \.self) { index in
+                ParkingCornerBracket()
+                    .stroke(tint, style: StrokeStyle(lineWidth: isActive ? 2.2 : 1.4, lineCap: .round, lineJoin: .round))
+                    .frame(width: 14, height: 14)
+                    .rotationEffect(.degrees(Double(index) * 90))
+                    .offset(x: index == 0 || index == 3 ? -13 : 13, y: index < 2 ? -13 : 13)
+            }
+        }
+        .frame(width: 44, height: 44)
+        .opacity(isActive ? 1 : 0.72)
+    }
+}
+
+private struct ParkingCornerBracket: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        return path
     }
 }

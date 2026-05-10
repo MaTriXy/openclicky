@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 nonisolated enum OpenClickyComputerUseBackendID: String, CaseIterable, Identifiable, Sendable {
@@ -121,6 +122,10 @@ struct OpenClickyComputerUseWindowInfo: Identifiable, Sendable, Codable, Hashabl
 
     var focusedTargetSummary: String {
         "\(displayTitle) · pid \(pid) · window \(id)"
+    }
+
+    var bundleIdentifier: String? {
+        NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
     }
 
     var agentContextNote: String {
@@ -347,6 +352,12 @@ struct OpenClickyBackgroundComputerUseWindowCapture: Sendable, Hashable {
         }
 
         return "\(bundleID) - \(trimmedTitle)"
+    }
+
+    var appName: String {
+        let localizedName = NSRunningApplication(processIdentifier: pid)?.localizedName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return localizedName?.isEmpty == false ? localizedName ?? bundleID : bundleID
     }
 
     var label: String {

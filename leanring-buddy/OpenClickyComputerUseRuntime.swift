@@ -89,11 +89,13 @@ final class OpenClickyNativeComputerUseController: ObservableObject {
 
     func pressKey(_ key: String, modifiers: [String] = [], toPid pid: pid_t? = nil) throws {
         guard isEnabled else { throw OpenClickyComputerUseError.disabled }
+        OpenClickyApplicationUsageLogStore.shared.recordFrontmostApplication(source: "native_cua_key_press")
         try OpenClickyComputerUseKeyboardInput.press(key, modifiers: modifiers, toPid: pid)
     }
 
     func typeText(_ text: String, delayMilliseconds: Int = 30, toPid pid: pid_t? = nil) throws {
         guard isEnabled else { throw OpenClickyComputerUseError.disabled }
+        OpenClickyApplicationUsageLogStore.shared.recordFrontmostApplication(source: "native_cua_text_input")
         try OpenClickyComputerUseKeyboardInput.typeCharacters(text, delayMilliseconds: delayMilliseconds, toPid: pid)
     }
 
@@ -264,6 +266,11 @@ final class OpenClickyBackgroundComputerUseController: ObservableObject {
 
     func pressKey(_ key: String, modifiers: [String] = [], targetAppName: String? = nil) async throws -> OpenClickyBackgroundComputerUseActionResult {
         let target = try await resolveTargetWindow(appName: targetAppName)
+        OpenClickyApplicationUsageLogStore.shared.recordApplication(
+            name: targetAppName,
+            bundleIdentifier: target.bundleID,
+            source: "background_computer_use_key_press"
+        )
         let chord = (modifiers + [key]).filter { !$0.isEmpty }.joined(separator: "+")
         let request = OpenClickyBackgroundComputerUsePressKeyRequest(
             window: target.windowID,
@@ -290,6 +297,11 @@ final class OpenClickyBackgroundComputerUseController: ObservableObject {
 
     func typeText(_ text: String, targetAppName: String? = nil) async throws -> OpenClickyBackgroundComputerUseActionResult {
         let target = try await resolveTargetWindow(appName: targetAppName)
+        OpenClickyApplicationUsageLogStore.shared.recordApplication(
+            name: targetAppName,
+            bundleIdentifier: target.bundleID,
+            source: "background_computer_use_text_input"
+        )
         let request = OpenClickyBackgroundComputerUseTypeTextRequest(
             window: target.windowID,
             text: text,

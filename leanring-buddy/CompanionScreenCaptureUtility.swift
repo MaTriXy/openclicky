@@ -13,6 +13,8 @@ import ScreenCaptureKit
 struct CompanionScreenCapture {
     let imageData: Data
     let label: String
+    let appName: String?
+    let bundleIdentifier: String?
     let isCursorScreen: Bool
     let displayWidthInPoints: Int
     let displayHeightInPoints: Int
@@ -57,6 +59,17 @@ enum CompanionScreenCaptureUtility {
     /// whether the user's cursor is on that screen. This gives the AI
     /// full context across multiple monitors.
     static func captureAllScreensAsJPEG() async throws -> [CompanionScreenCapture] {
+        try await captureScreensAsJPEG(cursorScreenOnly: false)
+    }
+
+    /// Captures only the display that currently contains the cursor. Agent
+    /// Mode uses this for default screen context so a multi-monitor setup
+    /// doesn't leak unrelated screens into the background-agent prompt.
+    static func captureCursorScreenAsJPEG() async throws -> [CompanionScreenCapture] {
+        try await captureScreensAsJPEG(cursorScreenOnly: true)
+    }
+
+    private static func captureScreensAsJPEG(cursorScreenOnly: Bool) async throws -> [CompanionScreenCapture] {
         let content = try await currentShareableContent()
 
         guard !content.displays.isEmpty else {
@@ -69,9 +82,15 @@ enum CompanionScreenCaptureUtility {
         // Exclude all windows belonging to this app so the AI sees
         // only the user's content, not our overlays or panels.
         let ownBundleIdentifier = Bundle.main.bundleIdentifier
+        recordEncounteredApplications(
+            from: content.windows,
+            excludingBundleIdentifier: ownBundleIdentifier,
+            source: cursorScreenOnly ? "cursor_screen_capture" : "all_screens_capture"
+        )
         let ownAppWindows = content.windows.filter { window in
             window.owningApplication?.bundleIdentifier == ownBundleIdentifier
         }
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
 
         // Build a lookup from display ID to NSScreen so we can use AppKit-coordinate
         // frames instead of CG-coordinate frames. NSEvent.mouseLocation and NSScreen.frame
@@ -96,9 +115,19 @@ enum CompanionScreenCaptureUtility {
             return false
         }
 
+        let displaysToCapture: [SCDisplay]
+        if cursorScreenOnly, let cursorDisplay = sortedDisplays.first(where: { display in
+            let frame = nsScreenByDisplayID[display.displayID]?.frame ?? display.frame
+            return frame.contains(mouseLocation)
+        }) {
+            displaysToCapture = [cursorDisplay]
+        } else {
+            displaysToCapture = sortedDisplays
+        }
+
         var capturedScreens: [CompanionScreenCapture] = []
 
-        for (displayIndex, display) in sortedDisplays.enumerated() {
+        for (displayIndex, display) in displaysToCapture.enumerated() {
             // Use NSScreen.frame (AppKit coordinates, bottom-left origin) so
             // displayFrame is in the same coordinate system as NSEvent.mouseLocation
             // and the overlay window's screenFrame in BlueCursorView.
@@ -131,7 +160,9 @@ enum CompanionScreenCaptureUtility {
             }
 
             let screenLabel: String
-            if sortedDisplays.count == 1 {
+            if cursorScreenOnly {
+                screenLabel = "cursor screen (primary focus)"
+            } else if sortedDisplays.count == 1 {
                 screenLabel = "user's screen (cursor is here)"
             } else if isCursorScreen {
                 screenLabel = "screen \(displayIndex + 1) of \(sortedDisplays.count) — cursor is on this screen (primary focus)"
@@ -142,6 +173,8 @@ enum CompanionScreenCaptureUtility {
             capturedScreens.append(CompanionScreenCapture(
                 imageData: jpegData,
                 label: screenLabel,
+                appName: frontmostApp?.localizedName,
+                bundleIdentifier: frontmostApp?.bundleIdentifier,
                 isCursorScreen: isCursorScreen,
                 displayWidthInPoints: Int(displayFrame.width),
                 displayHeightInPoints: Int(displayFrame.height),
@@ -181,6 +214,7 @@ enum CompanionScreenCaptureUtility {
         }) else {
             return try await captureAllScreensAsJPEG()
         }
+        recordEncounteredApplication(from: targetWindow, source: "focused_window_capture")
 
         let filter = SCContentFilter(desktopIndependentWindow: targetWindow)
         let configuration = SCStreamConfiguration()
@@ -218,6 +252,8 @@ enum CompanionScreenCaptureUtility {
         return [CompanionScreenCapture(
             imageData: jpegData,
             label: windowLabel,
+            appName: appName,
+            bundleIdentifier: frontmostApp?.bundleIdentifier,
             isCursorScreen: windowFrameInAppKit.contains(mouseLocation),
             displayWidthInPoints: windowWidth,
             displayHeightInPoints: windowHeight,
@@ -225,6 +261,41 @@ enum CompanionScreenCaptureUtility {
             screenshotWidthInPixels: configuration.width,
             screenshotHeightInPixels: configuration.height
         )]
+    }
+
+    private static func recordEncounteredApplications(
+        from windows: [SCWindow],
+        excludingBundleIdentifier ownBundleIdentifier: String?,
+        source: String
+    ) {
+        var seen = Set<String>()
+        for window in windows {
+            guard window.isOnScreen,
+                  window.frame.width > 100,
+                  window.frame.height > 80,
+                  let app = window.owningApplication else {
+                continue
+            }
+            let bundleIdentifier = app.bundleIdentifier
+            guard bundleIdentifier != ownBundleIdentifier else { continue }
+            let key = bundleIdentifier.isEmpty ? app.applicationName : bundleIdentifier
+            guard !key.isEmpty, !seen.contains(key) else { continue }
+            seen.insert(key)
+            OpenClickyApplicationUsageLogStore.shared.recordApplication(
+                name: app.applicationName,
+                bundleIdentifier: bundleIdentifier,
+                source: source
+            )
+        }
+    }
+
+    private static func recordEncounteredApplication(from window: SCWindow, source: String) {
+        guard let app = window.owningApplication else { return }
+        OpenClickyApplicationUsageLogStore.shared.recordApplication(
+            name: app.applicationName,
+            bundleIdentifier: app.bundleIdentifier,
+            source: source
+        )
     }
 
     private static func appKitFrame(for window: SCWindow, displays: [SCDisplay]) -> CGRect {

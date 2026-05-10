@@ -20,9 +20,6 @@ struct CompanionPanelView: View {
     @State private var isShowingHatchSheet: Bool = false
     @State private var hatchPetName: String = ""
     @State private var hatchPetDescription: String = ""
-    #if DEBUG
-    @State private var showDevTools = false
-    #endif
     private let setPanelPinned: (Bool) -> Void
     private let onPanelDismiss: () -> Void
     private let onQuit: () -> Void
@@ -1295,15 +1292,6 @@ struct CompanionPanelView: View {
                 Spacer()
 
                 HStack(spacing: 9) {
-                    #if DEBUG
-                    footerIconButton(
-                        systemImageName: "wrench",
-                        helpText: "Developer tools",
-                        isActive: showDevTools,
-                        action: toggleDevTools
-                    )
-                    #endif
-
                     if companionManager.hasCompletedOnboarding && companionManager.isAdvancedModeEnabled {
                         footerIconButton(
                             systemImageName: "books.vertical",
@@ -1327,13 +1315,6 @@ struct CompanionPanelView: View {
                     )
                 }
             }
-
-            #if DEBUG
-            if showDevTools {
-                devToolsSection
-                    .padding(.top, 8)
-            }
-            #endif
         }
     }
 
@@ -1362,87 +1343,6 @@ struct CompanionPanelView: View {
         .pointerCursor()
         .help(helpText)
     }
-
-    #if DEBUG
-    private func toggleDevTools() {
-        withAnimation(.easeOut(duration: 0.16)) {
-            showDevTools.toggle()
-        }
-        schedulePanelContentSizeRefresh()
-    }
-
-    private var devToolsSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            devToolRow("Test cursor flight", systemImage: "arrow.up.right") {
-                companionManager.debugTestCursorFlight()
-                onPanelDismiss()
-            }
-
-            devToolRow("Show response card", systemImage: "text.bubble") {
-                companionManager.debugShowResponseCard()
-            }
-
-            devToolRow("Capture screen context", systemImage: "camera") {
-                companionManager.debugCaptureAgentScreenContext()
-            }
-
-            devToolRow("Reset transient UI", systemImage: "xmark.circle", destructive: true) {
-                companionManager.debugResetTransientUI()
-            }
-        }
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(DS.Colors.surface1)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
-        )
-    }
-
-    private func devToolRow(
-        _ title: String,
-        systemImage: String,
-        destructive: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(destructive ? .red.opacity(0.72) : DS.Colors.textTertiary)
-                    .frame(width: 16)
-
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(destructive ? .red.opacity(0.72) : DS.Colors.textSecondary)
-
-                Spacer()
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(DevToolRowButtonStyle())
-        .pointerCursor()
-    }
-
-    private struct DevToolRowButtonStyle: ButtonStyle {
-        @State private var isHovered = false
-
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label
-                .background(
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(configuration.isPressed
-                              ? DS.Colors.surface4
-                              : isHovered ? DS.Colors.surface3 : Color.clear)
-                )
-                .onHover { isHovered = $0 }
-        }
-    }
-    #endif
 
     // MARK: - Footer
 

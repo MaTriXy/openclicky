@@ -36,6 +36,7 @@ struct CodexAgentModePanelSection: View {
     var openFeedback: () -> Void
     var showSettings: () -> Void
     @State private var prompt = ""
+    private static let inlineResponseBottomID = "inline-agent-response-bottom"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -194,11 +195,31 @@ struct CodexAgentModePanelSection: View {
                 }
             }
 
-            Text(inlineOverlayCaption)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(DS.Colors.textPrimary)
-                .lineLimit(5)
-                .fixedSize(horizontal: false, vertical: true)
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(inlineOverlayCaption)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.inlineResponseBottomID)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.vertical, 8)
+                }
+                .frame(maxHeight: 78, alignment: .topLeading)
+                .mask(CodexInlineResponseScrollFadeMask())
+                .onAppear { scrollInlineResponseToBottom(proxy, animated: false) }
+                .onChange(of: inlineOverlayCaption) { _, _ in
+                    scrollInlineResponseToBottom(proxy, animated: true)
+                }
+            }
 
             if !inlineSuggestedActions.isEmpty {
                 HStack(spacing: 6) {
@@ -317,6 +338,20 @@ struct CodexAgentModePanelSection: View {
             return caption
         }
         return inlineAgentResponseText ?? inlineAgentPlaceholder
+    }
+
+
+    private func scrollInlineResponseToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            let action = {
+                proxy.scrollTo(Self.inlineResponseBottomID, anchor: .bottom)
+            }
+            if animated {
+                withAnimation(.easeOut(duration: 0.18), action)
+            } else {
+                action()
+            }
+        }
     }
 
     private var inlineSuggestedActions: [String] {
@@ -453,6 +488,21 @@ struct CodexAgentModePanelSection: View {
     }
 }
 
+private struct CodexInlineResponseScrollFadeMask: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: .black, location: 0.05),
+                .init(color: .black, location: 0.95),
+                .init(color: .clear, location: 1.0)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
 struct CodexAgentModeSettingsSheet: View {
     @ObservedObject var session: CodexAgentSession
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
@@ -511,13 +561,6 @@ struct CodexAgentModeSettingsSheet: View {
                             selectedModelID: selectedCompanionModelID,
                             select: setSelectedCompanionModel
                         )
-                    }
-
-                    settingsSection(
-                        title: "Advanced mode",
-                        subtitle: "Reveals chat, inline agent input, model controls, API key overrides, and memory tools."
-                    ) {
-                        advancedModeToggleRow
                     }
 
                     if isAdvancedModeEnabled {
@@ -990,37 +1033,6 @@ struct CodexAgentModeSettingsSheet: View {
             Text(value)
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(DS.Colors.textTertiary)
-        }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 8)
-    }
-
-    private var advancedModeToggleRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(DS.Colors.textTertiary)
-                .frame(width: 14)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Advanced mode")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(DS.Colors.textSecondary)
-                Text("Shows chat controls and inline agent tools")
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-
-            Spacer()
-
-            Toggle("", isOn: Binding(
-                get: { isAdvancedModeEnabled },
-                set: { setAdvancedModeEnabled($0) }
-            ))
-            .toggleStyle(.switch)
-            .labelsHidden()
-            .tint(DS.Colors.accent)
-            .scaleEffect(0.7)
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 8)

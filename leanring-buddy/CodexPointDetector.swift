@@ -159,7 +159,9 @@ final class CodexPointDetector {
         }
         arguments.append(contentsOf: [
             "--model", model,
-            "--sandbox", "read-only",
+            "--sandbox", "danger-full-access",
+            "--ask-for-approval", "never",
+            "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             "--cd", workingDirectory.path,
             "--output-last-message", outputURL.path,

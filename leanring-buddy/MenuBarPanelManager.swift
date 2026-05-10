@@ -89,8 +89,9 @@ final class MenuBarPanelManager: NSObject {
 
         button.image = makeClickyMenuBarIcon()
         button.image?.isTemplate = true
-        button.action = #selector(statusItemClicked)
+        button.action = #selector(statusItemClicked(_:))
         button.target = self
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
     /// Draws the clicky triangle as a menu bar icon. Uses the same shape
@@ -138,7 +139,16 @@ final class MenuBarPanelManager: NSObject {
         }
     }
 
-    @objc private func statusItemClicked() {
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusItemContextMenu(from: sender)
+            return
+        }
+
+        togglePanelVisibility()
+    }
+
+    private func togglePanelVisibility() {
         if let panel, panel.isVisible {
             if isPanelPinned {
                 panel.makeKeyAndOrderFront(nil)
@@ -149,6 +159,87 @@ final class MenuBarPanelManager: NSObject {
         } else {
             showPanel()
         }
+    }
+
+    private func showStatusItemContextMenu(from sender: NSStatusBarButton) {
+        let menu = NSMenu()
+
+        let quickItem = NSMenuItem(
+            title: "Quick Ask OpenClicky",
+            action: #selector(quickAskOpenClickyFromStatusMenu),
+            keyEquivalent: ""
+        )
+        quickItem.target = self
+        menu.addItem(quickItem)
+
+        let settingsItem = NSMenuItem(
+            title: "Settings",
+            action: #selector(openSettingsFromStatusMenu),
+            keyEquivalent: ""
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+        menu.addItem(agentHistoryMenuItem())
+
+        menu.popUp(positioning: quickItem, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    private func agentHistoryMenuItem() -> NSMenuItem {
+        let historyItem = NSMenuItem(title: "Task History", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Task History")
+        let sessions = companionManager.codexAgentSessions.reversed()
+
+        if sessions.isEmpty {
+            let emptyItem = NSMenuItem(title: "No tasks yet", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            submenu.addItem(emptyItem)
+        } else {
+            for session in sessions {
+                let item = NSMenuItem(
+                    title: historyTitle(for: session),
+                    action: #selector(openHistorySessionFromStatusMenu(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = session.id
+                submenu.addItem(item)
+            }
+        }
+
+        historyItem.submenu = submenu
+        return historyItem
+    }
+
+    private func historyTitle(for session: CodexAgentSession) -> String {
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackTitle = title.isEmpty ? "Untitled task" : title
+        return "\(statusLabel(for: session.status)) · \(fallbackTitle)"
+    }
+
+    private func statusLabel(for status: CodexAgentSessionStatus) -> String {
+        switch status {
+        case .starting: return "Starting"
+        case .running: return "Working"
+        case .ready: return "Done"
+        case .stopped: return "Stopped"
+        case .failed: return "Failed"
+        }
+    }
+
+    @objc private func quickAskOpenClickyFromStatusMenu() {
+        companionManager.showQuickTextInputFromMenuBar()
+    }
+
+    @objc private func openSettingsFromStatusMenu() {
+        companionManager.showSettingsWindow()
+    }
+
+    @objc private func openHistorySessionFromStatusMenu(_ sender: NSMenuItem) {
+        guard let sessionID = sender.representedObject as? UUID else { return }
+        companionManager.selectCodexAgentSession(sessionID)
+        companionManager.showCodexHUD()
     }
 
     // MARK: - Panel Lifecycle
@@ -487,6 +578,7 @@ final class AgentMenuBarStatusManager: NSObject {
             button.identifier = NSUserInterfaceItemIdentifier(item.id.uuidString)
             button.target = self
             button.action = #selector(agentStatusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageOnly
         }
         return statusItem
@@ -497,12 +589,24 @@ final class AgentMenuBarStatusManager: NSObject {
         button.toolTip = tooltip(for: item)
         button.image = makeAgentStatusIcon(theme: item.accentTheme, status: item.status)
         button.image?.isTemplate = false
+        installDropTarget(on: button, itemID: item.id)
     }
 
     @objc private func agentStatusItemClicked(_ sender: NSStatusBarButton) {
         guard let rawID = sender.identifier?.rawValue,
               let itemID = UUID(uuidString: rawID),
               let item = latestItemsByID[itemID] else { return }
+
+        handleAgentStatusItemClick(item: item, from: sender, isRightClick: NSApp.currentEvent?.type == .rightMouseUp)
+    }
+
+    private func handleAgentStatusItemClick(item: ClickyAgentDockItem, from sender: NSStatusBarButton, isRightClick: Bool) {
+        let itemID = item.id
+
+        if isRightClick {
+            showAgentContextMenu(for: item, from: sender)
+            return
+        }
 
         if let activePopover, activePopover.isShown {
             activePopover.performClose(nil)
@@ -553,6 +657,122 @@ final class AgentMenuBarStatusManager: NSObject {
         popover.contentSize = NSSize(width: 560, height: 360)
         activePopover = popover
         popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+    }
+
+    private func installDropTarget(on button: NSStatusBarButton, itemID: UUID) {
+        let targetIdentifier = NSUserInterfaceItemIdentifier("OpenClickyAgentStatusDropTarget")
+        let dropTarget: AgentStatusItemDropTargetView
+
+        if let existing = button.subviews.first(where: { $0.identifier == targetIdentifier }) as? AgentStatusItemDropTargetView {
+            dropTarget = existing
+        } else {
+            dropTarget = AgentStatusItemDropTargetView(frame: button.bounds)
+            dropTarget.identifier = targetIdentifier
+            dropTarget.autoresizingMask = [.width, .height]
+            button.addSubview(dropTarget)
+        }
+
+        dropTarget.frame = button.bounds
+        dropTarget.configure(
+            itemID: itemID,
+            companionManager: companionManager,
+            clickHandler: { [weak self, weak button] itemID, isRightClick in
+                guard let self,
+                      let button,
+                      let item = self.latestItemsByID[itemID] else { return }
+                self.handleAgentStatusItemClick(item: item, from: button, isRightClick: isRightClick)
+            }
+        )
+    }
+
+    private func showAgentContextMenu(for item: ClickyAgentDockItem, from sender: NSStatusBarButton) {
+        let menu = NSMenu()
+
+        let quickItem = NSMenuItem(
+            title: "Quick Reply",
+            action: #selector(quickReplyToAgentFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        quickItem.target = self
+        quickItem.representedObject = item.id
+        menu.addItem(quickItem)
+
+        let settingsItem = NSMenuItem(
+            title: "Settings",
+            action: #selector(openSettingsFromAgentMenu),
+            keyEquivalent: ""
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+        menu.addItem(agentHistoryMenuItem())
+
+        menu.popUp(positioning: quickItem, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    private func agentHistoryMenuItem() -> NSMenuItem {
+        let historyItem = NSMenuItem(title: "Task History", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Task History")
+        guard let companionManager else {
+            let emptyItem = NSMenuItem(title: "OpenClicky is not ready", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            submenu.addItem(emptyItem)
+            historyItem.submenu = submenu
+            return historyItem
+        }
+
+        let sessions = companionManager.codexAgentSessions.reversed()
+        if sessions.isEmpty {
+            let emptyItem = NSMenuItem(title: "No tasks yet", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            submenu.addItem(emptyItem)
+        } else {
+            for session in sessions {
+                let item = NSMenuItem(
+                    title: historyTitle(for: session),
+                    action: #selector(openHistorySessionFromAgentMenu(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = session.id
+                submenu.addItem(item)
+            }
+        }
+
+        historyItem.submenu = submenu
+        return historyItem
+    }
+
+    private func historyTitle(for session: CodexAgentSession) -> String {
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackTitle = title.isEmpty ? "Untitled task" : title
+        return "\(statusLabel(for: session.status)) · \(fallbackTitle)"
+    }
+
+    private func statusLabel(for status: CodexAgentSessionStatus) -> String {
+        switch status {
+        case .starting: return "Starting"
+        case .running: return "Working"
+        case .ready: return "Done"
+        case .stopped: return "Stopped"
+        case .failed: return "Failed"
+        }
+    }
+
+    @objc private func quickReplyToAgentFromMenu(_ sender: NSMenuItem) {
+        guard let itemID = sender.representedObject as? UUID else { return }
+        companionManager?.showTextFollowUpForAgentDockItem(itemID)
+    }
+
+    @objc private func openSettingsFromAgentMenu() {
+        companionManager?.showSettingsWindow()
+    }
+
+    @objc private func openHistorySessionFromAgentMenu(_ sender: NSMenuItem) {
+        guard let sessionID = sender.representedObject as? UUID else { return }
+        companionManager?.selectCodexAgentSession(sessionID)
+        companionManager?.showCodexHUD()
     }
 
     private func tooltip(for item: ClickyAgentDockItem) -> String {
@@ -628,5 +848,69 @@ final class AgentMenuBarStatusManager: NSObject {
         case .rose: return NSColor(calibratedRed: 1.00, green: 0.31, blue: 0.37, alpha: 1)
         case .white: return NSColor(calibratedWhite: 0.97, alpha: 1)
         }
+    }
+}
+
+private final class AgentStatusItemDropTargetView: NSView {
+    private var itemID: UUID?
+    private weak var companionManager: CompanionManager?
+    private var clickHandler: ((UUID, Bool) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([.fileURL, .URL])
+    }
+
+    func configure(
+        itemID: UUID,
+        companionManager: CompanionManager?,
+        clickHandler: @escaping (UUID, Bool) -> Void
+    ) {
+        self.itemID = itemID
+        self.companionManager = companionManager
+        self.clickHandler = clickHandler
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let itemID else { return }
+        clickHandler?(itemID, false)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let itemID else { return }
+        clickHandler?(itemID, true)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        fileURLs(from: sender.draggingPasteboard).isEmpty ? [] : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        !fileURLs(from: sender.draggingPasteboard).isEmpty
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let itemID else { return false }
+        let urls = fileURLs(from: sender.draggingPasteboard)
+        guard !urls.isEmpty else { return false }
+        companionManager?.attachDroppedAgentFiles(urls, toAgentDockItem: itemID, source: "agent_menu_avatar_drop")
+        return true
+    }
+
+    private func fileURLs(from pasteboard: NSPasteboard) -> [URL] {
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL], !urls.isEmpty {
+            return urls.map(\.standardizedFileURL)
+        }
+
+        let filenames = pasteboard.propertyList(forType: .fileURL) as? [String] ?? []
+        return filenames.map { URL(fileURLWithPath: $0).standardizedFileURL }
     }
 }

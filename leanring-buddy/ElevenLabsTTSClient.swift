@@ -18,6 +18,7 @@
 //
 
 import AVFoundation
+import CryptoKit
 import Foundation
 
 @MainActor
@@ -377,7 +378,8 @@ final class ElevenLabsTTSClient {
     // MARK: - Public lifecycle
 
     var isPlaying: Bool {
-        playerNode?.isPlaying ?? false
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
     }
 
     func stopPlayback() {
@@ -391,7 +393,9 @@ final class ElevenLabsTTSClient {
     private func stopPlaybackInternal() {
         streamingTask?.cancel()
         streamingTask = nil
-        playerNode?.stop()
+        if let playerNode {
+            Self.stopPlayerIfAttached(playerNode)
+        }
         playerNode = nil
         audioEngine?.stop()
         audioEngine = nil
@@ -490,7 +494,7 @@ final class ElevenLabsTTSClient {
         sampleRate: Double = ElevenLabsTTSClient.streamSampleRate
     ) async {
         guard scheduledFrameCount > 0 else {
-            player.stop()
+            stopPlayerIfAttached(player)
             return
         }
 
@@ -516,11 +520,17 @@ final class ElevenLabsTTSClient {
             try? await Task.sleep(nanoseconds: 80_000_000)
         }
 
+        stopPlayerIfAttached(player)
+    }
+
+    fileprivate nonisolated static func stopPlayerIfAttached(_ player: AVAudioPlayerNode) {
+        guard player.engine != nil else { return }
         player.stop()
     }
 
     private static func renderedSampleTime(for player: AVAudioPlayerNode) -> AVAudioFramePosition? {
-        guard let nodeTime = player.lastRenderTime,
+        guard player.engine != nil,
+              let nodeTime = player.lastRenderTime,
               let playerTime = player.playerTime(forNodeTime: nodeTime) else {
             return nil
         }
@@ -1194,7 +1204,10 @@ final class CartesiaTTSClient {
         session.dataTask(with: request) { _, _, _ in }.resume()
     }
 
-    var isPlaying: Bool { playerNode?.isPlaying ?? false }
+    var isPlaying: Bool {
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
+    }
 
     func stopPlayback() {
         activeStreamingSession?.cancel()
@@ -1205,7 +1218,9 @@ final class CartesiaTTSClient {
     private func stopPlaybackInternal() {
         streamingTask?.cancel()
         streamingTask = nil
-        playerNode?.stop()
+        if let playerNode {
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
+        }
         playerNode = nil
         audioEngine?.stop()
         audioEngine = nil
@@ -1278,7 +1293,7 @@ final class CartesiaTTSClient {
         var scheduledFrameCount: AVAudioFramePosition = 0
         sampleAccumulator.reserveCapacity(Self.chunkSampleCount)
 
-        let task = Task { [weak self] in
+        let task = Task<Void, Error> { [weak self] in
             do {
                 for try await byte in asyncBytes {
                     try Task.checkCancellation()
@@ -1503,6 +1518,393 @@ extension OpenClickyTTSClient {
     }
 }
 
+// MARK: - MicrosoftEdgeTTSClient
+
+/// Uses the free Microsoft Edge Read Aloud online voices via the same
+/// WebSocket service used by Edge's built-in reader. No Azure key is
+/// required; users choose one of the Edge voice identifiers such as
+/// `en-US-EmmaMultilingualNeural` or `en-GB-RyanNeural`.
+@MainActor
+final class MicrosoftEdgeTTSClient: OpenClickyTTSClient {
+    nonisolated static let streamSampleRate: Double = 24_000
+    private nonisolated static let defaultVoiceID = "en-US-EmmaMultilingualNeural"
+    private nonisolated static let trustedClientToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+    private nonisolated static let chromiumFullVersion = "143.0.3650.75"
+    private nonisolated static let secMSGECVersion = "1-\(chromiumFullVersion)"
+    private nonisolated static let outputFormat = "audio-24khz-48kbitrate-mono-mp3"
+    private static let chunkSampleCount = 2_048
+
+    private(set) var voiceID: String
+    private let session: URLSession
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var streamingTask: Task<Void, Error>?
+    private weak var activeStreamingSession: StreamingTTSSession?
+
+    init(voiceID: String) {
+        self.voiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if self.voiceID.isEmpty { self.voiceID = Self.defaultVoiceID }
+
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 120
+        configuration.httpMaximumConnectionsPerHost = 6
+        self.session = URLSession(configuration: configuration)
+    }
+
+    func updateConfiguration(apiKey: String?, voiceID: String) {
+        let trimmed = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.voiceID = trimmed.isEmpty ? Self.defaultVoiceID : trimmed
+    }
+
+    func warmUpConnection() {
+        guard let url = URL(string: "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=\(Self.trustedClientToken)") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        Self.applyEdgeHeaders(to: &request)
+        session.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    var isPlaying: Bool {
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
+    }
+
+    func stopPlayback() {
+        activeStreamingSession?.cancel()
+        activeStreamingSession = nil
+        stopPlaybackInternal()
+    }
+
+    private func stopPlaybackInternal() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        if let playerNode {
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
+        }
+        playerNode = nil
+        audioEngine?.stop()
+        audioEngine = nil
+    }
+
+    func speakText(
+        _ text: String,
+        waitUntilFinished: Bool = true,
+        onPlaybackStarted: (() -> Void)? = nil
+    ) async throws {
+        stopPlaybackInternal()
+        let samples = try await fetchSentenceSamples(text)
+
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            throw Self.makeError(-102, "Could not build Microsoft Edge PCM stream format")
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        do { try engine.start() } catch {
+            throw Self.makeError(-103, "Audio engine failed to start: \(error.localizedDescription)")
+        }
+        self.audioEngine = engine
+        self.playerNode = player
+
+        let playerRef = player
+        let engineRef = engine
+        let scheduledFrames = ElevenLabsTTSClient.scheduleSamples(samples, on: playerRef, format: streamFormat)
+        if scheduledFrames > 0 { onPlaybackStarted?() }
+
+        let task = Task<Void, Error> { [weak self] in
+            await ElevenLabsTTSClient.waitForPlaybackToDrain(
+                playerRef,
+                scheduledFrameCount: scheduledFrames,
+                sampleRate: Self.streamSampleRate
+            )
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.audioEngine === engineRef {
+                    self.audioEngine?.stop()
+                    self.audioEngine = nil
+                    self.playerNode = nil
+                }
+            }
+        }
+        self.streamingTask = task
+        if waitUntilFinished {
+            do { try await task.value }
+            catch is CancellationError { stopPlaybackInternal(); throw CancellationError() }
+            catch { stopPlaybackInternal(); throw error }
+        }
+    }
+
+    func beginStreamingResponse(onPlaybackStarted: @escaping @MainActor () -> Void) -> StreamingTTSSession {
+        stopPlaybackInternal()
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        do { try engine.start() } catch {
+            print("⚠️ AVAudioEngine failed to start Microsoft Edge streaming session: \(error)")
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        self.audioEngine = engine
+        self.playerNode = player
+        let streaming = StreamingTTSSession(
+            fetchSamples: { [weak self] text in
+                guard let self else { throw CancellationError() }
+                return try await self.fetchSentenceSamples(text)
+            },
+            playerNode: player,
+            format: streamFormat,
+            sampleRate: Self.streamSampleRate,
+            onPlaybackStarted: onPlaybackStarted
+        )
+        self.activeStreamingSession = streaming
+        return streaming
+    }
+
+    func fetchSentenceSamples(_ text: String) async throws -> [Int16] {
+        let selectedVoice = voiceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Self.defaultVoiceID : voiceID
+        let mp3Data = try await Self.fetchMP3Data(
+            text: text,
+            voiceID: selectedVoice,
+            session: session
+        )
+        return try Self.decodeMP3DataToSamples(mp3Data)
+    }
+
+    private static func makeStreamFormat() -> AVAudioFormat? {
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: streamSampleRate,
+            channels: 1,
+            interleaved: false
+        )
+    }
+
+    nonisolated private static func fetchMP3Data(
+        text: String,
+        voiceID: String,
+        session: URLSession
+    ) async throws -> Data {
+        guard let url = websocketURL() else {
+            throw makeError(-10, "Could not build Microsoft Edge TTS WebSocket URL")
+        }
+        var request = URLRequest(url: url)
+        applyEdgeHeaders(to: &request)
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold", forHTTPHeaderField: "Origin")
+        request.setValue("muid=\(UUID().uuidString.replacingOccurrences(of: "-", with: "").uppercased());", forHTTPHeaderField: "Cookie")
+
+        let socket = session.webSocketTask(with: request)
+        socket.resume()
+        defer {
+            socket.cancel(with: .goingAway, reason: nil)
+        }
+
+        try await socket.send(.string(speechConfigMessage()))
+        try await socket.send(.string(ssmlMessage(text: text, voiceID: voiceID)))
+
+        var audioData = Data()
+        while true {
+            try Task.checkCancellation()
+            let message = try await socket.receive()
+            switch message {
+            case .data(let data):
+                let parsed = parseBinaryMessage(data)
+                if parsed.path == "audio", !parsed.payload.isEmpty {
+                    audioData.append(parsed.payload)
+                }
+            case .string(let string):
+                let parsed = parseTextMessage(string)
+                if parsed.path == "turn.end" {
+                    if audioData.isEmpty {
+                        throw makeError(-11, "Microsoft Edge TTS returned no audio")
+                    }
+                    return audioData
+                }
+            @unknown default:
+                continue
+            }
+        }
+    }
+
+    nonisolated private static func websocketURL() -> URL? {
+        let connectionID = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let secMSGEC = generateSecMSGEC()
+        return URL(string: "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedClientToken)&ConnectionId=\(connectionID)&Sec-MS-GEC=\(secMSGEC)&Sec-MS-GEC-Version=\(secMSGECVersion)")
+    }
+
+    nonisolated private static func speechConfigMessage() -> String {
+        """
+        X-Timestamp:\(edgeTimestamp())\r
+        Content-Type:application/json; charset=utf-8\r
+        Path:speech.config\r
+        \r
+        {"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"\(outputFormat)"}}}}\r
+        """
+    }
+
+    nonisolated private static func ssmlMessage(text: String, voiceID: String) -> String {
+        let requestID = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let escaped = xmlEscaped(cleanedText(text))
+        let ssml = """
+        <speak version='1.0' xml:lang='en-US'><voice name='\(voiceID)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escaped)</prosody></voice></speak>
+        """
+        return """
+        X-RequestId:\(requestID)\r
+        Content-Type:application/ssml+xml\r
+        X-Timestamp:\(edgeTimestamp())Z\r
+        Path:ssml\r
+        \r
+        \(ssml)
+        """
+    }
+
+    nonisolated private static func parseTextMessage(_ string: String) -> (path: String?, payload: Data) {
+        guard let separator = string.range(of: "\r\n\r\n") else {
+            return (nil, Data(string.utf8))
+        }
+        let headerText = String(string[..<separator.lowerBound])
+        let payloadText = String(string[separator.upperBound...])
+        return (pathFromHeaders(headerText), Data(payloadText.utf8))
+    }
+
+    nonisolated private static func parseBinaryMessage(_ data: Data) -> (path: String?, payload: Data) {
+        guard data.count >= 2 else { return (nil, Data()) }
+        let headerLength = (Int(data[data.startIndex]) << 8) | Int(data[data.index(after: data.startIndex)])
+        guard headerLength > 0, headerLength <= data.count else { return (nil, Data()) }
+        let headerData = data.prefix(headerLength)
+        let payloadStart = min(data.count, headerLength + 2)
+        let payload = data.suffix(from: payloadStart)
+        let headerText = String(data: headerData, encoding: .utf8) ?? ""
+        return (pathFromHeaders(headerText), payload)
+    }
+
+    nonisolated private static func pathFromHeaders(_ headerText: String) -> String? {
+        for line in headerText.components(separatedBy: "\r\n") {
+            if let range = line.range(of: "Path:", options: [.caseInsensitive]) {
+                return line[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let pieces = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pieces.count == 2 else { continue }
+            if pieces[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "path" {
+                return pieces[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func decodeMP3DataToSamples(_ data: Data) throws -> [Int16] {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("openclicky-edge-tts-\(UUID().uuidString)")
+            .appendingPathExtension("mp3")
+        try data.write(to: tempURL, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let file = try AVAudioFile(forReading: tempURL)
+        let format = file.processingFormat
+        let frameCount = AVAudioFrameCount(file.length)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            throw makeError(-12, "Could not allocate Microsoft Edge audio buffer")
+        }
+        try file.read(into: buffer)
+        guard let channels = buffer.floatChannelData else {
+            throw makeError(-13, "Could not decode Microsoft Edge MP3 audio")
+        }
+        let channelCount = max(1, Int(format.channelCount))
+        let frames = Int(buffer.frameLength)
+        var samples: [Int16] = []
+        samples.reserveCapacity(frames)
+        for frame in 0..<frames {
+            var mixed: Float = 0
+            for channel in 0..<channelCount {
+                mixed += channels[channel][frame]
+            }
+            let clamped = max(-1, min(1, mixed / Float(channelCount)))
+            samples.append(Int16(clamped * Float(Int16.max)))
+        }
+        return samples
+    }
+
+    nonisolated private static func cleanedText(_ text: String) -> String {
+        String(text.map { character in
+            guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
+                return character
+            }
+            switch scalar.value {
+            case 0...8, 11...12, 14...31:
+                return " "
+            default:
+                return character
+            }
+        })
+    }
+
+    nonisolated private static func xmlEscaped(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    nonisolated private static func edgeTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'"
+        return formatter.string(from: Date())
+    }
+
+    nonisolated private static func generateSecMSGEC() -> String {
+        let windowsEpochOffset: Double = 11_644_473_600
+        let unixSeconds = Date().timeIntervalSince1970 + windowsEpochOffset
+        let roundedSeconds = unixSeconds - unixSeconds.truncatingRemainder(dividingBy: 300)
+        let ticks = roundedSeconds * 10_000_000
+        let source = "\(String(format: "%.0f", ticks))\(trustedClientToken)"
+        let digest = SHA256.hash(data: Data(source.utf8))
+        return digest.map { String(format: "%02X", $0) }.joined()
+    }
+
+    nonisolated private static func applyEdgeHeaders(to request: inout URLRequest) {
+        let major = chromiumFullVersion.split(separator: ".", maxSplits: 1).first ?? "143"
+        request.setValue(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(major).0.0.0 Safari/537.36 Edg/\(major).0.0.0",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("gzip, deflate, br, zstd", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+    }
+
+    nonisolated private static func makeError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "MicrosoftEdgeTTS", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
 // MARK: - OpenAIRealtimeSpeechClient
 
 /// Speaks text through OpenAI's Realtime model over WebSocket. This is
@@ -1541,7 +1943,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
     }
 
     var isPlaying: Bool {
-        playerNode?.isPlaying == true
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
     }
 
     func updateConfiguration(apiKey: String?, voiceID: String) {
@@ -1739,16 +2142,18 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         turn.startReceiving()
     }
 
-    func finishBidirectionalVoiceTurn() async throws -> BidirectionalVoiceTurnResult {
+    func finishBidirectionalVoiceTurn(
+        routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)? = nil
+    ) async throws -> BidirectionalVoiceTurnResult {
         guard let activeBidirectionalVoiceTurn else {
             throw CancellationError()
         }
         self.activeBidirectionalVoiceTurn = nil
         do {
-            let result = try await activeBidirectionalVoiceTurn.finish()
-            if result.didCreateAssistantResponse {
-                stopPlaybackInternal()
-            }
+            let result = try await activeBidirectionalVoiceTurn.finish(
+                routeUserTranscriptBeforeAssistantResponse: routeUserTranscriptBeforeAssistantResponse
+            )
+            stopPlaybackInternal()
             return result
         } catch {
             activeBidirectionalVoiceTurn.cancel()
@@ -1987,8 +2392,12 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         private let onAssistantTextChunk: @MainActor @Sendable (String) -> Void
         private let onPlaybackStarted: @MainActor @Sendable () -> Void
         private var receiveTask: Task<BidirectionalVoiceTurnResult, Error>?
+        private var routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)?
         private var hasInstalledInputTap = false
         private var didStartPlayback = false
+        private var didCommitInput = false
+        private var didRequestAssistantResponse = false
+        private var didRouteByClient = false
 
         init(
             client: OpenAIRealtimeSpeechClient,
@@ -2042,26 +2451,55 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             }
         }
 
-        func finish() async throws -> BidirectionalVoiceTurnResult {
+        func finish(
+            routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)? = nil
+        ) async throws -> BidirectionalVoiceTurnResult {
             stopInputCapture()
+            self.routeUserTranscriptBeforeAssistantResponse = routeUserTranscriptBeforeAssistantResponse
+            didCommitInput = true
             try await sendJSON(["type": "input_audio_buffer.commit"])
+
+            // Let the Realtime transcription event reach OpenClicky's app
+            // router before asking the model to speak. Pointing, direct
+            // computer-use, and agent-start requests must become real app
+            // actions, not spoken "[POINT:...]" / "Done" audio.
+            let responseFallbackTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                try? await self?.requestAssistantResponseIfNeeded()
+            }
+
+            do {
+                guard let receiveTask else { throw CancellationError() }
+                let result = try await receiveTask.value
+                responseFallbackTask.cancel()
+                webSocket.cancel(with: .normalClosure, reason: nil)
+                return result
+            } catch {
+                responseFallbackTask.cancel()
+                throw error
+            }
+        }
+
+        private func requestAssistantResponseIfNeeded() async throws {
+            guard didCommitInput,
+                  !didRequestAssistantResponse,
+                  !didRouteByClient else {
+                return
+            }
+            didRequestAssistantResponse = true
             try await sendJSON([
                 "type": "response.create",
                 "response": [
                     "output_modalities": ["audio"]
                 ]
             ])
-            guard let receiveTask else { throw CancellationError() }
-            let result = try await receiveTask.value
-            webSocket.cancel(with: .normalClosure, reason: nil)
-            return result
         }
 
         func cancel() {
             stopInputCapture()
             receiveTask?.cancel()
             receiveTask = nil
-            playerNode.stop()
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
             outputEngine.stop()
             webSocket.cancel(with: .goingAway, reason: nil)
         }
@@ -2115,6 +2553,16 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
                     let snapshot = recordUserTranscript(transcript, completed: true)
                     userTranscript = snapshot
                     await MainActor.run { onUserTranscript(snapshot) }
+                    if didCommitInput, !didRequestAssistantResponse, !didRouteByClient {
+                        let routed = await MainActor.run {
+                            routeUserTranscriptBeforeAssistantResponse?(snapshot) ?? false
+                        }
+                        if routed {
+                            didRouteByClient = true
+                            break
+                        }
+                        try await requestAssistantResponseIfNeeded()
+                    }
                 } else if (type == "conversation.item.input_audio_transcription.delta" || type == "conversation.item.input_audio_transcription.updated"),
                           let delta = event["delta"] as? String,
                           !delta.isEmpty {
@@ -2146,8 +2594,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             return BidirectionalVoiceTurnResult(
                 userTranscript: userTranscript.trimmingCharacters(in: .whitespacesAndNewlines),
                 assistantTranscript: assistantTranscript.trimmingCharacters(in: .whitespacesAndNewlines),
-                didCreateAssistantResponse: true,
-                wasRoutedByClient: false
+                didCreateAssistantResponse: didRequestAssistantResponse,
+                wasRoutedByClient: didRouteByClient
             )
         }
 
@@ -2188,7 +2636,9 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
     private func stopPlaybackInternal() {
         streamingTask?.cancel()
         streamingTask = nil
-        playerNode?.stop()
+        if let playerNode {
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
+        }
         playerNode = nil
         audioEngine?.stop()
         audioEngine = nil
@@ -2268,6 +2718,7 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
     case elevenLabs = "elevenlabs"
     case cartesia = "cartesia"
     case deepgram = "deepgram"
+    case microsoftEdge = "microsoft_edge"
     var id: String { rawValue }
     var displayName: String {
         switch self {
@@ -2275,11 +2726,39 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
         case .elevenLabs: return "ElevenLabs"
         case .cartesia: return "Cartesia"
         case .deepgram: return "Deepgram Aura"
+        case .microsoftEdge: return "Microsoft Edge"
         }
     }
     static func resolve(_ raw: String?) -> OpenClickyTTSProvider {
         guard let raw, let parsed = OpenClickyTTSProvider(rawValue: raw) else { return .openAIRealtime }
         return parsed
+    }
+}
+
+nonisolated struct MicrosoftEdgeVoiceOption: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let subtitle: String
+
+    static let recommended: [MicrosoftEdgeVoiceOption] = [
+        .init(id: "en-US-EmmaMultilingualNeural", label: "Emma", subtitle: "US English, multilingual female"),
+        .init(id: "en-US-BrianMultilingualNeural", label: "Brian", subtitle: "US English, multilingual male"),
+        .init(id: "en-US-AriaNeural", label: "Aria", subtitle: "US English female"),
+        .init(id: "en-US-JennyNeural", label: "Jenny", subtitle: "US English female"),
+        .init(id: "en-US-GuyNeural", label: "Guy", subtitle: "US English male"),
+        .init(id: "en-US-AvaMultilingualNeural", label: "Ava", subtitle: "US English, multilingual female"),
+        .init(id: "en-GB-SoniaNeural", label: "Sonia", subtitle: "British English female"),
+        .init(id: "en-GB-RyanNeural", label: "Ryan", subtitle: "British English male"),
+        .init(id: "en-AU-NatashaNeural", label: "Natasha", subtitle: "Australian English female"),
+        .init(id: "en-AU-WilliamNeural", label: "William", subtitle: "Australian English male"),
+        .init(id: "en-CA-ClaraNeural", label: "Clara", subtitle: "Canadian English female"),
+        .init(id: "en-CA-LiamNeural", label: "Liam", subtitle: "Canadian English male"),
+        .init(id: "en-IN-NeerjaNeural", label: "Neerja", subtitle: "Indian English female"),
+        .init(id: "en-IN-PrabhatNeural", label: "Prabhat", subtitle: "Indian English male")
+    ]
+
+    static func option(for id: String) -> MicrosoftEdgeVoiceOption? {
+        recommended.first { $0.id == id }
     }
 }
 
@@ -2348,7 +2827,10 @@ final class DeepgramTTSClient {
         session.dataTask(with: request) { _, _, _ in }.resume()
     }
 
-    var isPlaying: Bool { playerNode?.isPlaying ?? false }
+    var isPlaying: Bool {
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
+    }
 
     func stopPlayback() {
         activeStreamingSession?.cancel()
@@ -2359,7 +2841,9 @@ final class DeepgramTTSClient {
     private func stopPlaybackInternal() {
         streamingTask?.cancel()
         streamingTask = nil
-        playerNode?.stop()
+        if let playerNode {
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
+        }
         playerNode = nil
         audioEngine?.stop()
         audioEngine = nil

@@ -61,6 +61,7 @@ struct ClickyAgentDockHoverCard: View {
     @State private var hoveredQuickAction: QuickAction? = nil
     @State private var statusLineCycleIndex = 0
     @State private var statusLineCycleTask: Task<Void, Never>?
+    private static let agentProgressBottomID = "agent-progress-bottom"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -112,13 +113,22 @@ struct ClickyAgentDockHoverCard: View {
                 .padding(.top, 4)
 
             VStack(alignment: .leading, spacing: 8) {
-                if !item.suggestedNextActions.isEmpty {
+                if hasTaskActionButtons {
                     HStack(spacing: 8) {
                         ForEach(item.suggestedNextActions, id: \.self) { actionTitle in
                             Button(action: {
                                 runSuggestedAction(actionTitle)
                             }) {
                                 Text(actionTitle)
+                            }
+                            .buttonStyle(ClickyAgentDockPillButtonStyle())
+                        }
+
+                        if let linkTarget {
+                            Button {
+                                NSWorkspace.shared.open(linkTarget)
+                            } label: {
+                                Label(linkButtonTitle(for: linkTarget), systemImage: "arrow.up.right.square")
                             }
                             .buttonStyle(ClickyAgentDockPillButtonStyle())
                         }
@@ -140,7 +150,7 @@ struct ClickyAgentDockHoverCard: View {
             }
             .buttonStyle(ClickyAgentGlassCloseButtonStyle())
             .help("Close")
-            .offset(x: 8, y: -8)
+            .offset(x: 13, y: -3)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
@@ -177,46 +187,75 @@ struct ClickyAgentDockHoverCard: View {
         .onChange(of: item.progressStepText ?? "") { _, _ in
             restartStatusLineCycle()
         }
+        .onChange(of: item.status) { _, _ in
+            restartStatusLineCycle()
+        }
     }
 
     @ViewBuilder
     private var agentProgressContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let trimmedCaption,
-               !trimmedCaption.isEmpty {
-                Text(trimmedCaption)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(DS.Colors.textPrimary)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.82)
-            } else {
-                // No real activity yet — surface a thinking indicator
-                // instead of the canned "An agent is working on this." line.
-                switch item.status {
-                case .starting, .running:
-                    ClickyThinkingDots(tint: item.accentTheme.cursorColor)
-                case .done:
-                    Text("Done.")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(item.accentTheme.cursorColor)
-                case .failed:
-                    Text("Stopped.")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(DS.Colors.textPrimary)
-                }
-            }
-
-            if let linkTarget {
-                HStack(spacing: 8) {
-                    Button {
-                        NSWorkspace.shared.open(linkTarget)
-                    } label: {
-                        Label(linkButtonTitle(for: linkTarget), systemImage: "arrow.up.right.square")
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let trimmedCaption,
+                       !trimmedCaption.isEmpty {
+                        Text(trimmedCaption)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        // No real activity yet — surface a thinking indicator
+                        // instead of the canned "An agent is working on this." line.
+                        switch item.status {
+                        case .starting, .running:
+                            ClickyThinkingDots(tint: item.accentTheme.cursorColor)
+                        case .done:
+                            Text("Done.")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(item.accentTheme.cursorColor)
+                        case .failed:
+                            Text("Stopped.")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(DS.Colors.textPrimary)
+                        }
                     }
-                    .buttonStyle(ClickyAgentDockPillButtonStyle())
 
-                    Spacer(minLength: 0)
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.agentProgressBottomID)
                 }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(.vertical, 8)
+            }
+            .mask(ClickyAgentProgressScrollFadeMask())
+            .onAppear { scrollAgentProgressToBottom(proxy, animated: false) }
+            .onChange(of: agentProgressScrollKey) { _, _ in
+                scrollAgentProgressToBottom(proxy, animated: true)
+            }
+        }
+    }
+
+
+    private var agentProgressScrollKey: String {
+        [
+            trimmedCaption ?? "",
+            currentStatusLine ?? "",
+            statusText
+        ].joined(separator: "\u{1F}")
+    }
+
+    private func scrollAgentProgressToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            let action = {
+                proxy.scrollTo(Self.agentProgressBottomID, anchor: .bottom)
+            }
+            if animated {
+                withAnimation(.easeOut(duration: 0.18), action)
+            } else {
+                action()
             }
         }
     }
@@ -232,14 +271,22 @@ struct ClickyAgentDockHoverCard: View {
     }
 
     private var statusLineLabel: String {
-        activityStatusLines.count > 1 ? "Update" : "Step"
+        if isTerminalStatus { return "Final" }
+        return activityStatusLines.count > 1 ? "Update" : "Step"
     }
 
     private var currentStatusLine: String? {
         let lines = activityStatusLines
         guard !lines.isEmpty else { return nil }
+        if isTerminalStatus {
+            return lines.last
+        }
         let safeIndex = min(statusLineCycleIndex, lines.count - 1)
         return lines[safeIndex]
+    }
+
+    private var isTerminalStatus: Bool {
+        item.status == .done || item.status == .failed
     }
 
     private var activityStatusLines: [String] {
@@ -258,7 +305,8 @@ struct ClickyAgentDockHoverCard: View {
         statusLineCycleTask?.cancel()
         statusLineCycleTask = nil
         let lines = activityStatusLines
-        statusLineCycleIndex = 0
+        statusLineCycleIndex = isTerminalStatus ? max(lines.count - 1, 0) : 0
+        guard !isTerminalStatus else { return }
         guard lines.count > 1 else { return }
 
         statusLineCycleTask = Task { @MainActor in
@@ -303,20 +351,34 @@ struct ClickyAgentDockHoverCard: View {
             Button {
                 isConfirmingStop = true
             } label: {
-                Label("Stop", systemImage: "stop.circle")
+                Image(systemName: "stop.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 14, height: 14)
             }
+            .accessibilityLabel("Stop")
+            .help("Stop")
             .buttonStyle(ClickyAgentDockStopButtonStyle(isConfirming: false))
             .confirmationDialog("Stop this agent?", isPresented: $isConfirmingStop, titleVisibility: .visible) {
                 Button("Stop", role: .destructive, action: stop)
                 Button("Keep running", role: .cancel) {}
             }
         } else if item.status == .done || item.status == .failed {
-            Button(action: dismiss) { Label("Dismiss", systemImage: "trash") }
+            Button(action: dismiss) {
+                Image(systemName: "archivebox")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 14, height: 14)
+            }
+            .accessibilityLabel("Archive")
+            .help("Archive")
                 .buttonStyle(ClickyAgentDockPillButtonStyle())
         }
     }
 
     private enum QuickAction { case voice, text, dashboard }
+
+    private var hasTaskActionButtons: Bool {
+        !item.suggestedNextActions.isEmpty || linkTarget != nil
+    }
 
     private var linkTarget: URL? {
         // Only scan the live caption — the previous version scanned the
@@ -388,6 +450,20 @@ struct ClickyAgentDockHoverCard: View {
 
 }
 
+private struct ClickyAgentProgressScrollFadeMask: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: .black, location: 0.055),
+                .init(color: .black, location: 0.945),
+                .init(color: .clear, location: 1.0)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
 
 struct ClickyAgentGlassCloseButtonStyle: ButtonStyle {
     @State private var isHovered = false

@@ -8,7 +8,9 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - AgentParkingPosition
 
@@ -31,6 +33,7 @@ nonisolated enum AgentParkingPosition: String, CaseIterable, Identifiable {
 
     static let `default`: AgentParkingPosition = .topRight
     static let userDefaultsKey = "openclicky.agentParkingPosition"
+    private static let calibrationDefaultsPrefix = "openclicky.agentParkingCalibration"
 
     var id: String { rawValue }
 
@@ -62,31 +65,71 @@ nonisolated enum AgentParkingPosition: String, CaseIterable, Identifiable {
         let yBottom = visible.minY + edgeInset
         let yMiddle = visible.midY - size.height / 2
 
+        let baseOrigin: CGPoint
         switch self {
-        case .topLeft:      return CGPoint(x: xLeft, y: yTop)
-        case .topCenter:    return CGPoint(x: xCenter, y: yTop)
-        case .topRight:     return CGPoint(x: xRight, y: yTop)
-        case .middleLeft:   return CGPoint(x: xLeft, y: yMiddle)
-        case .middleRight:  return CGPoint(x: xRight, y: yMiddle)
-        case .bottomLeft:   return CGPoint(x: xLeft, y: yBottom)
-        case .bottomCenter: return CGPoint(x: xCenter, y: yBottom)
-        case .bottomRight:  return CGPoint(x: xRight, y: yBottom)
+        case .topLeft:      baseOrigin = CGPoint(x: xLeft, y: yTop)
+        case .topCenter:    baseOrigin = CGPoint(x: xCenter, y: yTop)
+        case .topRight:     baseOrigin = CGPoint(x: xRight, y: yTop)
+        case .middleLeft:   baseOrigin = CGPoint(x: xLeft, y: yMiddle)
+        case .middleRight:  baseOrigin = CGPoint(x: xRight, y: yMiddle)
+        case .bottomLeft:   baseOrigin = CGPoint(x: xLeft, y: yBottom)
+        case .bottomCenter: baseOrigin = CGPoint(x: xCenter, y: yBottom)
+        case .bottomRight:  baseOrigin = CGPoint(x: xRight, y: yBottom)
+        }
+
+        let calibrationOffset = Self.calibrationOffset(for: self)
+        return CGPoint(
+            x: baseOrigin.x + calibrationOffset.width,
+            y: baseOrigin.y + calibrationOffset.height
+        )
+    }
+
+    /// Anchor in [0,1]x[0,1] for the preview picker. (0,0) = the
+    /// true top-left of the represented screen in SwiftUI drawing
+    /// coordinates, so the parking indicator matches real display
+    /// corners instead of an inset approximation.
+    var opensAgentPanelsToRight: Bool {
+        switch self {
+        case .topLeft, .middleLeft, .bottomLeft:
+            return true
+        case .topCenter, .topRight, .middleRight, .bottomCenter, .bottomRight:
+            return false
         }
     }
 
-    /// Anchor in [0,1]x[0,1] for the preview picker. (0,0) = top-left
-    /// in SwiftUI's drawing coordinates.
     var normalizedAnchor: CGPoint {
         switch self {
-        case .topLeft:      return CGPoint(x: 0.05, y: 0.10)
-        case .topCenter:    return CGPoint(x: 0.50, y: 0.10)
-        case .topRight:     return CGPoint(x: 0.95, y: 0.10)
-        case .middleLeft:   return CGPoint(x: 0.05, y: 0.50)
-        case .middleRight:  return CGPoint(x: 0.95, y: 0.50)
-        case .bottomLeft:   return CGPoint(x: 0.05, y: 0.90)
-        case .bottomCenter: return CGPoint(x: 0.50, y: 0.90)
-        case .bottomRight:  return CGPoint(x: 0.95, y: 0.90)
+        case .topLeft:      return CGPoint(x: 0.0, y: 0.0)
+        case .topCenter:    return CGPoint(x: 0.5, y: 0.0)
+        case .topRight:     return CGPoint(x: 1.0, y: 0.0)
+        case .middleLeft:   return CGPoint(x: 0.0, y: 0.5)
+        case .middleRight:  return CGPoint(x: 1.0, y: 0.5)
+        case .bottomLeft:   return CGPoint(x: 0.0, y: 1.0)
+        case .bottomCenter: return CGPoint(x: 0.5, y: 1.0)
+        case .bottomRight:  return CGPoint(x: 1.0, y: 1.0)
         }
+    }
+
+    static func calibrationOffset(for position: AgentParkingPosition) -> CGSize {
+        let defaults = UserDefaults.standard
+        return CGSize(
+            width: defaults.double(forKey: calibrationKey(for: position, axis: "x")),
+            height: defaults.double(forKey: calibrationKey(for: position, axis: "y"))
+        )
+    }
+
+    static func setCalibrationOffset(_ offset: CGSize, for position: AgentParkingPosition) {
+        let clampedOffset = CGSize(
+            width: min(max(offset.width, -220), 220),
+            height: min(max(offset.height, -180), 180)
+        )
+        let defaults = UserDefaults.standard
+        defaults.set(clampedOffset.width, forKey: calibrationKey(for: position, axis: "x"))
+        defaults.set(clampedOffset.height, forKey: calibrationKey(for: position, axis: "y"))
+    }
+
+    private static func calibrationKey(for position: AgentParkingPosition, axis: String) -> String {
+        "\(calibrationDefaultsPrefix).\(position.rawValue).\(axis)"
     }
 }
 
@@ -1094,11 +1137,12 @@ struct BlueCursorView: View {
         let distance = hypot(deltaX, deltaY)
 
         // Flight duration scales with distance. Normal pointing flights stay
-        // a little theatrical; agent-start corner handoffs should feel like a
-        // quick tag of the dock corner and come straight back.
+        // a little theatrical; agent-start corner handoffs should still feel
+        // quick, but not so quick that the rendered buddy appears to turn back
+        // before it actually reaches the parked-agent area.
         let flightDurationSeconds: Double
         if cursorState.detectedElementReturnsImmediately {
-            flightDurationSeconds = min(max(distance / 2200.0, 0.22), 0.42)
+            flightDurationSeconds = min(max(distance / 1800.0, 0.32), 0.58)
         } else {
             flightDurationSeconds = min(max(distance / 800.0, 0.6), 1.4)
         }
@@ -1163,8 +1207,8 @@ struct BlueCursorView: View {
 
     /// Transitions to pointing mode — shows a speech bubble with a bouncy
     /// scale-in entrance and variable-speed character streaming. Agent-start
-    /// handoffs skip the bubble and return immediately so OpenClicky only
-    /// touches the corner before coming straight back to the cursor.
+    /// handoffs skip the bubble, settle briefly at the dock point, then return
+    /// so OpenClicky visibly reaches the parking area before flying back.
     private func startPointingAtElement() {
         buddyNavigationMode = .pointingAtTarget
 
@@ -1180,7 +1224,7 @@ struct BlueCursorView: View {
         if cursorState.detectedElementReturnsImmediately {
             navigationBubbleOpacity = 0.0
             navigationBubbleScale = 1.0
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
                 guard self.buddyNavigationMode == .pointingAtTarget else { return }
                 self.startFlyingBackToCursor()
             }
@@ -1409,95 +1453,238 @@ private struct BlueCursorSpinnerView: View {
     }
 }
 
+private final class ClickyAgentDockLayoutState: ObservableObject {
+    @Published var opensPanelsToRight = false
+    @Published var dockHeight: CGFloat = 540
+}
+
 private struct ClickyAgentDockStackView: View {
     @ObservedObject var companionManager: CompanionManager
+    @ObservedObject var layoutState: ClickyAgentDockLayoutState
     @State private var hoveredItemID: UUID?
+    @State private var pendingHoverExit: DispatchWorkItem?
     @State private var didDragDock = false
     @State private var manuallyClosedExpandedItemIDs: Set<UUID> = []
+    private let dockItemSlotSize: CGFloat = 92
+    private let dockItemSpacing: CGFloat = 14
+    private let hoverCardHeight: CGFloat = 236
+    // Leave generous transparent overdraw room above the first parked avatar.
+    // The avatar glow/status pulse intentionally paints outside the 52pt
+    // circle; without this inset, the panel can crop the first parked task
+    // when the dock is parked near the screen edge.
+    private let avatarTopOverdrawPadding: CGFloat = 64
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 14) {
-            ForEach(companionManager.agentDockItems) { item in
-                HStack(alignment: .top, spacing: 22) {
-                    // Collapsed by default — icon-only — until the user
-                    // hovers. This removes both the always-on conversation
-                    // preview AND the post-completion expanded summary card,
-                    // matching the "just have the agent icon up there" UX.
-                    if shouldShowExpandedCard(for: item) {
-                        ClickyAgentDockHoverCard(
-                            item: item,
-                            canOpenDashboard: companionManager.isAdvancedModeEnabled,
-                            chat: { companionManager.openAgentDockItem(item.id) },
-                            text: { companionManager.showTextFollowUpForAgentDockItem(item.id) },
-                            voice: { companionManager.prepareVoiceFollowUpForAgentDockItem(item.id) },
-                            close: {
-                                // Close should collapse this expanded hover panel
-                                // immediately, even while the cursor is still
-                                // over the dock icon. Keep the dock icon/task.
-                                manuallyClosedExpandedItemIDs.insert(item.id)
-                                hoveredItemID = nil
-                            },
-                            stop: { companionManager.stopAgentDockItem(item.id) },
-                            dismiss: { companionManager.dismissAgentDockItem(item.id) },
-                            runSuggestedAction: { actionTitle in
-                                companionManager.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
-                            }
-                        )
-                        .transition(.opacity.combined(with: .move(edge: .trailing)))
-                    }
+        ZStack(alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing) {
+            ForEach(Array(companionManager.agentDockItems.enumerated()), id: \.element.id) { index, item in
+                dockRow(for: item)
+                    .offset(y: rowOffset(for: index))
+                    // Keep every parked avatar above the currently-expanded
+                    // card's tall hover row so moving down the avatar stack
+                    // immediately swaps the panel to the item under the
+                    // cursor instead of being intercepted by the old card.
+                    .zIndex(shouldShowExpandedCard(for: item) ? 1 : 2)
+            }
+        }
+        .frame(width: 760, height: stackHeight, alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing)
+        .padding(layoutState.opensPanelsToRight ? .leading : .trailing, 4)
+        .animation(.easeOut(duration: 0.16), value: companionManager.agentDockItems)
+    }
 
-                    Button {
-                        if didDragDock {
-                            didDragDock = false
-                            return
-                        }
-                        companionManager.openAgentDockItem(item.id)
-                    } label: {
-                        ClickyAgentDockItemView(item: item)
-                    }
-                    .buttonStyle(.plain)
-                    .contentShape(Rectangle())
-                    .pointerCursor()
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 2)
-                            .onChanged { value in
-                                if !didDragDock {
-                                    didDragDock = true
-                                    companionManager.beginAgentDockDrag()
-                                }
-                                companionManager.dragAgentDock(by: value.translation)
-                            }
-                            .onEnded { _ in
-                                companionManager.endAgentDockDrag()
-                                DispatchQueue.main.async {
-                                    didDragDock = false
-                                }
-                            }
-                    )
+    private var stackHeight: CGFloat {
+        max(layoutState.dockHeight - 40, requiredStackHeight)
+    }
+
+    private var requiredStackHeight: CGFloat {
+        let itemCount = companionManager.agentDockItems.count
+        guard itemCount > 0 else { return 500 }
+        let lastRowTop = CGFloat(max(0, itemCount - 1)) * (dockItemSlotSize + dockItemSpacing)
+        return max(500, avatarTopOverdrawPadding + lastRowTop + max(dockItemSlotSize, hoverCardHeight) + 8)
+    }
+
+    private func rowOffset(for index: Int) -> CGFloat {
+        avatarTopOverdrawPadding + CGFloat(index) * (dockItemSlotSize + dockItemSpacing)
+    }
+
+    private func dockRow(for item: ClickyAgentDockItem) -> some View {
+        let isExpanded = shouldShowExpandedCard(for: item)
+        return HStack(alignment: .top, spacing: 0) {
+            if layoutState.opensPanelsToRight {
+                dockButton(for: item)
+                hoverBridge(for: item, isExpanded: isExpanded)
+                expandedCard(for: item)
+            } else {
+                expandedCard(for: item)
+                hoverBridge(for: item, isExpanded: isExpanded)
+                dockButton(for: item)
+            }
+        }
+        // Keep the avatar position fixed with absolute row offsets, but let
+        // the active row's hover region grow to cover the full card. Without
+        // this, moving from the icon onto the visible card exits the 92pt row
+        // hit area and the card collapses under the cursor.
+        //
+        // The row itself must not advertise a full rectangular hit region:
+        // when expanded, that invisible rectangle covers the avatars below it
+        // and prevents hover from switching to a different parked task.
+        // Let the visible card and visible avatar button own hit-testing.
+        .frame(
+            width: 760,
+            height: isExpanded ? hoverCardHeight : dockItemSlotSize,
+            alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing
+        )
+        .padding(.top, 0)
+        .padding(layoutState.opensPanelsToRight ? .leading : .trailing, 0)
+        .onHover { isHovering in
+            guard isExpanded || hoveredItemID == item.id else { return }
+            updateHoverState(for: item.id, isHovering: isHovering)
+        }
+    }
+
+
+    @ViewBuilder
+    private func expandedCard(for item: ClickyAgentDockItem) -> some View {
+        // Collapsed by default — icon-only — until the user hovers. This
+        // removes both the always-on conversation preview AND the
+        // post-completion expanded summary card, matching the "just have the
+        // agent icon up there" UX.
+        if shouldShowExpandedCard(for: item) {
+            ClickyAgentDockHoverCard(
+                item: item,
+                canOpenDashboard: companionManager.isAdvancedModeEnabled,
+                chat: { companionManager.openAgentDockItem(item.id) },
+                text: { companionManager.showTextFollowUpForAgentDockItem(item.id) },
+                voice: { companionManager.prepareVoiceFollowUpForAgentDockItem(item.id) },
+                close: {
+                    // Close should collapse this expanded hover panel
+                    // immediately, even while the cursor is still
+                    // over the dock icon. Keep the dock icon/task.
+                    manuallyClosedExpandedItemIDs.insert(item.id)
+                    hoveredItemID = nil
+                },
+                stop: { companionManager.stopAgentDockItem(item.id) },
+                dismiss: { companionManager.dismissAgentDockItem(item.id) },
+                runSuggestedAction: { actionTitle in
+                    companionManager.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
                 }
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .onHover { isHovering in
+                updateHoverState(for: item.id, isHovering: isHovering)
+            }
+            .transition(.clickyAgentDockCardSlide(opensToRight: layoutState.opensPanelsToRight))
+        }
+    }
+
+    @ViewBuilder
+    private func hoverBridge(for item: ClickyAgentDockItem, isExpanded: Bool) -> some View {
+        if isExpanded {
+            Color.clear
+                .frame(width: 22, height: hoverCardHeight)
                 .contentShape(Rectangle())
-                // Tighter top/trailing inset so the icon sits closer to the
-                // corner. Combined with the outer-VStack inset reductions
-                // below, the icon shifted ~50px up and ~50px right per UX
-                // request 2026-04-28.
-                .padding(.top, 0)
-                .padding(.trailing, 0)
                 .onHover { isHovering in
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        hoveredItemID = isHovering ? item.id : nil
-                        if !isHovering {
-                            // Re-enable expansion after the pointer leaves, so a
-                            // later hover can open the panel again.
-                            manuallyClosedExpandedItemIDs.remove(item.id)
-                        }
+                    updateHoverState(for: item.id, isHovering: isHovering)
+                }
+        }
+    }
+
+    private func dockButton(for item: ClickyAgentDockItem) -> some View {
+        Button {
+            if didDragDock {
+                didDragDock = false
+                return
+            }
+            companionManager.openAgentDockItem(item.id)
+        } label: {
+            ClickyAgentDockItemView(item: item)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .pointerCursor()
+        .onHover { isHovering in
+            updateHoverState(for: item.id, isHovering: isHovering)
+        }
+        .onDrop(
+            of: [UTType.fileURL.identifier, UTType.image.identifier],
+            isTargeted: nil
+        ) { providers in
+            handleDroppedAgentAttachments(providers, for: item)
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 2)
+                .onChanged { value in
+                    if !didDragDock {
+                        didDragDock = true
+                        companionManager.beginAgentDockDrag()
+                    }
+                    companionManager.dragAgentDock(by: value.translation)
+                }
+                .onEnded { _ in
+                    companionManager.endAgentDockDrag()
+                    DispatchQueue.main.async {
+                        didDragDock = false
+                    }
+                }
+        )
+    }
+
+    private func handleDroppedAgentAttachments(_ providers: [NSItemProvider], for item: ClickyAgentDockItem) -> Bool {
+        var acceptedDrop = false
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                acceptedDrop = true
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { droppedItem, _ in
+                    guard let url = Self.fileURL(from: droppedItem) else { return }
+                    Task { @MainActor in
+                        companionManager.attachDroppedAgentFiles([url], toAgentDockItem: item.id, source: "agent_dock_avatar_drop")
+                    }
+                }
+                continue
+            }
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                acceptedDrop = true
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data, let url = Self.persistDroppedImage(data) else { return }
+                    Task { @MainActor in
+                        companionManager.attachDroppedAgentFiles([url], toAgentDockItem: item.id, source: "agent_dock_avatar_drop")
                     }
                 }
             }
         }
-        .frame(width: 760, height: 500, alignment: .topTrailing)
-        .padding(.top, 0)
-        .padding(.trailing, 4)
-        .animation(.easeOut(duration: 0.16), value: companionManager.agentDockItems)
+
+        return acceptedDrop
+    }
+
+    private static func fileURL(from item: Any?) -> URL? {
+        if let url = item as? URL {
+            return url.isFileURL ? url.standardizedFileURL : nil
+        }
+        if let data = item as? Data {
+            return URL(dataRepresentation: data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let data = item as? NSData {
+            return URL(dataRepresentation: data as Data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let string = item as? String {
+            return URL(string: string)?.standardizedFileURL
+        }
+        return nil
+    }
+
+    private static func persistDroppedImage(_ data: Data) -> URL? {
+        let directory = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/OpenClicky/AgentMode/DroppedAttachments", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("agent-dock-drop-\(UUID().uuidString).png")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
     }
 
     private func shouldShowExpandedCard(for item: ClickyAgentDockItem) -> Bool {
@@ -1507,11 +1694,85 @@ private struct ClickyAgentDockStackView: View {
         // default — hovering reveals the full card.
         return hoveredItemID == item.id && !manuallyClosedExpandedItemIDs.contains(item.id)
     }
+
+    private func updateHoverState(for itemID: UUID, isHovering: Bool) {
+        pendingHoverExit?.cancel()
+        pendingHoverExit = nil
+
+        if isHovering {
+            withAnimation(.easeOut(duration: 0.14)) {
+                hoveredItemID = itemID
+            }
+            return
+        }
+
+        let exitWorkItem = DispatchWorkItem {
+            guard hoveredItemID == itemID else { return }
+            withAnimation(.easeOut(duration: 0.14)) {
+                hoveredItemID = nil
+                // Re-enable expansion after the pointer leaves, so a later
+                // hover can open the panel again.
+                manuallyClosedExpandedItemIDs.remove(itemID)
+            }
+        }
+        pendingHoverExit = exitWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: exitWorkItem)
+    }
+}
+
+private struct ClickyAgentDockCardRevealShape: Shape {
+    var progress: CGFloat
+    let revealsFromLeadingEdge: Bool
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let clampedProgress = min(max(progress, 0), 1)
+        let revealWidth = rect.width * clampedProgress
+        let revealX = revealsFromLeadingEdge ? rect.minX : rect.maxX - revealWidth
+        return Path(CGRect(x: revealX, y: rect.minY, width: revealWidth, height: rect.height))
+    }
+}
+
+private struct ClickyAgentDockCardSlideModifier: ViewModifier {
+    let progress: CGFloat
+    let opensToRight: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .clipShape(
+                ClickyAgentDockCardRevealShape(
+                    progress: progress,
+                    revealsFromLeadingEdge: opensToRight
+                )
+            )
+            // Nudge only toward the avatar while revealing. The old move
+            // transition offset the card by its full width, so right-parked
+            // avatars briefly drew the card from beyond the avatar before it
+            // settled. This keeps the avatar-side edge as the visual origin.
+            .offset(x: (opensToRight ? -14 : 14) * (1 - progress))
+            .opacity(Double(progress))
+    }
+}
+
+private extension AnyTransition {
+    static func clickyAgentDockCardSlide(opensToRight: Bool) -> AnyTransition {
+        .modifier(
+            active: ClickyAgentDockCardSlideModifier(progress: 0, opensToRight: opensToRight),
+            identity: ClickyAgentDockCardSlideModifier(progress: 1, opensToRight: opensToRight)
+        )
+    }
 }
 
 private struct ClickyAgentDockItemView: View {
     let item: ClickyAgentDockItem
     @State private var isStatusAnimating = false
+    @State private var isAvatarGlowPulsing = false
+    @State private var isCompletionFlashVisible = false
+    @State private var lastObservedStatus: ClickyAgentDockStatus?
     @AppStorage(ClickyCursorAvatarStyle.userDefaultsKey)
     private var avatarStyleRawValue = ClickyCursorAvatarStyle.default.storageValue
 
@@ -1526,6 +1787,8 @@ private struct ClickyAgentDockItemView: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
+            completionFlashRing
+
             Circle()
                 .fill(
                     LinearGradient(
@@ -1556,14 +1819,14 @@ private struct ClickyAgentDockItemView: View {
                         )
                 )
                 .shadow(
-                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(0.34) : .clear,
-                    radius: shouldShowAccentGlow ? 24 : 0,
+                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(avatarOuterGlowOpacity) : .clear,
+                    radius: shouldShowAccentGlow ? avatarOuterGlowRadius : 0,
                     x: 0,
                     y: 11
                 )
                 .shadow(
-                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(0.70) : .clear,
-                    radius: shouldShowAccentGlow ? 16 : 0,
+                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(avatarInnerGlowOpacity) : .clear,
+                    radius: shouldShowAccentGlow ? avatarInnerGlowRadius : 0,
                     x: 0,
                     y: 0
                 )
@@ -1586,13 +1849,42 @@ private struct ClickyAgentDockItemView: View {
         .frame(width: 92, height: 92, alignment: .center)
         .help(item.title)
         .onAppear {
+            lastObservedStatus = item.status
             isStatusAnimating = true
+            restartAvatarGlowPulse(for: item.status)
         }
         .onChange(of: item.status) {
+            let previousStatus = lastObservedStatus
+            lastObservedStatus = item.status
+
             isStatusAnimating = false
             DispatchQueue.main.async {
                 isStatusAnimating = true
             }
+
+            restartAvatarGlowPulse(for: item.status)
+
+            if previousStatus != .done && item.status == .done {
+                triggerCompletionFlash()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var completionFlashRing: some View {
+        if shouldShowAccentGlow {
+            Circle()
+                .stroke(item.accentTheme.cursorColor.opacity(isCompletionFlashVisible ? 0.92 : 0), lineWidth: 2)
+                .frame(width: 62, height: 62)
+                .scaleEffect(isCompletionFlashVisible ? 1.18 : 0.88)
+                .opacity(isCompletionFlashVisible ? 0.95 : 0)
+                .shadow(
+                    color: item.accentTheme.cursorColor.opacity(isCompletionFlashVisible ? 0.86 : 0),
+                    radius: isCompletionFlashVisible ? 18 : 0,
+                    x: 0,
+                    y: 0
+                )
+                .animation(.easeOut(duration: 0.34), value: isCompletionFlashVisible)
         }
     }
 
@@ -1628,6 +1920,77 @@ private struct ClickyAgentDockItemView: View {
         }
         .frame(width: 22, height: 22)
         .accessibilityLabel(statusAccessibilityLabel)
+    }
+
+
+    private var isWorkingStatus: Bool {
+        switch item.status {
+        case .starting, .running:
+            return true
+        case .done, .failed:
+            return false
+        }
+    }
+
+    private var avatarOuterGlowOpacity: Double {
+        if isCompletionFlashVisible { return 0.58 }
+        guard isWorkingStatus else { return 0.34 }
+        return isAvatarGlowPulsing ? 0.40 : 0.28
+    }
+
+    private var avatarOuterGlowRadius: CGFloat {
+        if isCompletionFlashVisible { return 30 }
+        guard isWorkingStatus else { return 24 }
+        return isAvatarGlowPulsing ? 28 : 22
+    }
+
+    private var avatarInnerGlowOpacity: Double {
+        if isCompletionFlashVisible { return 0.92 }
+        guard isWorkingStatus else { return 0.70 }
+        return isAvatarGlowPulsing ? 0.78 : 0.58
+    }
+
+    private var avatarInnerGlowRadius: CGFloat {
+        if isCompletionFlashVisible { return 20 }
+        guard isWorkingStatus else { return 16 }
+        return isAvatarGlowPulsing ? 18 : 14
+    }
+
+    private func restartAvatarGlowPulse(for status: ClickyAgentDockStatus) {
+        guard shouldShowAccentGlow else {
+            isAvatarGlowPulsing = false
+            return
+        }
+
+        switch status {
+        case .starting, .running:
+            isAvatarGlowPulsing = false
+            DispatchQueue.main.async {
+                withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) {
+                    isAvatarGlowPulsing = true
+                }
+            }
+        case .done, .failed:
+            withAnimation(.easeOut(duration: 0.24)) {
+                isAvatarGlowPulsing = false
+            }
+        }
+    }
+
+    private func triggerCompletionFlash() {
+        guard shouldShowAccentGlow else { return }
+
+        isCompletionFlashVisible = false
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.16)) {
+                isCompletionFlashVisible = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
+                withAnimation(.easeOut(duration: 0.42)) {
+                    isCompletionFlashVisible = false
+                }
+            }
+        }
     }
 
     private var statusColor: Color {
@@ -1849,7 +2212,16 @@ final class ClickyAgentDockWindowManager {
     private var dragStartFrame: NSRect?
     private var dragStartMouseLocation: CGPoint?
     private var customFrame: NSRect?
-    private let dockSize = NSSize(width: 800, height: 540)
+    private let layoutState = ClickyAgentDockLayoutState()
+    private let dockWidth: CGFloat = 800
+    private let minimumDockHeight: CGFloat = 540
+    // The parked dock window is intentionally a transparent full-height strip
+    // on the active screen. Keeping the window taller than the avatar stack
+    // gives glows, status rings, and top-parked icons room to overdraw instead
+    // of being clipped by the NSPanel/content-view bounds.
+    private let dockVerticalScreenInset: CGFloat = 16
+    private let dockVerticalPadding: CGFloat = 40
+    private let hoverCardHeight: CGFloat = 236
     private let hoverCardWidth: CGFloat = 560
     // Track the icon container size used by `ClickyAgentDockItemView`. Used
     // by `textFollowUpOrigin()` to position follow-up popovers relative to
@@ -1860,20 +2232,28 @@ final class ClickyAgentDockWindowManager {
     // closer to the screen corner.
     private let dockTrailingInset: CGFloat = 4
     private let dockItemSpacing: CGFloat = 22
+    private let dockRowSpacing: CGFloat = 14
 
     func show(
         companionManager: CompanionManager,
         onScreen screen: NSScreen,
         position: AgentParkingPosition
     ) {
+        let targetSize = preferredDockSize(itemCount: companionManager.agentDockItems.count, on: screen)
+        layoutState.dockHeight = targetSize.height
+
         if panel == nil {
-            createPanel(companionManager: companionManager)
+            createPanel(companionManager: companionManager, initialSize: targetSize)
         }
 
         if let customFrame {
-            panel?.setFrame(customFrame, display: true)
+            let resizedFrame = resizedCustomFrame(customFrame, to: targetSize, on: screen)
+            self.customFrame = resizedFrame
+            panel?.setFrame(resizedFrame, display: true)
+            updatePanelExpansionDirection(for: resizedFrame, fallbackScreen: screen, fallbackPosition: position)
         } else {
-            positionPanel(onScreen: screen, position: position)
+            layoutState.opensPanelsToRight = position.opensAgentPanelsToRight
+            positionPanel(onScreen: screen, position: position, size: targetSize)
         }
         panel?.orderFrontRegardless()
     }
@@ -1915,6 +2295,7 @@ final class ClickyAgentDockWindowManager {
         // on the next pass and this reduces perceived "left behind" lag.
         panel.setFrame(frame, display: false)
         customFrame = frame
+        updatePanelExpansionDirection(for: frame)
     }
 
     func endDrag() {
@@ -1932,16 +2313,18 @@ final class ClickyAgentDockWindowManager {
     func textFollowUpOrigin() -> CGPoint? {
         guard let panel else { return nil }
         let frame = panel.frame
-        let hoverCardLeftX = frame.maxX - dockTrailingInset - dockIconWidth - dockItemSpacing - hoverCardWidth
+        let hoverCardX = layoutState.opensPanelsToRight
+            ? frame.minX + dockTrailingInset + dockIconWidth + dockItemSpacing
+            : frame.maxX - dockTrailingInset - dockIconWidth - dockItemSpacing - hoverCardWidth
         return CGPoint(
-            x: hoverCardLeftX,
+            x: hoverCardX,
             y: frame.minY - 62
         )
     }
 
-    private func createPanel(companionManager: CompanionManager) {
+    private func createPanel(companionManager: CompanionManager, initialSize: NSSize) {
         let dockPanel = ClickyAgentDockPanel(
-            contentRect: NSRect(origin: .zero, size: dockSize),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -1956,8 +2339,8 @@ final class ClickyAgentDockWindowManager {
         dockPanel.isMovableByWindowBackground = false
         dockPanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        let rootView = ClickyAgentDockStackView(companionManager: companionManager)
-            .frame(width: dockSize.width, height: dockSize.height, alignment: .topTrailing)
+        let rootView = ClickyAgentDockStackView(companionManager: companionManager, layoutState: layoutState)
+            .frame(width: dockWidth, height: layoutState.dockHeight, alignment: .topTrailing)
         let hostingView = NSHostingView(rootView: rootView)
         if #available(macOS 13.0, *) {
             // Critical: keep SwiftUI from driving the NSPanel's size from
@@ -1968,7 +2351,7 @@ final class ClickyAgentDockWindowManager {
             // owns the panel size; SwiftUI only draws inside it.
             hostingView.sizingOptions = []
         }
-        let containerView = NSView(frame: NSRect(origin: .zero, size: dockSize))
+        let containerView = NSView(frame: NSRect(origin: .zero, size: initialSize))
         containerView.wantsLayer = true
         containerView.layer?.backgroundColor = NSColor.clear.cgColor
         hostingView.frame = containerView.bounds
@@ -1978,7 +2361,7 @@ final class ClickyAgentDockWindowManager {
         panel = dockPanel
     }
 
-    private func positionPanel(onScreen screen: NSScreen, position: AgentParkingPosition) {
+    private func positionPanel(onScreen screen: NSScreen, position: AgentParkingPosition, size: NSSize) {
         guard let panel else { return }
         // Keep the previous extra top padding for top-anchored positions
         // (notification banners + menu bar leave less usable area at the
@@ -1990,16 +2373,71 @@ final class ClickyAgentDockWindowManager {
         default:
             edgeInset = 16
         }
-        var origin = position.originForWindow(size: dockSize, on: screen, edgeInset: edgeInset)
+        var origin = position.originForWindow(size: size, on: screen, edgeInset: edgeInset)
         // UX tweak (2026-05-01): move the default top-right parked dock
         // closer into the corner by nudging it up/right.
         if position == .topRight {
             origin.x += 70
             origin.y += 70
         }
-        let targetFrame = NSRect(origin: origin, size: dockSize)
+        origin = clampedDockOrigin(origin, size: size, on: screen)
+        let targetFrame = NSRect(origin: origin, size: size)
         guard panel.frame.integral != targetFrame.integral else { return }
         panel.setFrame(targetFrame, display: true)
+    }
+
+    private func preferredDockSize(itemCount: Int, on screen: NSScreen) -> NSSize {
+        let lastRowTop = CGFloat(max(0, itemCount - 1)) * (dockIconWidth + dockRowSpacing)
+        let unclampedHeight = max(
+            minimumDockHeight,
+            lastRowTop + max(dockIconWidth, hoverCardHeight) + dockVerticalPadding
+        )
+        let fullHeightStrip = max(minimumDockHeight, screen.visibleFrame.height - dockVerticalScreenInset)
+        return NSSize(
+            width: dockWidth,
+            height: max(unclampedHeight, fullHeightStrip)
+        )
+    }
+
+    private func resizedCustomFrame(_ frame: NSRect, to targetSize: NSSize, on screen: NSScreen) -> NSRect {
+        var origin = frame.origin
+
+        // If a dragged dock is visually parked near the top half, keep its
+        // top edge stable as the panel grows for more avatars. Otherwise it
+        // would expand upward and clip against the menu bar/visible screen.
+        if frame.midY >= screen.visibleFrame.midY {
+            origin.y = frame.maxY - targetSize.height
+        }
+
+        origin = clampedDockOrigin(origin, size: targetSize, on: screen)
+
+        return NSRect(origin: origin, size: targetSize)
+    }
+
+    private func clampedDockOrigin(_ origin: CGPoint, size: NSSize, on screen: NSScreen) -> CGPoint {
+        CGPoint(
+            x: min(max(origin.x, screen.visibleFrame.minX - hoverCardWidth), screen.visibleFrame.maxX - dockIconWidth + 8),
+            y: min(max(origin.y, screen.visibleFrame.minY + 8), screen.visibleFrame.maxY - size.height - 8)
+        )
+    }
+
+    private func updatePanelExpansionDirection(
+        for frame: NSRect,
+        fallbackScreen: NSScreen? = nil,
+        fallbackPosition: AgentParkingPosition? = nil
+    ) {
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? fallbackScreen
+        guard let screen else {
+            if let fallbackPosition {
+                layoutState.opensPanelsToRight = fallbackPosition.opensAgentPanelsToRight
+            }
+            return
+        }
+
+        let iconCenterX = layoutState.opensPanelsToRight
+            ? frame.minX + dockTrailingInset + dockIconWidth / 2
+            : frame.maxX - dockTrailingInset - dockIconWidth / 2
+        layoutState.opensPanelsToRight = iconCenterX < screen.visibleFrame.midX
     }
 }
 

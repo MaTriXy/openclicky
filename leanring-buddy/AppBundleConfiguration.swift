@@ -160,11 +160,17 @@ nonisolated enum AppBundleConfiguration {
 
     /// LLM model Deepgram Voice Agent should use for the think stage.
     static func deepgramVoiceAgentThinkModel() -> String {
-        userDefaultsValue(forKey: userDeepgramVoiceAgentThinkModelDefaultsKey) ?? stringValue(
+        let rawModel = userDefaultsValue(forKey: userDeepgramVoiceAgentThinkModelDefaultsKey) ?? stringValue(
             forKey: "DeepgramVoiceAgentThinkModel",
             environmentKeys: ["DEEPGRAM_VOICE_AGENT_THINK_MODEL"]
         ) ?? localDevelopmentEnvironmentValue(forKey: "DEEPGRAM_VOICE_AGENT_THINK_MODEL")
         ?? "gpt-4o-mini"
+        return normalizeDeepgramVoiceAgentThinkModel(rawModel)
+    }
+
+    static func normalizeDeepgramVoiceAgentThinkModel(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "gpt-4o-mini" : trimmed.lowercased()
     }
 
     /// Microsoft Edge Read Aloud voice identifier. These are the free

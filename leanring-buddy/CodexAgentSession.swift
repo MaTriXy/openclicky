@@ -1899,6 +1899,7 @@ final class CodexAgentSession: ObservableObject, Identifiable {
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
         let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:see\s+(?:the\s+)?issue\s+here|look\s+at\s+this|fix\s+this)\b.*\b(?:OpenClickyLog|NSXPCDecoder|ViewBridge|unifiedReasons|NSXPCConnection)\b"#, "Log Issue Review"),
             (#"(?i)\b(?:whole|full)\s+(?:task\s+)?names?\b"#, "Task Status Wording"),
             (#"(?i)\bshort\s+(?:version|task\s+name|name)\b"#, "Task Status Wording"),
             (#"(?i)\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b.*\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b"#, "Task Title Cleanup"),

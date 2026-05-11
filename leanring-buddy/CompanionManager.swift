@@ -13,8 +13,9 @@ import Combine
 import Foundation
 import ScreenCaptureKit
 import SwiftUI
+import UniformTypeIdentifiers
 
-enum CompanionVoiceState {
+enum CompanionVoiceState: String {
     case idle
     case listening
     case processing
@@ -632,6 +633,35 @@ final class CompanionManager: ObservableObject {
         return "…\n" + String(text.suffix(limit))
     }
 
+    private func rememberMainConversationUserPrompt(_ transcript: String, source: String) {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty,
+              trimmedTranscript != "Realtime voice input",
+              !Self.isReferentialAgentInstruction(trimmedTranscript) else {
+            return
+        }
+        if let lastVoiceUserTranscript,
+           let lastVoiceUserTranscriptAt,
+           Date().timeIntervalSince(lastVoiceUserTranscriptAt) < 2,
+           Self.normalizedSpokenCommandText(lastVoiceUserTranscript) == Self.normalizedSpokenCommandText(trimmedTranscript) {
+            return
+        }
+
+        lastVoiceUserTranscript = trimmedTranscript
+        lastVoiceUserTranscriptAt = Date()
+
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "voice.main_conversation_context.updated",
+            fields: [
+                "source": source,
+                "promptLength": trimmedTranscript.count,
+                "promptPreview": String(trimmedTranscript.prefix(160))
+            ]
+        )
+    }
+
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
@@ -653,9 +683,13 @@ final class CompanionManager: ObservableObject {
     private var pendingAgentOfferAt: Date?
     private var deferredLiveAgentRoutePartial: String?
     private var deferredLiveAgentRoutePartialAt: Date?
-    /// Most recent voice transcript that fell through to the voice
-    /// responder. Used as the candidate task when Haiku offers an agent.
+    /// Most recent user prompt in the shared instant/voice conversation.
+    /// This lets a later referential agent request ("on it", "do that")
+    /// resolve to what the user was just talking about, regardless of
+    /// whether the prior turn came from push-to-talk, Realtime voice, or
+    /// the double-Control instant text popup.
     private var lastVoiceUserTranscript: String?
+    private var lastVoiceUserTranscriptAt: Date?
     private static let pendingAgentVoiceFollowUpTTL: TimeInterval = 90
     private static let pendingAgentOfferTTL: TimeInterval = 90
     private static let deferredLiveAgentRoutePartialTTL: TimeInterval = 20
@@ -1194,7 +1228,7 @@ final class CompanionManager: ObservableObject {
         if trimmed.isEmpty {
             UserDefaults.standard.removeObject(forKey: AppBundleConfiguration.userDeepgramVoiceAgentThinkModelDefaultsKey)
         } else {
-            UserDefaults.standard.set(trimmed, forKey: AppBundleConfiguration.userDeepgramVoiceAgentThinkModelDefaultsKey)
+            UserDefaults.standard.set(AppBundleConfiguration.normalizeDeepgramVoiceAgentThinkModel(trimmed), forKey: AppBundleConfiguration.userDeepgramVoiceAgentThinkModelDefaultsKey)
         }
         deepgramVoiceAgentClient.updateConfiguration(
             apiKey: AppBundleConfiguration.deepgramAPIKey(),
@@ -1970,8 +2004,8 @@ final class CompanionManager: ObservableObject {
         controlDoubleTapCancellable = globalPushToTalkShortcutMonitor
             .controlDoubleTapPublisher
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                self?.showTextModeInputAtCursor()
+            .sink { [weak self] activationPoint in
+                self?.showTextModeInputAtCursor(activationPoint: activationPoint)
             }
     }
 
@@ -2499,6 +2533,11 @@ final class CompanionManager: ObservableObject {
         return model.provider == .deepgram ? "deepgram_voice_agent_pcm_stream" : "realtime_input_audio_buffer"
     }
 
+    private var activeRealtimeThinkModel: String {
+        let model = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel)
+        return model.provider == .deepgram ? deepgramVoiceAgentClient.thinkModel : openAIRealtimeSpeechClient.model
+    }
+
     private struct BidirectionalRealtimeVoiceResult {
         let userTranscript: String
         let assistantTranscript: String
@@ -2508,6 +2547,25 @@ final class CompanionManager: ObservableObject {
 
     private func startBidirectionalRealtimeVoiceCapture(source: String) {
         guard !isRealtimeBidirectionalVoiceCaptureActive else { return }
+        if voiceState == .processing || voiceState == .responding || voiceTTSClient.isPlaying || openAIRealtimeSpeechClient.isPlaying || deepgramVoiceAgentClient.isPlaying {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice",
+                direction: "internal",
+                event: "voice.realtime_bidirectional.start_deferred",
+                fields: [
+                    "source": source,
+                    "speechModel": selectedModel,
+                    "speechVoice": activeRealtimeSpeechVoiceID,
+                    "inputPath": activeRealtimeInputPath,
+                    "voiceState": voiceState.rawValue,
+                    "ttsPlaying": voiceTTSClient.isPlaying,
+                    "openAIRealtimePlaying": openAIRealtimeSpeechClient.isPlaying,
+                    "deepgramVoiceAgentPlaying": deepgramVoiceAgentClient.isPlaying,
+                    "reason": "previous_voice_turn_still_speaking"
+                ]
+            )
+            return
+        }
 
         isRealtimeBidirectionalVoiceCaptureActive = true
         realtimeBidirectionalVoiceCaptureStartedAt = Date()
@@ -2526,6 +2584,7 @@ final class CompanionManager: ObservableObject {
                 "speechModel": selectedModel,
                 "speechVoice": activeRealtimeSpeechVoiceID,
                 "inputPath": activeRealtimeInputPath,
+                "thinkModel": activeRealtimeThinkModel,
                 "bypassesWhisper": true,
                 "historyCount": historyForAPI.count
             ]
@@ -2651,6 +2710,13 @@ final class CompanionManager: ObservableObject {
                             assistantResponse: assistantText,
                             reason: "realtime_bidirectional"
                         )
+                        if Self.responseOffersAgentSpawn(assistantText) {
+                            self.pendingAgentOfferInstruction = userTranscript
+                            self.pendingAgentOfferAt = Date()
+                        } else {
+                            self.pendingAgentOfferInstruction = nil
+                            self.pendingAgentOfferAt = nil
+                        }
                         self.latestVoiceResponseCard = ClickyResponseCard(
                             source: .voice,
                             rawText: assistantText,
@@ -2709,6 +2775,7 @@ final class CompanionManager: ObservableObject {
               trimmedTranscript != "Realtime voice input" else {
             return false
         }
+        rememberMainConversationUserPrompt(trimmedTranscript, source: "realtime_final_transcript")
 
         let requestTiming = beginRequestTiming(source: "realtime_voice_final_transcript", text: trimmedTranscript)
         activeRequestTiming = requestTiming
@@ -2723,7 +2790,7 @@ final class CompanionManager: ObservableObject {
             event: "voice.transcript",
             fields: [
                 "text": trimmedTranscript,
-                "inputPath": "realtime_input_audio_buffer",
+                "inputPath": activeRealtimeInputPath,
                 "requestID": requestTiming.requestID
             ]
         )
@@ -2771,7 +2838,8 @@ final class CompanionManager: ObservableObject {
                 "source": source,
                 "stage": stage,
                 "speechModel": selectedModel,
-                "speechVoice": openAIRealtimeSpeechClient.voiceID,
+                "speechVoice": activeRealtimeSpeechVoiceID,
+                "inputPath": activeRealtimeInputPath,
                 "error": error.localizedDescription
             ]
         )
@@ -2817,10 +2885,10 @@ final class CompanionManager: ObservableObject {
         ) {
             return
         }
-        // Remember this transcript as the candidate task in case Haiku's
-        // reply offers to spin up an agent — the user's confirmation on
-        // the next turn will then have something to delegate.
-        lastVoiceUserTranscript = finalTranscript
+        // Remember this prompt in the same shared conversation context used
+        // by instant text and Realtime voice, so later "on it" / "do that"
+        // agent handoffs can resolve to the actual previous message.
+        rememberMainConversationUserPrompt(finalTranscript, source: "voice_final_transcript")
 
         // Speculative pre-fire commit path. If the partial we fired
         // against matches the final, hand the in-flight Claude task
@@ -4443,7 +4511,7 @@ final class CompanionManager: ObservableObject {
         showTextModeInputAtCursor()
     }
 
-    private func showTextModeInputAtCursor() {
+    private func showTextModeInputAtCursor(activationPoint: CGPoint? = nil) {
         guard allPermissionsGranted else { return }
         guard !buddyDictationManager.isKeyboardShortcutSessionActiveOrFinalizing else { return }
 
@@ -4454,8 +4522,9 @@ final class CompanionManager: ObservableObject {
         }
 
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        let inputAnchorPoint = activationPoint ?? NSEvent.mouseLocation
         textModeWindowManager.show(
-            at: NSEvent.mouseLocation,
+            at: inputAnchorPoint,
             submitText: { [weak self] submittedText in
                 self?.submitTextModePrompt(submittedText)
             }
@@ -4474,6 +4543,7 @@ final class CompanionManager: ObservableObject {
         activeRequestTiming = requestTiming
         defer { activeRequestTiming = nil }
         lastTranscript = trimmedText
+        rememberMainConversationUserPrompt(trimmedText, source: "text_mode")
         ClickyAnalytics.trackUserMessageSent(transcript: trimmedText)
         interruptCurrentVoiceResponse()
         clearDetectedElementLocation()
@@ -5717,13 +5787,23 @@ final class CompanionManager: ObservableObject {
         }
 
         var instruction = Self.normalizedAgentTaskInstruction(from: explicitInstruction)
-        if Self.isReferentialAgentInstruction(instruction),
-           let pendingInstruction = pendingAgentOfferInstruction,
-           let offeredAt = pendingAgentOfferAt,
-           Date().timeIntervalSince(offeredAt) <= Self.pendingAgentOfferTTL {
-            instruction = pendingInstruction
-            pendingAgentOfferInstruction = nil
-            pendingAgentOfferAt = nil
+        if Self.isReferentialAgentInstruction(instruction) {
+            guard let resolvedInstruction = referentialAgentInstructionContext(excluding: transcript) else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "agent",
+                    direction: "incoming",
+                    event: "openclicky.agent_task.referential_instruction_unresolved",
+                    fields: [
+                        "transcript": transcript,
+                        "explicitInstruction": explicitInstruction,
+                        "requestID": activeRequestTiming?.requestID ?? "none"
+                    ]
+                )
+                speakShortSystemResponse("what should the agent do?")
+                return true
+            }
+
+            instruction = resolvedInstruction
             OpenClickyMessageLogStore.shared.append(
                 lane: "agent",
                 direction: "incoming",
@@ -5764,6 +5844,38 @@ final class CompanionManager: ObservableObject {
         print("OpenClicky agent task detected; starting agent task: \(instruction)")
         startVoiceAgentTask(instruction: instruction)
         return true
+    }
+
+    private func referentialAgentInstructionContext(excluding transcript: String) -> String? {
+        let now = Date()
+        if let pendingInstruction = pendingAgentOfferInstruction,
+           let offeredAt = pendingAgentOfferAt,
+           now.timeIntervalSince(offeredAt) <= Self.pendingAgentOfferTTL {
+            pendingAgentOfferInstruction = nil
+            pendingAgentOfferAt = nil
+            return pendingInstruction
+        }
+
+        if let offeredAt = pendingAgentOfferAt,
+           now.timeIntervalSince(offeredAt) > Self.pendingAgentOfferTTL {
+            pendingAgentOfferInstruction = nil
+            pendingAgentOfferAt = nil
+        }
+
+        guard let lastTranscript = lastVoiceUserTranscript,
+              let lastTranscriptAt = lastVoiceUserTranscriptAt,
+              now.timeIntervalSince(lastTranscriptAt) <= Self.pendingAgentOfferTTL else {
+            return nil
+        }
+
+        let trimmedLastTranscript = lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLastTranscript.isEmpty,
+              Self.normalizedSpokenCommandText(trimmedLastTranscript) != Self.normalizedSpokenCommandText(transcript),
+              !Self.isReferentialAgentInstruction(trimmedLastTranscript) else {
+            return nil
+        }
+
+        return trimmedLastTranscript
     }
 
     private static func isCancelAllAgentTasksRequest(_ transcript: String) -> Bool {
@@ -6518,6 +6630,9 @@ final class CompanionManager: ObservableObject {
             "do that",
             "do it",
             "do this",
+            "on it",
+            "get on it",
+            "take care of it",
             "that one",
             "the thing",
             "the task",
@@ -6530,6 +6645,10 @@ final class CompanionManager: ObservableObject {
     static func agentTaskCreationInstruction(from transcript: String) -> String? {
         let candidate = normalizedCommandCandidate(from: transcript)
         guard !candidate.isEmpty else { return nil }
+
+        if let diagnosticInstruction = diagnosticPasteAgentInstruction(from: candidate) {
+            return diagnosticInstruction
+        }
 
         let patterns = [
             #"(?i)^\s*(?:(?:clicky|openclicky)\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:create|start|spin\s+up|spawn|run|launch|kick\s+off|set\s+up)\s+(?:an?\s+|the\s+)?(?:new\s+)?(?:background\s+)?(?:agent|agenty|codex)\s*(?:task|job|session)?\s+(?:to|for|that|which|who)?\s*(.+?)\s*$"#,
@@ -6553,6 +6672,44 @@ final class CompanionManager: ObservableObject {
         }
 
         return misheardQuestionAgentInstruction(from: candidate)
+    }
+
+    private static func diagnosticPasteAgentInstruction(from candidate: String) -> String? {
+        let normalized = normalizedSpokenCommandText(candidate)
+        guard normalized.hasPrefix("see issue here")
+            || normalized.hasPrefix("see the issue here")
+            || normalized.hasPrefix("look at this")
+            || normalized.hasPrefix("look at these")
+            || normalized.hasPrefix("fix this")
+            || normalized.hasPrefix("what is this")
+            || normalized.hasPrefix("whats this")
+            || normalized.hasPrefix("what's this")
+        else {
+            return nil
+        }
+
+        let rawLogSignals = [
+            "[OpenClickyLog]",
+            "openclicky.",
+            "NSXPCDecoder",
+            "NSXPCInterface",
+            "NSXPCConnection",
+            "ViewBridge",
+            "NSViewBridgeError",
+            "unifiedReasons",
+            "Unable to obtain a task name port right",
+            "nw_protocol_instance",
+            "stack trace",
+            "traceback",
+            "exception",
+            "error domain="
+        ]
+
+        guard candidate.count > 240 || rawLogSignals.contains(where: { candidate.localizedCaseInsensitiveContains($0) }) else {
+            return nil
+        }
+
+        return candidate.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func misheardQuestionAgentInstruction(from candidate: String) -> String? {
@@ -8198,6 +8355,7 @@ final class CompanionManager: ObservableObject {
             .trimmingCharacters(in: CharacterSet(charactersIn: " `\"'.,:;!?-–—[](){}<>"))
 
         let directTitleRules: [(pattern: String, title: String)] = [
+            (#"(?i)\b(?:see\s+(?:the\s+)?issue\s+here|look\s+at\s+this|fix\s+this)\b.*\b(?:OpenClickyLog|NSXPCDecoder|ViewBridge|unifiedReasons|NSXPCConnection)\b"#, "Log Issue Review"),
             (#"(?i)\b(?:whole|full)\s+(?:task\s+)?names?\b"#, "Task Status Wording"),
             (#"(?i)\bshort\s+(?:version|task\s+name|name)\b"#, "Task Status Wording"),
             (#"(?i)\b(?:read(?:ing)?\s+out|speak(?:ing)?|say(?:ing)?)\b.*\b(?:whole|full|long|raw)\b.*\b(?:task\s+)?(?:name|title|request)\b"#, "Task Title Cleanup"),
@@ -9870,6 +10028,7 @@ final class CompanionManager: ObservableObject {
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+        rememberMainConversationUserPrompt(transcript, source: "voice_response")
         interruptCurrentVoiceResponse()
         let timing = activeRequestTiming
         var executionFields = voiceResponseExecutionFields()
@@ -11740,7 +11899,10 @@ private final class ClickyTextModePanel: NSPanel {
 @MainActor
 final class ClickyTextModeWindowManager {
     private var panel: NSPanel?
-    private let panelSize = NSSize(width: 520, height: 54)
+    private static let panelWidth: CGFloat = 520
+    private static let compactPanelHeight: CGFloat = 86
+    private static let attachmentPanelHeight: CGFloat = 124
+    private var panelSize: NSSize { NSSize(width: Self.panelWidth, height: Self.compactPanelHeight) }
 
     func show(at cursorLocation: CGPoint, accentTheme: ClickyAccentTheme? = nil, submitText: @escaping (String) -> Void) {
         preparePanel(accentTheme: accentTheme, submitText: submitText)
@@ -11780,7 +11942,13 @@ final class ClickyTextModeWindowManager {
         textModePanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let hostingView = NSHostingView(
-            rootView: ClickyTextModeInputView(accentThemeOverride: accentTheme, submitText: submitText) { [weak self] in
+            rootView: ClickyTextModeInputView(
+                accentThemeOverride: accentTheme,
+                submitText: submitText,
+                requestHeight: { [weak self] height in
+                    self?.resizePanel(toHeight: height)
+                }
+            ) { [weak self] in
                 self?.hide()
             }
         )
@@ -11795,10 +11963,27 @@ final class ClickyTextModeWindowManager {
         if panel == nil {
             createPanel(accentTheme: accentTheme, submitText: submitText)
         } else if let hostingView = panel?.contentView as? NSHostingView<ClickyTextModeInputView> {
-            hostingView.rootView = ClickyTextModeInputView(accentThemeOverride: accentTheme, submitText: submitText) { [weak self] in
+            hostingView.rootView = ClickyTextModeInputView(
+                accentThemeOverride: accentTheme,
+                submitText: submitText,
+                requestHeight: { [weak self] height in
+                    self?.resizePanel(toHeight: height)
+                }
+            ) { [weak self] in
                 self?.hide()
             }
         }
+    }
+
+
+    private func resizePanel(toHeight requestedHeight: CGFloat) {
+        guard let panel else { return }
+        let height = min(max(requestedHeight, Self.compactPanelHeight), Self.attachmentPanelHeight)
+        var frame = panel.frame
+        guard abs(frame.height - height) > 0.5 else { return }
+        frame.origin.y += frame.height - height
+        frame.size = NSSize(width: Self.panelWidth, height: height)
+        panel.setFrame(frame, display: true, animate: false)
     }
 
     private func positionPanel(near cursorLocation: CGPoint) {
@@ -11833,71 +12018,132 @@ final class ClickyTextModeWindowManager {
 }
 
 private struct ClickyTextModeInputView: View {
+    private struct DraftAttachment: Identifiable, Equatable {
+        let id = UUID()
+        let url: URL
+        let kind: Kind
+
+        enum Kind {
+            case image
+            case document
+        }
+
+        var displayName: String {
+            url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+        }
+
+        var systemImage: String {
+            kind == .image ? "photo" : "doc.text"
+        }
+    }
+
     @State private var text = ""
+    @State private var droppedAttachments: [DraftAttachment] = []
+    @State private var isDropTargeted = false
     @FocusState private var isFocused: Bool
     @AppStorage(ClickyAccentTheme.userDefaultsKey) private var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
 
     let accentThemeOverride: ClickyAccentTheme?
     let submitText: (String) -> Void
+    let requestHeight: (CGFloat) -> Void
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "text.cursor")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundColor(controlColor)
+        VStack(alignment: .leading, spacing: droppedAttachments.isEmpty ? 6 : 7) {
+            if !droppedAttachments.isEmpty {
+                attachmentChipRow
+            }
 
-            ZStack(alignment: .leading) {
-                if text.isEmpty {
-                    Text(placeholderText)
+            HStack(spacing: 9) {
+                Image(systemName: droppedAttachments.isEmpty ? "text.cursor" : "paperclip")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(controlColor)
+
+                ZStack(alignment: .leading) {
+                    if text.isEmpty {
+                        Text(droppedAttachments.isEmpty ? placeholderText : "Ask OpenClicky about the attachment…")
+                            .font(.system(size: 16, weight: .regular))
+                            .foregroundColor(placeholderColor)
+                            .lineLimit(1)
+                            .allowsHitTesting(false)
+                    }
+
+                    TextField("", text: $text)
+                        .textFieldStyle(.plain)
                         .font(.system(size: 16, weight: .regular))
-                        .foregroundColor(placeholderColor)
-                        .lineLimit(1)
-                        .allowsHitTesting(false)
+                        .foregroundColor(textColor)
+                        .focused($isFocused)
+                        .onSubmit(submit)
                 }
 
-                TextField("", text: $text)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 16, weight: .regular))
-                    .foregroundColor(textColor)
-                    .focused($isFocused)
-                    .onSubmit(submit)
+                Button(action: submit) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(controlColor)
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .disabled(!canSubmit)
+
+                Button(action: dismiss) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(controlColor.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
             }
 
-            Button(action: submit) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundColor(controlColor)
-            }
-            .buttonStyle(.plain)
-            .pointerCursor()
-            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            Button(action: dismiss) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(controlColor.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .pointerCursor()
+            suggestionRow
         }
-        .padding(.horizontal, 14)
-        .frame(width: 520, height: 54)
+        .padding(.horizontal, 12)
+        .padding(.vertical, droppedAttachments.isEmpty ? 8 : 9)
+        .frame(width: 520, height: preferredHeight)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(backgroundColor)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(borderColor, lineWidth: 1)
+                .stroke(isDropTargeted ? accentTheme.cursorColor.opacity(0.78) : borderColor, lineWidth: isDropTargeted ? 1.4 : 1)
         )
         .shadow(color: accentTheme.cursorColor.opacity(0.32), radius: 18, x: 0, y: 0)
         .shadow(color: Color.black.opacity(0.28), radius: 14, x: 0, y: 8)
+        .overlay(alignment: .center) {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.black.opacity(0.24))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(accentTheme.cursorColor.opacity(0.62), style: StrokeStyle(lineWidth: 1.1, dash: [5, 4]))
+                    )
+                    .overlay(
+                        HStack(spacing: 8) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 15, weight: .heavy))
+                            Text("Drop to attach")
+                                .font(.system(size: 12, weight: .heavy))
+                        }
+                        .foregroundColor(textColor)
+                    )
+                    .padding(5)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(
+            of: [UTType.fileURL.identifier, UTType.image.identifier, UTType.png.identifier, UTType.jpeg.identifier],
+            isTargeted: $isDropTargeted,
+            perform: handleDrop
+        )
         .onAppear {
+            requestHeight(preferredHeight)
             focusTextField()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                 focusTextField()
             }
+        }
+        .onChange(of: droppedAttachments) {
+            requestHeight(preferredHeight)
         }
     }
 
@@ -11907,12 +12153,210 @@ private struct ClickyTextModeInputView: View {
         }
     }
 
+    private var preferredHeight: CGFloat {
+        droppedAttachments.isEmpty ? 86 : 124
+    }
+
+    private var canSubmit: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !droppedAttachments.isEmpty
+    }
+
     private func submit() {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else { return }
-        submitText(trimmedText)
+        guard canSubmit else { return }
+        submitText(promptWithAttachments(trimmedText))
         text = ""
+        droppedAttachments.removeAll()
         dismiss()
+    }
+
+    private var attachmentChipRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(droppedAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        Image(systemName: attachment.systemImage)
+                            .font(.system(size: 9, weight: .heavy))
+                        Text(attachment.displayName)
+                            .font(.system(size: 10, weight: .heavy))
+                            .lineLimit(1)
+                        Button {
+                            removeAttachment(attachment)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .heavy))
+                        }
+                        .buttonStyle(.plain)
+                        .pointerCursor()
+                    }
+                    .foregroundColor(textColor.opacity(0.92))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Capsule(style: .continuous).fill(Color.white.opacity(0.14)))
+                }
+            }
+        }
+        .frame(height: 24)
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        var acceptedDrop = false
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                acceptedDrop = true
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    guard let url = Self.fileURL(from: item) else { return }
+                    Task { @MainActor in
+                        addAttachment(url)
+                    }
+                }
+                continue
+            }
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                acceptedDrop = true
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data, let url = Self.persistDroppedImage(data) else { return }
+                    Task { @MainActor in
+                        addAttachment(url, forcedKind: .image)
+                    }
+                }
+            }
+        }
+
+        return acceptedDrop
+    }
+
+    private func addAttachment(_ url: URL, forcedKind: DraftAttachment.Kind? = nil) {
+        let standardizedURL = url.standardizedFileURL
+        guard droppedAttachments.contains(where: { $0.url.standardizedFileURL == standardizedURL }) == false else { return }
+        droppedAttachments.append(DraftAttachment(url: standardizedURL, kind: forcedKind ?? Self.attachmentKind(for: standardizedURL)))
+    }
+
+    private func removeAttachment(_ attachment: DraftAttachment) {
+        droppedAttachments.removeAll { $0.id == attachment.id }
+    }
+
+    private func promptWithAttachments(_ prompt: String) -> String {
+        guard !droppedAttachments.isEmpty else { return prompt }
+        let request = prompt.isEmpty ? "Please review the attached file(s)." : prompt
+        let attachmentLines = droppedAttachments.enumerated().map { index, attachment in
+            "\(index + 1). \(attachment.kind == .image ? "Image" : "Document"): \(attachment.url.path)"
+        }.joined(separator: "\n")
+
+        return """
+        \(request)
+
+        OpenClicky instant chat attachments:
+        \(attachmentLines)
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func fileURL(from item: Any?) -> URL? {
+        if let url = item as? URL {
+            return url.isFileURL ? url.standardizedFileURL : nil
+        }
+        if let data = item as? Data {
+            return URL(dataRepresentation: data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let data = item as? NSData {
+            return URL(dataRepresentation: data as Data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let string = item as? String {
+            return URL(string: string)?.standardizedFileURL
+        }
+        return nil
+    }
+
+    private static func attachmentKind(for url: URL) -> DraftAttachment.Kind {
+        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
+           type.conforms(to: .image) {
+            return .image
+        }
+        let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "tiff", "bmp"]
+        return imageExtensions.contains(url.pathExtension.lowercased()) ? .image : .document
+    }
+
+    private static func persistDroppedImage(_ data: Data) -> URL? {
+        let directory = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/OpenClicky/AgentMode/DroppedAttachments", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("instant-chat-drop-\(UUID().uuidString).png")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private var suggestionRow: some View {
+        HStack(spacing: 6) {
+            ForEach(activeSuggestions) { suggestion in
+                Button {
+                    applySuggestion(suggestion)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: suggestion.systemImage)
+                            .font(.system(size: 9, weight: .bold))
+                        Text(suggestion.token)
+                            .font(.system(size: 10, weight: .heavy))
+                        Text(suggestion.title)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                    }
+                    .foregroundColor(textColor.opacity(0.92))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Capsule(style: .continuous).fill(Color.white.opacity(0.16)))
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(height: 24)
+        .overlay(alignment: .leading) {
+            if activeSuggestions.isEmpty {
+                Text("Use / for commands or @ for agents, tools, skills, and workspace context")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(placeholderColor)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var activeSuggestions: [ClickyTextModeSuggestion] {
+        guard let trigger = currentTrigger else { return [] }
+        let candidates = ClickyTextModeSuggestion.candidates(for: trigger.kind)
+        let filtered = trigger.query.isEmpty
+            ? candidates
+            : candidates.filter {
+                $0.token.dropFirst().localizedCaseInsensitiveContains(trigger.query)
+                    || $0.title.localizedCaseInsensitiveContains(trigger.query)
+            }
+        return Array(filtered.prefix(4))
+    }
+
+    private var currentTrigger: (kind: ClickyTextModeSuggestion.Kind, query: String, range: Range<String.Index>)? {
+        let cursorText = text
+        guard let tokenRange = cursorText.range(of: #"(?<!\S)[/@][A-Za-z0-9_-]*$"#, options: .regularExpression) else {
+            return nil
+        }
+        let token = String(cursorText[tokenRange])
+        guard let first = token.first,
+              let kind = ClickyTextModeSuggestion.Kind(trigger: first) else {
+            return nil
+        }
+        return (kind, String(token.dropFirst()), tokenRange)
+    }
+
+    private func applySuggestion(_ suggestion: ClickyTextModeSuggestion) {
+        guard let trigger = currentTrigger else { return }
+        text.replaceSubrange(trigger.range, with: "\(suggestion.token) ")
+        focusTextField()
     }
 
     private var accentTheme: ClickyAccentTheme {
@@ -11959,6 +12403,50 @@ private struct ClickyTextModeInputView: View {
             return Color(hex: "#1F2937")
         default:
             return Color.white.opacity(0.88)
+        }
+    }
+}
+
+private struct ClickyTextModeSuggestion: Identifiable {
+    enum Kind {
+        case slashCommand
+        case mention
+
+        init?(trigger: Character) {
+            switch trigger {
+            case "/": self = .slashCommand
+            case "@": self = .mention
+            default: return nil
+            }
+        }
+    }
+
+    let token: String
+    let title: String
+    let systemImage: String
+
+    var id: String { token }
+
+    static func candidates(for kind: Kind) -> [ClickyTextModeSuggestion] {
+        switch kind {
+        case .slashCommand:
+            return [
+                ClickyTextModeSuggestion(token: "/agent", title: "start background work", systemImage: "shippingbox"),
+                ClickyTextModeSuggestion(token: "/voice", title: "use shared voice context", systemImage: "waveform"),
+                ClickyTextModeSuggestion(token: "/screen", title: "include screen context", systemImage: "rectangle.dashed"),
+                ClickyTextModeSuggestion(token: "/workspace", title: "current workspace", systemImage: "folder"),
+                ClickyTextModeSuggestion(token: "/skills", title: "available skills", systemImage: "sparkles"),
+                ClickyTextModeSuggestion(token: "/tools", title: "available tools", systemImage: "wrench.and.screwdriver")
+            ]
+        case .mention:
+            return [
+                ClickyTextModeSuggestion(token: "@agent", title: "background agent", systemImage: "shippingbox"),
+                ClickyTextModeSuggestion(token: "@voice", title: "main voice thread", systemImage: "waveform"),
+                ClickyTextModeSuggestion(token: "@screen", title: "visible screen", systemImage: "rectangle.dashed"),
+                ClickyTextModeSuggestion(token: "@workspace", title: "current workspace", systemImage: "folder"),
+                ClickyTextModeSuggestion(token: "@skills", title: "skills", systemImage: "sparkles"),
+                ClickyTextModeSuggestion(token: "@tools", title: "tools", systemImage: "wrench.and.screwdriver")
+            ]
         }
     }
 }

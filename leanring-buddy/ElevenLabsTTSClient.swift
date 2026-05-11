@@ -2721,6 +2721,7 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 @MainActor
 final class DeepgramVoiceAgentClient {
     nonisolated static let streamSampleRate: Double = 24_000
+    private static let voiceAgentEndpoint = "wss://agent.deepgram.com/v1/agent/converse"
 
     struct BidirectionalVoiceTurnResult {
         let userTranscript: String
@@ -2743,9 +2744,8 @@ final class DeepgramVoiceAgentClient {
         self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedVoice = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
         self.voiceID = trimmedVoice.isEmpty ? "aura-2-thalia-en" : trimmedVoice
-        let trimmedThinkModel = thinkModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.thinkModel = trimmedThinkModel.isEmpty ? "gpt-4o-mini" : trimmedThinkModel
-        self.listenModel = listenModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "nova-3" : listenModel
+        self.thinkModel = Self.normalizedThinkModel(thinkModel)
+        self.listenModel = Self.normalizedListenModel(listenModel)
         self.session = URLSession(configuration: .default)
     }
 
@@ -2754,16 +2754,29 @@ final class DeepgramVoiceAgentClient {
         return playerNode.isPlaying
     }
 
+    private nonisolated static func normalizedThinkModel(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "gpt-4o-mini" : trimmed.lowercased()
+    }
+
+    private nonisolated static func normalizedListenModel(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Flux owns end-of-turn detection for the Voice Agent API. It is less
+        // prone to cutting users off mid-thought than the older Nova listen
+        // defaults when OpenClicky is used as a live realtime conversation.
+        return trimmed.isEmpty ? "flux-general-en" : trimmed.lowercased()
+    }
+
     func updateConfiguration(apiKey: String?, voiceID: String, thinkModel: String) {
         self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedVoice = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedVoice.isEmpty { self.voiceID = trimmedVoice }
-        let trimmedThinkModel = thinkModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedThinkModel.isEmpty { self.thinkModel = trimmedThinkModel }
+        let normalizedThinkModel = Self.normalizedThinkModel(thinkModel)
+        if !normalizedThinkModel.isEmpty { self.thinkModel = normalizedThinkModel }
     }
 
     func warmUpConnection() {
-        guard let url = URL(string: "https://api.deepgram.com/v1/agent/converse") else { return }
+        guard let url = URL(string: Self.voiceAgentEndpoint.replacingOccurrences(of: "wss://", with: "https://")) else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 10
@@ -2788,7 +2801,7 @@ final class DeepgramVoiceAgentClient {
                 userInfo: [NSLocalizedDescriptionKey: "Deepgram Voice Agent needs a Deepgram API key in Settings or DEEPGRAM_API_KEY in the launch environment."]
             )
         }
-        guard let url = URL(string: "wss://api.deepgram.com/v1/agent/converse") else {
+        guard let url = URL(string: Self.voiceAgentEndpoint) else {
             throw NSError(domain: "DeepgramVoiceAgentClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Deepgram Voice Agent WebSocket URL is invalid."])
         }
         guard let streamFormat = Self.makeStreamFormat() else {
@@ -2814,14 +2827,24 @@ final class DeepgramVoiceAgentClient {
             "You are in OpenClicky's Deepgram Voice Agent realtime mode. Listen to the user's live microphone audio directly and reply out loud as OpenClicky in one concise spoken answer. Do not claim you will start background work, take care of a task, or start an agent unless the app already routed the turn before you receive it. Do not mention transcription, Whisper, markdown, or [POINT:] tags."
         ].compactMap { $0 }.joined(separator: "\n\n")
 
+        var listenProvider: [String: Any] = [
+            "type": "deepgram",
+            "model": listenModel
+        ]
+        if listenModel.hasPrefix("flux-") {
+            listenProvider["version"] = "v2"
+            // Higher confidence means Deepgram waits for stronger evidence that
+            // the user is actually done, trading a little latency for fewer
+            // premature cutoffs in OpenClicky's realtime voice mode.
+            listenProvider["eot_threshold"] = 0.9
+        } else {
+            listenProvider["smart_format"] = true
+        }
+
         var agent: [String: Any] = [
             "language": "en",
             "listen": [
-                "provider": [
-                    "type": "deepgram",
-                    "model": listenModel,
-                    "smart_format": true
-                ]
+                "provider": listenProvider
             ],
             "think": [
                 "provider": [

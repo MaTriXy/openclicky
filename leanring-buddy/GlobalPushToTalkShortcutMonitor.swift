@@ -14,7 +14,7 @@ import Foundation
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
-    let controlDoubleTapPublisher = PassthroughSubject<Void, Never>()
+    let controlDoubleTapPublisher = PassthroughSubject<CGPoint, Never>()
 
     @Published private(set) var isActivationShortcutEnabled = true
 
@@ -172,7 +172,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             if let lastStandaloneControlTapDate,
                now.timeIntervalSince(lastStandaloneControlTapDate) <= maximumControlDoubleTapInterval {
                 self.lastStandaloneControlTapDate = nil
-                controlDoubleTapPublisher.send()
+                controlDoubleTapPublisher.send(NSEvent.mouseLocation)
             } else {
                 lastStandaloneControlTapDate = now
             }

@@ -4,8 +4,8 @@ import SwiftUI
 @MainActor
 final class OpenClickySettingsWindowManager {
     private var window: NSWindow?
-    private let windowSize = NSSize(width: 860, height: 580)
-    private let minimumWindowSize = NSSize(width: 760, height: 500)
+    private let windowSize = NSSize(width: 1120, height: 760)
+    private let minimumWindowSize = NSSize(width: 1040, height: 660)
 
     func show(companionManager: CompanionManager) {
         if window == nil {
@@ -29,6 +29,7 @@ final class OpenClickySettingsWindowManager {
         settingsWindow.level = .floating
         settingsWindow.collectionBehavior.insert(.moveToActiveSpace)
         settingsWindow.collectionBehavior.insert(.fullScreenAuxiliary)
+        ensureSettingsWindowFitsContent(settingsWindow, shouldCenter: shouldCenter)
         if shouldCenter {
             settingsWindow.center()
         }
@@ -36,6 +37,29 @@ final class OpenClickySettingsWindowManager {
         settingsWindow.orderFrontRegardless()
         settingsWindow.makeKeyAndOrderFront(nil)
         settingsWindow.makeMain()
+    }
+
+    private func ensureSettingsWindowFitsContent(_ settingsWindow: NSWindow, shouldCenter: Bool) {
+        let visibleFrame = settingsWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        let currentFrame = settingsWindow.frame
+        let targetWidth = max(currentFrame.width, windowSize.width)
+        let targetHeight = max(currentFrame.height, windowSize.height)
+        let fittedWidth = visibleFrame.map { min(targetWidth, $0.width - 32) } ?? targetWidth
+        let fittedHeight = visibleFrame.map { min(targetHeight, $0.height - 32) } ?? targetHeight
+        guard fittedWidth > currentFrame.width || fittedHeight > currentFrame.height else { return }
+
+        let targetSize = NSSize(width: fittedWidth, height: fittedHeight)
+        if shouldCenter {
+            settingsWindow.setContentSize(targetSize)
+        } else {
+            var targetFrame = currentFrame
+            targetFrame.size = targetSize
+            if let visibleFrame {
+                targetFrame.origin.x = min(max(targetFrame.origin.x, visibleFrame.minX + 16), visibleFrame.maxX - targetSize.width - 16)
+                targetFrame.origin.y = min(max(targetFrame.origin.y, visibleFrame.minY + 16), visibleFrame.maxY - targetSize.height - 16)
+            }
+            settingsWindow.setFrame(targetFrame, display: true, animate: false)
+        }
     }
 
     private func createWindow(companionManager: CompanionManager) {
@@ -166,7 +190,7 @@ struct OpenClickySettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(minWidth: 760, minHeight: 500)
+        .frame(minWidth: 1040, minHeight: 660)
         .onChange(of: selectedSection) { _, newSection in
             if newSection == .googleWorkspace, !gogCLIStatus.isInstalled, !isRefreshingGogCLIStatus {
                 refreshGogCLIStatus()
